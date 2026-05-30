@@ -180,8 +180,7 @@ static int ds2_read_metadata_date(AVFormatContext *s, unsigned int offset,
   if (ret < DS2_TIME_SIZE)
     return ret < 0 ? ret : AVERROR_EOF;
 
-  if (sscanf(string, "%2d%2d%2d%2d%2d%2d", &y, &month, &d, &h, &minute, &sec) !=
-      6)
+  if (sscanf(string, "%2d%2d%2d%2d%2d%2d", &y, &month, &d, &h, &minute, &sec) != 6)
     return AVERROR_INVALIDDATA;
 
   snprintf(datetime, sizeof(datetime), "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d",
@@ -417,8 +416,23 @@ static int ds2_read_header(AVFormatContext *s) {
 
   avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
   st->start_time = 0;
-  if (ctx->total_frames > 0)
-    st->duration = (int64_t)ctx->total_frames * samples_per_frame;
+  if (ctx->total_frames > 0) {
+    int64_t nb_samples = (int64_t)ctx->total_frames * samples_per_frame;
+    int frame_bytes = (ctx->format_type == DS2_FORMAT_SP) ? DS2_SP_FRAME_SIZE
+                                                          : DS2_QP_FRAME_SIZE;
+    int64_t file_size = avio_size(pb);
+
+    st->duration = nb_samples;
+    s->duration  = av_rescale_q(nb_samples, (AVRational){1, st->codecpar->sample_rate},
+                                AV_TIME_BASE_Q);
+
+    if (file_size > DS2_HEADER_SIZE && s->duration > 0)
+      s->bit_rate = (file_size - DS2_HEADER_SIZE) * 8LL * AV_TIME_BASE / s->duration;
+    else
+      s->bit_rate = 8LL * frame_bytes * st->codecpar->sample_rate / samples_per_frame;
+
+    st->codecpar->bit_rate = (int)s->bit_rate;
+  }
 
   blk_swap    = block_header[0] >> 7;
   frame_count = block_header[2];
