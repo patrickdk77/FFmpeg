@@ -20,6 +20,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/avstring.h"
 
 #include "avformat.h"
 #include "demux.h"
@@ -44,14 +45,19 @@
 #define DS2_QP_SAMPLES_PER_FRAME 256 /* 64 samples * 4 subframes */
 #define DS2_QP_SAMPLE_RATE 16000
 
-/* Metadata offsets (same layout as DSS) */
-#define DS2_HEAD_OFFSET_AUTHOR 0xc
-#define DS2_AUTHOR_SIZE 16
-#define DS2_HEAD_OFFSET_START_TIME 0x26
-#define DS2_HEAD_OFFSET_END_TIME 0x32
-#define DS2_TIME_SIZE 12
-#define DS2_HEAD_OFFSET_COMMENT 0x31e
-#define DS2_COMMENT_SIZE 64
+/* Metadata offsets (DSS-compatible; DS2 adds a typed table at 0x240) */
+#define DS2_HEAD_OFFSET_ENCODER     0xc
+#define DS2_ENCODER_SIZE            16
+#define DS2_HEAD_OFFSET_START_TIME  0x26
+#define DS2_HEAD_OFFSET_END_TIME    0x32
+#define DS2_TIME_SIZE               12
+#define DS2_HEAD_OFFSET_COMMENT     0x31e
+#define DS2_COMMENT_SIZE            64
+#define DS2_HEAD_OFFSET_EXT_META    0x240
+#define DS2_META_ENTRY_SIZE         60
+#define DS2_META_KEY_SIZE           30
+#define DS2_META_VAL_SIZE           30
+#define DS2_HEAD_EXT_META_END       0x31e
 
 typedef struct DS2DemuxContext {
   const AVClass *class;
@@ -167,46 +173,164 @@ static int ds2_probe(const AVProbeData *p) {
   return AVPROBE_SCORE_MAX;
 }
 
-static int ds2_read_metadata_date(AVFormatContext *s, unsigned int offset,
-                                  const char *key) {
-  AVIOContext *pb = s->pb;
-  char datetime[64], string[DS2_TIME_SIZE + 1] = {0};
-  int y, month, d, h, minute, sec;
-  int ret;
+static void ds2_trim_string(char *s, int size)
+{
+    int i;
 
-  avio_seek(pb, offset, SEEK_SET);
-
-  ret = avio_read(pb, string, DS2_TIME_SIZE);
-  if (ret < DS2_TIME_SIZE)
-    return ret < 0 ? ret : AVERROR_EOF;
-
-  if (sscanf(string, "%2d%2d%2d%2d%2d%2d", &y, &month, &d, &h, &minute, &sec) != 6)
-    return AVERROR_INVALIDDATA;
-
-  snprintf(datetime, sizeof(datetime), "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d",
-           y + 2000, month, d, h, minute, sec);
-  return av_dict_set(&s->metadata, key, datetime, 0);
+    for (i = 0; i < size && s[i]; i++) {
+        if ((unsigned char)s[i] < 0x20 || (unsigned char)s[i] == 0xff) {
+            s[i] = 0;
+            break;
+        }
+    }
+    while (i > 0 && ((unsigned char)s[i - 1] <= 0x20 ||
+                     (unsigned char)s[i - 1] == 0xff))
+        s[--i] = 0;
 }
 
-static int ds2_read_metadata_string(AVFormatContext *s, unsigned int offset,
-                                    unsigned int size, const char *key) {
-  AVIOContext *pb = s->pb;
-  char *value;
-  int ret;
+static int ds2_field_is_blank(const char *s, int size)
+{
+    int i;
 
-  avio_seek(pb, offset, SEEK_SET);
+    for (i = 0; i < size; i++) {
+        if (s[i] && (unsigned char)s[i] != 0xff)
+            return 0;
+    }
+    return 1;
+}
 
-  value = av_mallocz(size + 1);
-  if (!value)
-    return AVERROR(ENOMEM);
+static int ds2_parse_ascii_time(const uint8_t *buf, char *datetime, size_t dsize)
+{
+    char string[DS2_TIME_SIZE + 1];
+    int y, month, d, h, minute, sec;
+    int i;
 
-  ret = avio_read(pb, value, size);
-  if (ret < size) {
-    av_free(value);
-    return ret < 0 ? ret : AVERROR_EOF;
-  }
+    memcpy(string, buf, DS2_TIME_SIZE);
+    string[DS2_TIME_SIZE] = 0;
+    for (i = 0; i < DS2_TIME_SIZE; i++) {
+        if (string[i] < '0' || string[i] > '9')
+            return AVERROR_INVALIDDATA;
+    }
 
-  return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
+    if (sscanf(string, "%2d%2d%2d%2d%2d%2d", &y, &month, &d, &h, &minute, &sec) != 6)
+        return AVERROR_INVALIDDATA;
+    if (month < 1 || month > 12 || d < 1 || d > 31 ||
+        h < 0 || h > 23 || minute < 0 || minute > 59 || sec < 0 || sec > 59)
+        return AVERROR_INVALIDDATA;
+
+    snprintf(datetime, dsize, "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d",
+             y + 2000, month, d, h, minute, sec);
+    return 0;
+}
+
+static int ds2_set_metadata_time(AVFormatContext *s, const uint8_t *buf,
+                                 const char *key)
+{
+    char datetime[64];
+    int ret;
+
+    ret = ds2_parse_ascii_time(buf, datetime, sizeof(datetime));
+    if (ret < 0)
+        return ret;
+
+    return av_dict_set(&s->metadata, key, datetime, 0);
+}
+
+static int ds2_set_metadata_copy(AVFormatContext *s, const char *src, int size,
+                                 const char *key)
+{
+    char *value;
+
+    if (ds2_field_is_blank(src, size))
+        return 0;
+
+    value = av_malloc(size + 1);
+    if (!value)
+        return AVERROR(ENOMEM);
+    memcpy(value, src, size);
+    value[size] = 0;
+    ds2_trim_string(value, size);
+    if (!value[0]) {
+        av_free(value);
+        return 0;
+    }
+
+    return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
+}
+
+static int ds2_read_extended_metadata(AVFormatContext *s, const uint8_t *hdr)
+{
+    int off, ret = 0;
+
+    if (hdr[DS2_HEAD_OFFSET_EXT_META] == 0xff)
+        return 0;
+
+    for (off = DS2_HEAD_OFFSET_EXT_META;
+         off + DS2_META_ENTRY_SIZE <= DS2_HEAD_EXT_META_END;
+         off += DS2_META_ENTRY_SIZE) {
+        const char *key = (const char *)(hdr + off);
+        const char *val = (const char *)(hdr + off + DS2_META_KEY_SIZE);
+        char keybuf[DS2_META_KEY_SIZE + 1];
+        char valbuf[DS2_META_VAL_SIZE + 1];
+
+        if (ds2_field_is_blank(key, DS2_META_KEY_SIZE))
+            break;
+
+        av_strlcpy(keybuf, key, sizeof(keybuf));
+        av_strlcpy(valbuf, val, sizeof(valbuf));
+        ds2_trim_string(keybuf, DS2_META_KEY_SIZE);
+        ds2_trim_string(valbuf, DS2_META_VAL_SIZE);
+        if (!keybuf[0])
+            break;
+
+        if (!av_strcasecmp(keybuf, "Author")) {
+            if (valbuf[0])
+                ret = av_dict_set(&s->metadata, "author", valbuf, 0);
+        } else if (!av_strcasecmp(keybuf, "Memo") ||
+                   !av_strcasecmp(keybuf, "Comment")) {
+            if (valbuf[0])
+                ret = av_dict_set(&s->metadata, "comment", valbuf, 0);
+        } else if (valbuf[0]) {
+            ret = av_dict_set(&s->metadata, keybuf, valbuf, 0);
+        }
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+static int ds2_read_metadata(AVFormatContext *s)
+{
+    AVIOContext *pb = s->pb;
+    uint8_t hdr[DS2_HEADER_SIZE];
+    int ret;
+
+    avio_seek(pb, 0, SEEK_SET);
+    ret = avio_read(pb, hdr, sizeof(hdr));
+    if (ret < sizeof(hdr))
+        return ret < 0 ? ret : AVERROR_EOF;
+
+    ret = ds2_set_metadata_copy(s, (const char *)(hdr + DS2_HEAD_OFFSET_ENCODER),
+                                DS2_ENCODER_SIZE, "encoder");
+    if (ret < 0)
+        return ret;
+
+    ret = ds2_set_metadata_time(s, hdr + DS2_HEAD_OFFSET_START_TIME,
+                                "creation_time");
+    if (ret < 0)
+        av_log(s, AV_LOG_DEBUG, "DS2 start time invalid or missing\n");
+
+    ret = ds2_set_metadata_time(s, hdr + DS2_HEAD_OFFSET_END_TIME, "date");
+    if (ret < 0)
+        av_log(s, AV_LOG_DEBUG, "DS2 end time invalid or missing\n");
+
+    ret = ds2_set_metadata_copy(s, (const char *)(hdr + DS2_HEAD_OFFSET_COMMENT),
+                                DS2_COMMENT_SIZE, "comment");
+    if (ret < 0)
+        return ret;
+
+    return ds2_read_extended_metadata(s, hdr);
 }
 
 static int ds2_count_total_frames(AVFormatContext *s) {
@@ -365,19 +489,9 @@ static int ds2_read_header(AVFormatContext *s) {
   if (!st)
     return AVERROR(ENOMEM);
 
-  ret = ds2_read_metadata_string(s, DS2_HEAD_OFFSET_AUTHOR, DS2_AUTHOR_SIZE,
-                                 "author");
+  ret = ds2_read_metadata(s);
   if (ret < 0)
-    av_log(s, AV_LOG_WARNING, "Failed to read author metadata\n");
-
-  ret = ds2_read_metadata_date(s, DS2_HEAD_OFFSET_END_TIME, "date");
-  if (ret < 0)
-    av_log(s, AV_LOG_WARNING, "Failed to read date metadata\n");
-
-  ret = ds2_read_metadata_string(s, DS2_HEAD_OFFSET_COMMENT, DS2_COMMENT_SIZE,
-                                 "comment");
-  if (ret < 0)
-    av_log(s, AV_LOG_WARNING, "Failed to read comment metadata\n");
+    av_log(s, AV_LOG_WARNING, "Failed to read DS2 metadata\n");
 
   ret = ds2_count_total_frames(s);
   if (ret < 0)
