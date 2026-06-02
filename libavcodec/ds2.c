@@ -909,6 +909,17 @@ static av_cold int ds2_decode_init(AVCodecContext *avctx) {
   return 0;
 }
 
+/* Reset persistent decoder state at a segment boundary (mirrors init). */
+static void ds2_reset_decoder_state(DS2Context *p)
+{
+  memset(p->pitch_memory, 0, sizeof(p->pitch_memory));
+  p->pitch_mem_len = (p->mode == DS2_SP_FORMAT)
+                         ? DS2_SP_PITCH_MAX + DS2_SP_SUBFRAME_SIZE
+                         : DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE;
+  memset(p->lattice_state, 0, sizeof(p->lattice_state));
+  p->deemph_state = 0.0;
+}
+
 static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame_ptr, AVPacket *avpkt) {
   DS2Context *p = avctx->priv_data;
@@ -916,6 +927,13 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   int buf_size = avpkt->size;
   int16_t *out;
   int ret, j, i;
+
+  /* Segment reset flagged by demuxer (not AV_PKT_FLAG_KEY — the framework
+   * may set that on every audio packet). */
+  if (avpkt->flags & AV_PKT_FLAG_CORRUPT) {
+    ds2_reset_decoder_state(p);
+    avpkt->flags &= ~AV_PKT_FLAG_CORRUPT;
+  }
 
   if (buf_size < p->frame_size) {
     if (buf_size)
