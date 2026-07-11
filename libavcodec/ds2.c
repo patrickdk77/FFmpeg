@@ -69,7 +69,7 @@
 #define DS2_MAX_FRAME_SAMPLES 288
 #define DS2_MAX_PITCH 300
 
-/* ---- Quantization tables (from DssDecoder.dll via hirparak/dss-codec) ---- */
+/* ---- Quantization tables (from the hirparak/dss-codec reference) ---- */
 
 static const int ds2_sp_refl_cb_sizes[DS2_SP_NUM_REFL] = {
     32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8, 8, 8, 8};
@@ -873,8 +873,10 @@ static av_cold int ds2_decode_init(AVCodecContext *avctx) {
   av_channel_layout_uninit(&avctx->ch_layout);
   avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
-  /* Determine mode from codec_tag set by demuxer */
-  if (avctx->codec_tag == DS2_QP_FORMAT) {
+  /* Determine mode from codec_tag set by demuxer. Olympus QP is tag 6;
+   * Grundig/Philips QP recorders use 7 with the same CELP frames, so treat
+   * any tag >= 6 as QP. */
+  if (avctx->codec_tag >= DS2_QP_FORMAT) {
     p->mode = DS2_QP_FORMAT;
     p->num_refl = DS2_QP_NUM_REFL;
     p->subframe_size = DS2_QP_SUBFRAME_SIZE;
@@ -960,7 +962,7 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   if (p->mode == DS2_QP_FORMAT)
     ds2_qp_deemphasis_frame(p, p->frame_buf, p->frame_samples);
 
-  /* Convert to int16 (truncate toward zero, matching ds2decode.py / DLL) */
+  /* Convert to int16 (truncate toward zero) */
   for (i = 0; i < p->frame_samples; i++) {
     double sample = p->frame_buf[i];
     if (sample > 32767.0)
