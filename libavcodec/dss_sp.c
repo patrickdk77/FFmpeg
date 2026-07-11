@@ -19,6 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
+
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
 #include "libavutil/mem_internal.h"
@@ -28,12 +30,21 @@
 #include "decode.h"
 #include "get_bits.h"
 
+#include "dss_sp_combinatorial_table_d32.h"
+
 #define SUBFRAMES 4
 #define PULSE_MAX 8
+
+
+
 
 #define DSS_SP_FRAME_SIZE        42
 #define DSS_SP_SAMPLE_COUNT     (66 * SUBFRAMES)
 #define DSS_SP_FORMULA(a, b, c) ((int)((((a) * (1 << 15)) + (b) * (unsigned)(c)) + 0x4000) >> 15)
+#define DSS_SP_REPACK_SAMPLES   72   /* NCH repack loops use imm 0x48 (=72) */
+#define DSS_SP_SHIFT_IN_OFF     187  /* NCH shift_in[0..22] @ history+187 */
+#define DSS_SP_SHIFT_IN_LEN     23
+#define DSS_SP_HISTORY_SIZE     (DSS_SP_SHIFT_IN_OFF + DSS_SP_SHIFT_IN_LEN)
 
 typedef struct DssSpSubframe {
     int16_t gain;
@@ -52,7 +63,7 @@ typedef struct DssSpFrame {
 typedef struct DssSpContext {
     AVCodecContext *avctx;
     int32_t excitation[288 + 6];
-    int32_t history[187];
+    int32_t history[DSS_SP_HISTORY_SIZE];
     DssSpFrame fparam;
     int32_t working_buffer[SUBFRAMES][72];
     int32_t audio_buf[15];
@@ -64,10 +75,18 @@ typedef struct DssSpContext {
     int32_t err_buf2[15];
 
     int pulse_dec_mode;
+    int repack_pulse_tbl;     /* repack: pulse-table selection sticks per frame */
+    int repack;
+    int comb_pulse_mode;
+    int post_lpc_shift;
+    int frame_idx;
+    int shift_amount;
+    int state_preloaded;
 
     DECLARE_ALIGNED(16, uint8_t, bits)[DSS_SP_FRAME_SIZE +
                                        AV_INPUT_BUFFER_PADDING_SIZE];
 } DssSpContext;
+
 
 /*
  * Used for the coding/decoding of the pulse positions for the MP-MLQ codebook.
@@ -243,6 +262,8 @@ static const int16_t dss_sp_filter_cb[14][32] = {
            0,      0,      0,      0,      0,      0,      0,      0 },
 };
 
+
+
 static const uint16_t  dss_sp_fixed_cb_gain[64] = {
        0,    4,    8,   13,   17,   22,   26,   31,
       35,   40,   44,   48,   53,   58,   63,   69,
@@ -295,10 +316,71 @@ static av_cold int dss_sp_decode_init(AVCodecContext *avctx)
     av_channel_layout_uninit(&avctx->ch_layout);
     avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
-    p->pulse_dec_mode = 1;
-    p->avctx          = avctx;
+    p->pulse_dec_mode   = 1;
+    p->repack_pulse_tbl = 0;
+    p->repack           = 0;
+    p->comb_pulse_mode  = 0;
+    p->post_lpc_shift   = 0;
+    p->frame_idx        = 0;
+    p->shift_amount     = 0;
+    p->state_preloaded  = 0;
+    p->avctx            = avctx;
 
     return 0;
+}
+
+static int dss_sp_decode_pulse_pos_alt(uint32_t combined_pulse_pos,
+                                       int16_t *pulse_pos)
+{
+    unsigned int C72_binomials[PULSE_MAX] = {
+        72, 2556, 59640, 1028790, 13991544, 156238908, 1473109704,
+        3379081753
+    };
+    int index = 6;
+    int placements = 0;
+    int i;
+
+    pulse_pos[6] = 0;
+
+    for (i = 71; i >= 0; i--) {
+        if (C72_binomials[index] <= combined_pulse_pos) {
+            combined_pulse_pos -= C72_binomials[index];
+            pulse_pos[6 - index] = i;
+            placements++;
+            if (!index)
+                break;
+            --index;
+        }
+        --C72_binomials[0];
+        if (index) {
+            int a;
+            for (a = 0; a < index; a++)
+                C72_binomials[a + 1] -= C72_binomials[a];
+        }
+    }
+    /* Alt decode succeeds only when the index is fully consumed after all 7
+     * binomial subtractions (placements == 7) - not merely cp == 0 with pos[6]
+     * preset and only 6 placements. */
+    return combined_pulse_pos == 0 && placements == 7;
+}
+
+/* comb-table selector for the repack path only */
+static void dss_sp_decode_pulse_pos_d32(uint32_t combined_pulse_pos,
+                                        int16_t *pulse_pos)
+{
+    int pulse = PULSE_MAX - 1;
+    int pulse_idx = 71;
+    int i;
+
+    for (i = 0; i < 7; i++) {
+        for (; combined_pulse_pos <
+               dss_sp_combinatorial_table_d32[pulse][pulse_idx];
+             --pulse_idx)
+            ;
+        combined_pulse_pos -= dss_sp_combinatorial_table_d32[pulse][pulse_idx];
+        pulse--;
+        pulse_pos[i] = pulse_idx;
+    }
 }
 
 static void dss_sp_unpack_coeffs(DssSpContext *p, const uint8_t *src)
@@ -316,6 +398,21 @@ static void dss_sp_unpack_coeffs(DssSpContext *p, const uint8_t *src)
         p->bits[i + 1] = src[i];
     }
 
+    /* Stream routing:
+     *   comb_pulse_mode - frame-0 flag: (b0 & 0x80) ? (b0 & 1) : 0
+     *   repack          - per packet on comb streams: (b1 >> 7); else always 1.
+     * repack=1 -> gen_exc + add_pulses + overlay; repack=0 -> same excitation,
+     * comb LPC. */
+    if (!p->frame_idx)
+        p->comb_pulse_mode = (src[0] & 0x80) ? (src[0] & 1) : 0;
+    /* The bit-7-of-byte-1 selector applies only on comb_pulse streams; clean
+     * CELP streams always use repack synthesis. */
+    if (p->comb_pulse_mode)
+        p->repack = (src[1] >> 7) & 1;
+    else
+        p->repack = 1;
+    /* repack_pulse_tbl persists across frames; cleared on a cp clamp only */
+
     init_get_bits(&gb, p->bits, DSS_SP_FRAME_SIZE * 8);
 
     for (i = 0; i < 2; i++)
@@ -328,7 +425,8 @@ static void dss_sp_unpack_coeffs(DssSpContext *p, const uint8_t *src)
     for (subframe_idx = 0; subframe_idx < 4; subframe_idx++) {
         fparam->sf_adaptive_gain[subframe_idx] = get_bits(&gb, 5);
 
-        fparam->sf[subframe_idx].combined_pulse_pos = get_bits_long(&gb, 31);
+        fparam->sf[subframe_idx].combined_pulse_pos = get_bits_long(&gb, 31) &
+                                                      0x7FFFFFFFU;
 
         fparam->sf[subframe_idx].gain = get_bits(&gb, 6);
 
@@ -343,20 +441,44 @@ static void dss_sp_unpack_coeffs(DssSpContext *p, const uint8_t *src)
         };
         unsigned int combined_pulse_pos =
             fparam->sf[subframe_idx].combined_pulse_pos;
-        int index = 6;
 
         if (combined_pulse_pos < C72_binomials[PULSE_MAX - 1]) {
-            if (p->pulse_dec_mode) {
+            if (p->repack) {
+                int16_t alt_pos[7];
+                unsigned int cp = combined_pulse_pos;
+
+                /* repack pulse-position decode:
+                 *   cp > C72[6]-1 -> clamp, clear repack_pulse_tbl.
+                 *   repack_pulse_tbl set -> table decode.
+                 *   else stack/alt decode; a non-zero remainder after the
+                 *   7-pulse loop sets repack_pulse_tbl = 1 (switch to table).
+                 *   Alt decode succeeds only when all 7 binomial subtractions
+                 *   consume the index exactly (remainder == 0).
+                 * repack_pulse_tbl is sticky across frames. */
+                if (cp > C72_binomials[6] - 1) {
+                    cp = C72_binomials[6] - 1;
+                    p->pulse_dec_mode = 0;
+                    p->repack_pulse_tbl = 0;
+                }
+
+                if (p->repack_pulse_tbl) {
+                    dss_sp_decode_pulse_pos_d32(cp,
+                        fparam->sf[subframe_idx].pulse_pos);
+                } else if (dss_sp_decode_pulse_pos_alt(cp, alt_pos)) {
+                    memcpy(fparam->sf[subframe_idx].pulse_pos, alt_pos,
+                           sizeof(alt_pos));
+                } else {
+                    p->repack_pulse_tbl = 1;
+                    dss_sp_decode_pulse_pos_d32(cp,
+                        fparam->sf[subframe_idx].pulse_pos);
+                }
+            } else if (p->pulse_dec_mode) {
                 int pulse, pulse_idx;
                 pulse              = PULSE_MAX - 1;
                 pulse_idx          = 71;
                 combined_pulse_pos =
                     fparam->sf[subframe_idx].combined_pulse_pos;
 
-                /* this part seems to be close to g723.1 gen_fcb_excitation()
-                 * RATE_6300 */
-
-                /* TODO: what is 7? size of subframe? */
                 for (i = 0; i < 7; i++) {
                     for (;
                          combined_pulse_pos <
@@ -370,9 +492,9 @@ static void dss_sp_unpack_coeffs(DssSpContext *p, const uint8_t *src)
                 }
             }
         } else {
+            int index = 6;
             p->pulse_dec_mode = 0;
 
-            /* why do we need this? */
             fparam->sf[subframe_idx].pulse_pos[6] = 0;
 
             for (i = 71; i >= 0; i--) {
@@ -433,30 +555,52 @@ static void dss_sp_unpack_filter(DssSpContext *p)
         p->lpc_filter[i] = dss_sp_filter_cb[i][p->fparam.filter_idx[i]];
 }
 
-static void dss_sp_convert_coeffs(int32_t *lpc_filter, int32_t *coeffs)
+static void dss_sp_convert_coeffs(DssSpContext *p)
 {
-    int a, a_plus, i;
+    int32_t *lpc_filter = p->lpc_filter;
+    int32_t *coeffs     = p->filter;
+    int a, a_plus, i, overflow = 0;
 
-    coeffs[0] = 0x2000;
+    p->shift_amount = 0;
+    coeffs[0]       = 0x2000;
     for (a = 0; a < 14; a++) {
         a_plus         = a + 1;
         coeffs[a_plus] = lpc_filter[a] >> 2;
-        if (a_plus / 2 >= 1) {
+        for (i = 1; i <= a_plus / 2; i++) {
+            int32_t coeff_1 = coeffs[i];
+            int32_t coeff_2 = coeffs[a_plus - i];
+            int32_t tmp1, tmp2;
+
+            tmp1 = DSS_SP_FORMULA(coeff_1, lpc_filter[a], coeff_2);
+            tmp2 = DSS_SP_FORMULA(coeff_2, lpc_filter[a], coeff_1);
+            if (tmp1 < -32768 || tmp1 > 32767 || tmp2 < -32768 || tmp2 > 32767)
+                overflow = 1;
+            coeffs[i]          = av_clip_int16(tmp1);
+            coeffs[a_plus - i] = av_clip_int16(tmp2);
+        }
+    }
+
+    if (overflow) {
+        p->shift_amount = 1;
+        coeffs[0]       = 0x1000;
+        for (a = 0; a < 14; a++) {
+            a_plus         = a + 1;
+            coeffs[a_plus] = lpc_filter[a] >> 3;
             for (i = 1; i <= a_plus / 2; i++) {
-                int coeff_1, coeff_2, tmp;
+                int32_t coeff_1 = coeffs[i];
+                int32_t coeff_2 = coeffs[a_plus - i];
 
-                coeff_1 = coeffs[i];
-                coeff_2 = coeffs[a_plus - i];
-
-                tmp = DSS_SP_FORMULA(coeff_1, lpc_filter[a], coeff_2);
-                coeffs[i] = av_clip_int16(tmp);
-
-                tmp = DSS_SP_FORMULA(coeff_2, lpc_filter[a], coeff_1);
-                coeffs[a_plus - i] = av_clip_int16(tmp);
+                coeffs[i] = av_clip_int16(DSS_SP_FORMULA(coeff_1, lpc_filter[a],
+                                                          coeff_2));
+                coeffs[a_plus - i] = av_clip_int16(DSS_SP_FORMULA(coeff_2,
+                                                                   lpc_filter[a],
+                                                                   coeff_1));
             }
         }
     }
 }
+
+static int32_t dss_sp_clip_sinc_pcm(int32_t tmp);
 
 static void dss_sp_add_pulses(int32_t *vector_buf,
                               const struct DssSpSubframe *sf)
@@ -469,23 +613,24 @@ static void dss_sp_add_pulses(int32_t *vector_buf,
                                          0x4000) >> 15;
 }
 
-static void dss_sp_gen_exc(int32_t *vector, int32_t *prev_exc,
-                           int pitch_lag, int gain)
+static void dss_sp_gen_exc(int32_t *vector, const int32_t *prev_exc,
+                           int pitch_lag, int gain, int size)
 {
     int i;
 
     /* do we actually need this check? we can use just [a3 - i % a3]
      * for both cases */
     if (pitch_lag < 72)
-        for (i = 0; i < 72; i++)
+        for (i = 0; i < size; i++)
             vector[i] = prev_exc[pitch_lag - i % pitch_lag];
     else
-        for (i = 0; i < 72; i++)
+        for (i = 0; i < size; i++)
             vector[i] = prev_exc[pitch_lag - i];
 
-    for (i = 0; i < 72; i++) {
+    for (i = 0; i < size; i++) {
         int tmp = gain * vector[i] >> 11;
-        vector[i] = av_clip_int16(tmp);
+        /* Clamp to +-32767 (dss_sp_clip_sinc_pcm). */
+        vector[i] = dss_sp_clip_sinc_pcm(tmp);
     }
 }
 
@@ -501,19 +646,74 @@ static void dss_sp_scale_vector(int32_t *vec, int bits, int size)
             vec[i] = vec[i] * (1 << bits);
 }
 
-static void dss_sp_update_buf(int32_t *hist, int32_t *vector)
+static void dss_sp_update_buf(const int32_t *vec, int32_t *hist)
 {
     int i;
 
     for (i = 114; i > 0; i--)
-        vector[i + 72] = vector[i];
+        hist[i + 72] = hist[i];
 
-    for (i = 0; i < 72; i++)
-        vector[72 - i] = hist[i];
+    for (i = 0; i < DSS_SP_REPACK_SAMPLES; i++)
+        hist[72 - i] = vec[i];
+}
+
+/* NCH repack: reverse-copy 72 dwords from history into vector. */
+static void dss_sp_overlay_history(int32_t *vector, const int32_t *history)
+{
+    int i;
+
+    for (i = 0; i < DSS_SP_REPACK_SAMPLES; i++)
+        vector[i] = history[72 - i];
+}
+
+
+static int32_t dss_sp_clip_sinc_pcm(int32_t tmp)
+{
+    int32_t hi = tmp & 0xFFFF8000;
+
+    if (hi == 0 || hi == (int32_t)0xFFFF8000)
+        return tmp;
+    return tmp <= 0 ? (int32_t)0xFFFF8001 : 0x7FFF;
+}
+
+static int32_t dss_sp_clip_work(int32_t tmp)
+{
+    return dss_sp_clip_sinc_pcm(tmp);
+}
+
+/* NCH repack: stateful scale + overflow-recovery loop. */
+static int dss_sp_apply_d054(int32_t *vector, int d054, int count)
+{
+    int i;
+
+    for (i = 0; i < count; i++) {
+        int64_t tmp = (int64_t)d054 * 0x1fff + ((int64_t)vector[i] << 15) + 0x4000;
+        int32_t out = (int32_t)(tmp >> 15);
+        int32_t hi  = out & 0xFFFF8000;
+
+        vector[i] = out;
+        if (hi && hi != (int32_t)0xFFFF8000) {
+            /* Positive overflow -> +32767, negative -> -32767. */
+            d054 = out > 0 ? 0x7FFF : (int32_t)0xFFFF8001;
+            vector[i] = d054;
+        }
+    }
+    return d054;
+}
+
+static void dss_sp_sync_shift_in_from_err(DssSpContext *p)
+{
+    int i;
+
+    p->history[DSS_SP_SHIFT_IN_OFF] = p->err_buf2[0];
+    for (i = 1; i < 15; i++)
+        p->history[DSS_SP_SHIFT_IN_OFF + i] = p->err_buf2[i];
+    for (i = 15; i < DSS_SP_SHIFT_IN_LEN; i++)
+        p->history[DSS_SP_SHIFT_IN_OFF + i] = 0;
 }
 
 static void dss_sp_shift_sq_sub(const int32_t *filter_buf,
-                                int32_t *error_buf, int32_t *dst)
+                                int32_t *error_buf, int32_t *dst, int shift)
 {
     int a;
 
@@ -528,33 +728,90 @@ static void dss_sp_shift_sq_sub(const int32_t *filter_buf,
         for (i = 14; i > 0; i--)
             error_buf[i] = error_buf[i - 1];
 
-        tmp = (int)(tmp + 4096U) >> 13;
+        tmp = (int)(tmp + 4096U) >> shift;
+
+        /* Clamp the result and feed the *clamped* value back into the error
+         * ring (error_buf[1]), not the raw shifted value. Matters only when
+         * the LPC output saturates. */
+        tmp = av_clip_int16(tmp);
 
         error_buf[1] = tmp;
 
-        dst[a] = av_clip_int16(tmp);
+        dst[a] = tmp;
     }
 }
 
+/* NCH comb_pulse (pulse_mode=1 / repack=0): 72-sample LPC shift, then either
+ *   sf0: vector[i]=out[i+1], vector[71]=zero-tail shift step
+ *   sf1+: vector[i]=out[i], vector[71]=zero-tail (inter-subframe delay) */
+static void dss_sp_shift_sq_sub_comb_pulse(const int32_t *filter_buf,
+                                           int32_t *error_buf,
+                                           int32_t *vector, int shift,
+                                           int inter_delay)
+{
+    int32_t out[72];
+    int a, i, tmp;
+
+    for (a = 0; a < 72; a++) {
+        tmp = vector[a] * filter_buf[0];
+
+        for (i = 14; i > 0; i--)
+            tmp -= error_buf[i] * (unsigned)filter_buf[i];
+
+        for (i = 14; i > 0; i--)
+            error_buf[i] = error_buf[i - 1];
+
+        tmp = (int)(tmp + 4096U) >> shift;
+
+        error_buf[1] = tmp;
+        out[a] = av_clip_int16(tmp);
+    }
+
+    tmp = 0;
+    for (i = 14; i > 0; i--)
+        tmp -= error_buf[i] * (unsigned)filter_buf[i];
+
+    for (i = 14; i > 0; i--)
+        error_buf[i] = error_buf[i - 1];
+
+    tmp = (int)(tmp + 4096U) >> shift;
+
+    error_buf[1] = tmp;
+    /* 73rd shift step (zero input): always advances err state; sf0 uses it in vector[71]. */
+    tmp = av_clip_int16(tmp);
+
+    if (inter_delay) {
+        for (i = 0; i < 72; i++)
+            vector[i] = out[i];
+    } else {
+        for (i = 0; i < 71; i++)
+            vector[i] = out[i + 1];
+        vector[71] = tmp;
+    }
+}
+
+/* 0a8 frame 0 sf3: NCH st4[0]=err[1], st4[i]=comb_pulse inter1 out[i-1]. */
+
 static void dss_sp_shift_sq_add(const int32_t *filter_buf, int32_t *audio_buf,
-                                int32_t *dst)
+                                int32_t *dst, int shift)
 {
     int a;
 
     for (a = 0; a < 72; a++) {
-        int i, tmp = 0;
+        int i;
+        unsigned tmp = 0;
 
         audio_buf[0] = dst[a];
 
+        /* Accumulate in 32-bit (wraps) and clamp to +-32767
+         * (dss_sp_clip_sinc_pcm), not av_clip_int16. */
         for (i = 14; i >= 0; i--)
-            tmp += audio_buf[i] * filter_buf[i];
+            tmp += (unsigned)audio_buf[i] * (unsigned)filter_buf[i];
 
         for (i = 14; i > 0; i--)
             audio_buf[i] = audio_buf[i - 1];
 
-        tmp = (tmp + 4096) >> 13;
-
-        dst[a] = av_clip_int16(tmp);
+        dst[a] = dss_sp_clip_sinc_pcm((int)(tmp + 4096U) >> shift);
     }
 }
 
@@ -599,6 +856,7 @@ static void dss_sp_sf_synthesis(DssSpContext *p, int32_t lpc_filter,
     int32_t noise[72];
     int bias, vsum_2 = 0, vsum_1 = 0, v36, normalize_bits;
     int i, tmp;
+    const int nch_work_clip = p->repack;
 
     if (size > 0) {
         vsum_1 = dss_sp_vector_sum(p, size);
@@ -615,11 +873,17 @@ static void dss_sp_sf_synthesis(DssSpContext *p, int32_t lpc_filter,
 
     v36 = p->err_buf1[1];
 
-    dss_sp_vec_mult(p->filter, tmp_buf, binary_decreasing_array);
-    dss_sp_shift_sq_add(tmp_buf, p->audio_buf, p->vector_buf);
 
-    dss_sp_vec_mult(p->filter, tmp_buf, dss_sp_unc_decreasing_array);
-    dss_sp_shift_sq_sub(tmp_buf, p->err_buf1, p->vector_buf);
+    {
+        int shift = 13 - p->shift_amount;
+
+        dss_sp_vec_mult(p->filter, tmp_buf, binary_decreasing_array);
+        dss_sp_shift_sq_add(tmp_buf, p->audio_buf, p->vector_buf, shift);
+
+        dss_sp_vec_mult(p->filter, tmp_buf, dss_sp_unc_decreasing_array);
+        dss_sp_shift_sq_sub(tmp_buf, p->err_buf1, p->vector_buf, shift);
+    }
+
 
     /* lpc_filter can be negative */
     lpc_filter = lpc_filter >> 1;
@@ -630,12 +894,13 @@ static void dss_sp_sf_synthesis(DssSpContext *p, int32_t lpc_filter,
         for (i = size - 1; i > 0; i--) {
             tmp = DSS_SP_FORMULA(p->vector_buf[i], lpc_filter,
                                  p->vector_buf[i - 1]);
-            p->vector_buf[i] = av_clip_int16(tmp);
+            p->vector_buf[i] = dss_sp_clip_sinc_pcm(tmp);
         }
     }
 
     tmp              = DSS_SP_FORMULA(p->vector_buf[0], lpc_filter, v36);
-    p->vector_buf[0] = av_clip_int16(tmp);
+    p->vector_buf[0] = dss_sp_clip_sinc_pcm(tmp);
+
 
     dss_sp_scale_vector(p->vector_buf, -normalize_bits, size);
     dss_sp_scale_vector(p->audio_buf, -normalize_bits, 15);
@@ -651,29 +916,34 @@ static void dss_sp_sf_synthesis(DssSpContext *p, int32_t lpc_filter,
 
     bias     = 409 * tmp >> 15 << 15;
     tmp      = (bias + 32358 * p->noise_state) >> 15;
-    noise[0] = av_clip_int16(tmp);
+    noise[0] = dss_sp_clip_sinc_pcm(tmp);
 
     for (i = 1; i < size; i++) {
         tmp      = (bias + 32358 * noise[i - 1]) >> 15;
-        noise[i] = av_clip_int16(tmp);
+        noise[i] = dss_sp_clip_sinc_pcm(tmp);
     }
 
     p->noise_state = noise[size - 1];
+
     for (i = 0; i < size; i++) {
-        tmp    = (p->vector_buf[i] * noise[i]) >> 11;
-        dst[i] = av_clip_int16(tmp);
+        tmp = (p->vector_buf[i] * noise[i]) >> 11;
+        if (nch_work_clip)
+            dst[i] = dss_sp_clip_work(tmp);
+        else
+            dst[i] = av_clip_int16(tmp);
     }
 }
 
 static void dss_sp_update_state(DssSpContext *p, int32_t *dst)
 {
     int i, offset = 6, counter = 0, a = 0;
+    const int use_nch_clip = p->repack;
 
     for (i = 0; i < 6; i++)
         p->excitation[i] = p->excitation[288 + i];
 
     for (i = 0; i < 72 * SUBFRAMES; i++)
-        p->excitation[6 + i] = dst[i];
+        p->excitation[6 + i] = p->working_buffer[i / 72][i % 72];
 
     do {
         int tmp = 0;
@@ -684,7 +954,10 @@ static void dss_sp_update_state(DssSpContext *p, int32_t *dst)
         offset += 7;
 
         tmp >>= 15;
-        dst[counter] = av_clip_int16(tmp);
+        if (use_nch_clip)
+            dst[counter] = (int16_t)dss_sp_clip_sinc_pcm(tmp);
+        else
+            dst[counter] = av_clip_int16(tmp);
 
         counter++;
 
@@ -702,31 +975,48 @@ static void dss_sp_32to16bit(int16_t *dst, int32_t *src, int size)
         dst[i] = av_clip_int16(src[i]);
 }
 
+/* NCH repack: overlay → shift_out → post_lpc(overlay) → sf(vector, shift_out). */
+
 static int dss_sp_decode_one_frame(DssSpContext *p,
                                    int16_t *abuf_dst, const uint8_t *abuf_src)
 {
-    int i, j;
+    int j;
 
     dss_sp_unpack_coeffs(p, abuf_src);
 
     dss_sp_unpack_filter(p);
 
-    dss_sp_convert_coeffs(p->lpc_filter, p->filter);
+    dss_sp_convert_coeffs(p);
 
     for (j = 0; j < SUBFRAMES; j++) {
+        int shift = 13 - p->shift_amount;
+
         dss_sp_gen_exc(p->vector_buf, p->history,
                        p->fparam.pitch_lag[j],
-                       dss_sp_adaptive_gain[p->fparam.sf_adaptive_gain[j]]);
+                       dss_sp_adaptive_gain[p->fparam.sf_adaptive_gain[j]],
+                       72);
 
         dss_sp_add_pulses(p->vector_buf, &p->fparam.sf[j]);
 
         dss_sp_update_buf(p->vector_buf, p->history);
+        dss_sp_overlay_history(p->vector_buf, p->history);
 
-        for (i = 0; i < 72; i++)
-            p->vector_buf[i] = p->history[72 - i];
+        if (!p->repack)
+            dss_sp_sync_shift_in_from_err(p);
 
-        dss_sp_shift_sq_sub(p->filter,
-                            p->err_buf2, p->vector_buf);
+        if (!p->repack && !p->frame_idx && !j)
+            dss_sp_shift_sq_sub_comb_pulse(p->filter, p->err_buf2,
+                                           p->vector_buf, shift, 0);
+        else if (!p->repack && !p->frame_idx && j == 1)
+            dss_sp_shift_sq_sub_comb_pulse(p->filter, p->err_buf2,
+                                           p->vector_buf, shift, 1);
+        else
+            dss_sp_shift_sq_sub(p->filter, p->err_buf2, p->vector_buf, shift);
+
+
+        p->post_lpc_shift = dss_sp_apply_d054(p->vector_buf,
+                                              p->post_lpc_shift,
+                                              DSS_SP_REPACK_SAMPLES);
 
         dss_sp_sf_synthesis(p, p->lpc_filter[0],
                             &p->working_buffer[j][0], 72);
@@ -734,9 +1024,31 @@ static int dss_sp_decode_one_frame(DssSpContext *p,
 
     dss_sp_update_state(p, &p->working_buffer[0][0]);
 
-    dss_sp_32to16bit(abuf_dst,
-                     &p->working_buffer[0][0], 264);
+    dss_sp_32to16bit(abuf_dst, &p->working_buffer[0][0], 264);
+
+    p->frame_idx++;
     return 0;
+}
+
+static void dss_sp_reset_decoder_state(DssSpContext *p)
+{
+    memset(p->excitation, 0, sizeof(p->excitation));
+    memset(p->history, 0, sizeof(p->history));
+
+
+
+    memset(p->audio_buf, 0, sizeof(p->audio_buf));
+    memset(p->err_buf1, 0, sizeof(p->err_buf1));
+    memset(p->err_buf2, 0, sizeof(p->err_buf2));
+    p->noise_state      = 0;
+    p->pulse_dec_mode   = 1;
+    p->repack_pulse_tbl = 0;
+    p->repack           = 0;
+    p->comb_pulse_mode  = 0;
+    p->post_lpc_shift   = 0;
+    p->frame_idx        = 0;
+    p->shift_amount     = 0;
+    p->state_preloaded  = 0;
 }
 
 static int dss_sp_decode_frame(AVCodecContext *avctx, AVFrame *frame,
@@ -748,6 +1060,12 @@ static int dss_sp_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     int16_t *out;
     int ret;
+
+    if (avpkt->flags & AV_PKT_FLAG_CORRUPT) {
+        if (!p->state_preloaded)
+            dss_sp_reset_decoder_state(p);
+        avpkt->flags &= ~AV_PKT_FLAG_CORRUPT;
+    }
 
     if (buf_size < DSS_SP_FRAME_SIZE) {
         if (buf_size)
