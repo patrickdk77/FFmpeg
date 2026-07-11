@@ -492,6 +492,8 @@ library:
 @item Delphine Software International CIN @tab   @tab X
     @tab Multimedia format used by Delphine Software games.
 @item Digital Speech Standard (DSS) @tab   @tab X
+@item Digital Speech Standard Pro (DS2) @tab   @tab X
+    @tab Olympus dictation format; SP (12000 Hz) and QP (16000 Hz) CELP modes.
 @item CD+G                      @tab   @tab X
     @tab Video format used by CD+G karaoke disks
 @item Phantom Cine              @tab   @tab X
@@ -1304,6 +1306,8 @@ following image formats are supported:
     @tab Codec used in Delphine Software International games.
 @item DFPWM                  @tab  X  @tab  X
 @item Digital Speech Standard - Standard Play mode (DSS SP) @tab     @tab  X
+@item Digital Speech Standard Pro (DS2) @tab     @tab  X
+    @tab SP (12000 Hz) and QP (16000 Hz) modes.
 @item Discworld II BMV Audio @tab     @tab  X
 @item COOK                   @tab     @tab  X
     @tab All versions except 5.1 are supported.
