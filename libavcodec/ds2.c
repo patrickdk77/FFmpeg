@@ -7,9 +7,9 @@
  * DS2 (DSS Pro) CELP audio decoder
  *
  * Supports two modes:
- *   - SP mode: 12000 Hz, 14 reflection coefficients, 4×72-sample subframes,
+ *   - SP mode: 12000 Hz, 14 reflection coefficients, 4x72-sample subframes,
  *              C(72,7) combinatorial codebook, 328-bit frames
- *   - QP mode: 16000 Hz, 16 reflection coefficients, 4×64-sample subframes,
+ *   - QP mode: 16000 Hz, 16 reflection coefficients, 4x64-sample subframes,
  *              C(64,11) combinatorial codebook, 448-bit frames
  *
  * Based on technical documentation from FFmpeg trac ticket #6091.
@@ -60,6 +60,15 @@
 #define DS2_QP_COMB_BITS 40
 #define DS2_QP_PITCH_MIN 45
 #define DS2_QP_PITCH_MAX 300
+
+/* QP7 mode (Grundig/Philips): same 16 kHz CELP as QP, but records are
+ * byte-aligned and variable length - a 1-bit selector picks a 12-byte
+ * "short" (unvoiced noise-fill) record or a 56-byte "long" (full CELP)
+ * record. The reflection-coefficient bit allocation differs in the last
+ * coefficient (2 bits instead of 3). */
+#define DS2_QP7_FORMAT 7
+#define DS2_QP7_SHORT_SIZE 12 /* bytes: 96-bit unvoiced record */
+#define DS2_QP7_SHORT_GAIN_BITS 5
 
 /* Maximum values across both modes */
 #define DS2_MAX_REFL 16
@@ -206,6 +215,29 @@ static const int ds2_qp_refl_cb_sizes[DS2_QP_NUM_REFL] = {
 
 static const int ds2_qp_refl_bits[DS2_QP_NUM_REFL] = {7, 7, 6, 6, 5, 5, 5, 5,
                                                       5, 4, 4, 4, 4, 3, 3, 3};
+
+/* QP7 reflection-coefficient bit allocation: last coefficient is 2 bits
+ * (QP uses 3); it indexes the same ds2_qp_refl_cb codebook. */
+static const int ds2_qp7_refl_bits[DS2_QP_NUM_REFL] = {7, 7, 6, 6, 5, 5, 5, 5,
+                                                       5, 4, 4, 4, 4, 3, 3, 2};
+
+/* QP7 short-record excitation gain table (64 entries). */
+static const double ds2_qp7_short_gain[64] = {
+    0.0, 0.000152587890625, 0.00030517578125, 0.000457763671875,
+    0.000640869140625, 0.0008544921875, 0.001068115234375, 0.00128173828125,
+    0.00152587890625, 0.001800537109375, 0.002105712890625, 0.002410888671875,
+    0.00274658203125, 0.00311279296875, 0.003509521484375, 0.003936767578125,
+    0.00439453125, 0.0048828125, 0.00543212890625, 0.006011962890625,
+    0.00665283203125, 0.00732421875, 0.008056640625, 0.00885009765625,
+    0.00970458984375, 0.0106201171875, 0.011627197265625, 0.012725830078125,
+    0.013885498046875, 0.01513671875, 0.016510009765625, 0.017974853515625,
+    0.0498046875, 0.11279296875, 0.17578125, 0.23828125, 0.30126953125,
+    0.3642578125, 0.42724609375, 0.490234375, 0.55322265625, 0.61572265625,
+    0.6787109375, 0.74169921875, 0.8046875, 0.86767578125, 0.93017578125,
+    0.9931640625, 1.05615234375, 1.119140625, 1.18212890625, 1.2451171875,
+    1.3076171875, 1.37060546875, 1.43359375, 1.49658203125, 1.5595703125,
+    1.62255859375, 1.68505859375, 1.748046875, 1.81103515625, 1.8740234375,
+    1.93701171875, 2.0};
 
 static const double ds2_qp_refl_cb[DS2_QP_NUM_REFL][128] = {
     /* codebook 0: 128 entries (7 bits) */
@@ -606,6 +638,8 @@ typedef struct DS2Context {
   int num_pulses;    /* 7 (SP) or 11 (QP) */
   int comb_n;        /* 72 (SP) or 64 (QP) */
   int frame_size;    /* bytes: 42 (SP) or 56 (QP) */
+  int is_qp7;        /* QP7 variable-length record variant */
+  uint16_t prng_state; /* QP7 short-record noise generator */
 
   /* Per-frame decoded parameters */
   double refl_coeffs[DS2_MAX_REFL];
@@ -743,9 +777,19 @@ static void ds2_qp_unpack_frame(DS2Context *p, const uint8_t *src) {
     for (i = 0; i < DS2_QP_NUM_PULSES; i++)
       sf->pulse_indices[i] = get_bits(&gb, 3);
 
-    /* Decode combinatorial pulse positions */
-    ds2_decode_combinatorial(sf->cb_index, DS2_QP_COMB_N, DS2_QP_NUM_PULSES,
-                             sf->pulse_positions);
+    /* Decode combinatorial pulse positions. The 40-bit field can exceed
+     * C(64,11) (misaligned frames in NCH selective-extraction cut files);
+     * the reference decoder then drops the first pulse and places the
+     * remaining ten at positions 9..0 (verified sample-exact against the
+     * NCH decode of such files). */
+    if (sf->cb_index >= ds2_comb(DS2_QP_COMB_N, DS2_QP_NUM_PULSES)) {
+      sf->pulse_positions[0] = DS2_QP_COMB_N;
+      for (i = 1; i < DS2_QP_NUM_PULSES; i++)
+        sf->pulse_positions[i] = DS2_QP_NUM_PULSES - 1 - i;
+    } else {
+      ds2_decode_combinatorial(sf->cb_index, DS2_QP_COMB_N, DS2_QP_NUM_PULSES,
+                               sf->pulse_positions);
+    }
   }
 }
 
@@ -878,12 +922,13 @@ static av_cold int ds2_decode_init(AVCodecContext *avctx) {
    * any tag >= 6 as QP. */
   if (avctx->codec_tag >= DS2_QP_FORMAT) {
     p->mode = DS2_QP_FORMAT;
+    p->is_qp7 = avctx->codec_tag == DS2_QP7_FORMAT;
     p->num_refl = DS2_QP_NUM_REFL;
     p->subframe_size = DS2_QP_SUBFRAME_SIZE;
     p->frame_samples = DS2_QP_FRAME_SAMPLES;
     p->num_pulses = DS2_QP_NUM_PULSES;
     p->comb_n = DS2_QP_COMB_N;
-    p->frame_size = DS2_QP_FRAME_SIZE;
+    p->frame_size = p->is_qp7 ? DS2_QP7_SHORT_SIZE : DS2_QP_FRAME_SIZE;
     avctx->sample_rate = DS2_QP_SAMPLE_RATE;
   } else {
     /* Default to SP */
@@ -918,6 +963,76 @@ static void ds2_reset_decoder_state(DS2Context *p)
                          : DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE;
   memset(p->lattice_state, 0, sizeof(p->lattice_state));
   p->deemph_state = 0.0;
+  p->prng_state = 0;
+}
+
+/*
+ * Decode one QP7 record (12-byte short or 56-byte long) into frame_buf.
+ * A 1-bit selector chooses the record type; both carry 16 reflection
+ * coefficients (QP7 bit allocation). Short records fill each subframe with
+ * scaled LCG noise (unvoiced); long records are the QP CELP subframe.
+ */
+static void ds2_qp7_decode_frame(DS2Context *p, const uint8_t *src, int size)
+{
+  GetBitContext gb;
+  int i, j, is_short;
+
+  /* A record is at most a 56-byte long record; clamp so an oversized packet
+   * cannot overflow the fixed p->bits buffer. */
+  if (size > DS2_MAX_FRAME_SIZE)
+    size = DS2_MAX_FRAME_SIZE;
+
+  ds2_swap_bytes(p, src, size);
+  init_get_bits(&gb, p->bits, size * 8);
+
+  is_short = get_bits(&gb, 1) == 0;
+  for (i = 0; i < DS2_QP_NUM_REFL; i++) {
+    int idx = get_bits(&gb, ds2_qp7_refl_bits[i]);
+    p->refl_coeffs[i] = ds2_qp_refl_cb[i][idx];
+  }
+
+  for (j = 0; j < DS2_SUBFRAMES; j++) {
+    if (is_short) {
+      int gain_idx = get_bits(&gb, DS2_QP7_SHORT_GAIN_BITS);
+      double gain = ds2_qp7_short_gain[FFMIN(gain_idx, 63)];
+
+      for (i = 0; i < DS2_QP_SUBFRAME_SIZE; i++) {
+        p->prng_state = p->prng_state * 0x209 + 0x103;
+        p->excitation[i] = (double)(int16_t)p->prng_state * gain;
+      }
+    } else {
+      DS2Subframe *sf = &p->sf[j];
+      int pg_idx, eg_idx;
+
+      sf->pitch_lag = get_bits(&gb, 8) + DS2_QP_PITCH_MIN;
+      pg_idx        = get_bits(&gb, 6);
+      sf->cb_index  = get_bits64(&gb, DS2_QP_COMB_BITS);
+      eg_idx        = get_bits(&gb, 6);
+      sf->pitch_gain = ds2_qp_pitch_gain[pg_idx];
+      sf->exc_gain   = ds2_qp_exc_gain[eg_idx];
+      for (i = 0; i < DS2_QP_NUM_PULSES; i++)
+        sf->pulse_indices[i] = get_bits(&gb, 3);
+
+      if (sf->cb_index >= ds2_comb(DS2_QP_COMB_N, DS2_QP_NUM_PULSES)) {
+        sf->pulse_positions[0] = DS2_QP_COMB_N;
+        for (i = 1; i < DS2_QP_NUM_PULSES; i++)
+          sf->pulse_positions[i] = DS2_QP_NUM_PULSES - 1 - i;
+      } else {
+        ds2_decode_combinatorial(sf->cb_index, DS2_QP_COMB_N, DS2_QP_NUM_PULSES,
+                                 sf->pulse_positions);
+      }
+
+      ds2_gen_adaptive_exc(p, sf->pitch_lag, DS2_QP_SUBFRAME_SIZE);
+      ds2_gen_fixed_exc(p, j, DS2_QP_SUBFRAME_SIZE);
+      ds2_gen_excitation(p, j, DS2_QP_SUBFRAME_SIZE);
+    }
+
+    ds2_update_pitch_memory(p, DS2_QP_SUBFRAME_SIZE);
+    ds2_lattice_filter(p, DS2_QP_SUBFRAME_SIZE);
+
+    for (i = 0; i < DS2_QP_SUBFRAME_SIZE; i++)
+      p->frame_buf[j * DS2_QP_SUBFRAME_SIZE + i] = p->synth_out[i];
+  }
 }
 
 static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
@@ -928,7 +1043,7 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   int16_t *out;
   int ret, j, i;
 
-  /* Segment reset flagged by demuxer (not AV_PKT_FLAG_KEY — the framework
+  /* Segment reset flagged by demuxer (not AV_PKT_FLAG_KEY - the framework
    * may set that on every audio packet). */
   if (avpkt->flags & AV_PKT_FLAG_CORRUPT) {
     ds2_reset_decoder_state(p);
@@ -950,31 +1065,37 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
   out = (int16_t *)frame->data[0];
 
-  /* Unpack frame parameters from bitstream */
-  if (p->mode == DS2_SP_FORMAT)
-    ds2_sp_unpack_frame(p, buf);
-  else
-    ds2_qp_unpack_frame(p, buf);
+  if (p->is_qp7) {
+    /* QP7 handles selector, unpack and subframe synthesis together, using
+     * the record length (variable per packet) rather than a fixed size. */
+    ds2_qp7_decode_frame(p, buf, buf_size);
+  } else {
+    /* Unpack frame parameters from bitstream */
+    if (p->mode == DS2_SP_FORMAT)
+      ds2_sp_unpack_frame(p, buf);
+    else
+      ds2_qp_unpack_frame(p, buf);
 
-  /* Decode each subframe */
-  for (j = 0; j < DS2_SUBFRAMES; j++) {
-    /* Generate adaptive excitation from pitch memory */
-    ds2_gen_adaptive_exc(p, p->sf[j].pitch_lag, p->subframe_size);
+    /* Decode each subframe */
+    for (j = 0; j < DS2_SUBFRAMES; j++) {
+      /* Generate adaptive excitation from pitch memory */
+      ds2_gen_adaptive_exc(p, p->sf[j].pitch_lag, p->subframe_size);
 
-    /* Generate fixed excitation from pulse codebook */
-    ds2_gen_fixed_exc(p, j, p->subframe_size);
+      /* Generate fixed excitation from pulse codebook */
+      ds2_gen_fixed_exc(p, j, p->subframe_size);
 
-    /* Combine: excitation = pitch_gain * adaptive + fixed */
-    ds2_gen_excitation(p, j, p->subframe_size);
+      /* Combine: excitation = pitch_gain * adaptive + fixed */
+      ds2_gen_excitation(p, j, p->subframe_size);
 
-    /* Update pitch memory */
-    ds2_update_pitch_memory(p, p->subframe_size);
+      /* Update pitch memory */
+      ds2_update_pitch_memory(p, p->subframe_size);
 
-    /* Lattice synthesis filter */
-    ds2_lattice_filter(p, p->subframe_size);
+      /* Lattice synthesis filter */
+      ds2_lattice_filter(p, p->subframe_size);
 
-    for (i = 0; i < p->subframe_size; i++)
-      p->frame_buf[j * p->subframe_size + i] = p->synth_out[i];
+      for (i = 0; i < p->subframe_size; i++)
+        p->frame_buf[j * p->subframe_size + i] = p->synth_out[i];
+    }
   }
 
   if (p->mode == DS2_QP_FORMAT)
@@ -991,7 +1112,7 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   }
 
   *got_frame_ptr = 1;
-  return p->frame_size;
+  return p->is_qp7 ? buf_size : p->frame_size;
 }
 
 const FFCodec ff_ds2_decoder = {
