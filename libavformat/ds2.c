@@ -39,6 +39,9 @@
 
 #define DS2_FORMAT_SP 0 /* Standard Play, 12000 Hz */
 #define DS2_FORMAT_QP 6 /* Quality Play, 16000 Hz */
+#define DS2_FORMAT_QP7 7 /* Grundig/Philips QP: variable-length records */
+#define DS2_QP7_SHORT_SIZE 12 /* bytes: unvoiced noise-fill record */
+#define DS2_QP7_LONG_SIZE 56  /* bytes: full CELP record */
 
 #define DS2_SP_FRAME_SIZE 42 /* SP: 328 bits ~ 41 bytes, padded to 42 */
 #define DS2_SP_SAMPLES_PER_FRAME 288 /* 72 samples * 4 subframes */
@@ -78,6 +81,12 @@ typedef struct DS2AnnotationRange {
   int last_frame;  /* exclusive */
 } DS2AnnotationRange;
 
+typedef struct DS2Qp7Record {
+  int off;   /* byte offset into the concatenated payload stream */
+  int size;  /* 12 (short) or 56 (long) */
+  int reset; /* reset the decoder before this record (segment boundary) */
+} DS2Qp7Record;
+
 typedef struct DS2DemuxContext {
   AVClass *class;
   int extract;          /* DS2ExtractMode; QP only */
@@ -99,20 +108,17 @@ typedef struct DS2DemuxContext {
   uint8_t cur_block[DS2_BLOCK_SIZE];
   int64_t cur_block_start;
   int cur_block_valid;
-  /* QP annotation / cut-point demux */
-  int abs_frame;
-  int raw_read_pos;
-  int qp_frame_part;     /* bytes read for in-progress QP frame (straddle head) */
-  int qp_frame_restart;  /* resync dropped partial frame; restart assembly */
-  int qp_reset_next;
-  int qp_resync_remaining; /* frames left in post-pause resync excitation band */
-  uint8_t qp_cont_queue[DS2_BLOCK_PAYLOAD_SIZE];
-  int qp_cont_queue_len;
-  int qp_cont_queue_pending; /* attach queue bytes on next emitted packet */
-  int *qp_block_raw_off; /* compact stream offset per block payload */
-  int qp_nb_blocks;
-  int qp_ann_block1_phase; /* magic 0x01: 0=block0+2..n-1, 1=deferred block1 */
-  int qp_ann_block1_fc;    /* magic 0x01: block1 fc (deferred tail frame count) */
+  /* QP block-quantized demux state */
+  int abs_frame;           /* frames emitted (or skipped) so far */
+  int qp_blk_frames_left;  /* fresh frames remaining in the current block */
+  int qp_reset_next;       /* flag decoder reset on the next emitted frame */
+  /* QP7 (format 7): variable-length records precomputed at open */
+  int is_qp7;
+  uint8_t *qp7_raw;        /* concatenated block payloads */
+  int qp7_raw_len;
+  DS2Qp7Record *qp7_records;
+  int qp7_nb_records;
+  int qp7_rec_idx;
   DS2AnnotationRange annotations[DS2_MAX_ANNOTATIONS];
   int nb_annotations;
 } DS2DemuxContext;
@@ -442,72 +448,6 @@ static int ds2_qp_frame_included(const DS2DemuxContext *ctx, int abs_frame)
   }
 }
 
-static void ds2_qp_capture_cont_prefix(DS2DemuxContext *ctx, AVIOContext *pb,
-                                     int64_t block_pos, int cont_size)
-{
-  int n = FFMIN(cont_size, DS2_BLOCK_PAYLOAD_SIZE);
-  int64_t saved_pos;
-
-  if (n <= 0)
-    return;
-
-  saved_pos = avio_tell(pb);
-  avio_seek(pb, block_pos + DS2_AUDIO_BLOCK_HEADER_SIZE, SEEK_SET);
-  if (avio_read(pb, ctx->qp_cont_queue, n) == n) {
-    ctx->qp_cont_queue_len     = n;
-    ctx->qp_cont_queue_pending = 1;
-  }
-  avio_seek(pb, saved_pos, SEEK_SET);
-}
-
-static void ds2_qp_capture_ann_block0_tail(DS2DemuxContext *ctx, AVIOContext *pb,
-                                          int block_idx, int bytes_used)
-{
-  int64_t bstart, saved_pos;
-  int tail;
-
-  if (ctx->file_magic_byte != 0x01 || block_idx != 0 || bytes_used <= 0)
-    return;
-
-  tail = DS2_BLOCK_PAYLOAD_SIZE - bytes_used;
-  if (tail <= 0)
-    return;
-
-  bstart    = ctx->header_size + (int64_t) block_idx * DS2_BLOCK_SIZE;
-  saved_pos = avio_tell(pb);
-  avio_seek(pb, bstart + DS2_AUDIO_BLOCK_HEADER_SIZE + bytes_used, SEEK_SET);
-  if (avio_read(pb, ctx->qp_cont_queue, tail) == tail) {
-    ctx->qp_cont_queue_len     = tail;
-    ctx->qp_cont_queue_pending = 1;
-  }
-  avio_seek(pb, saved_pos, SEEK_SET);
-}
-
-static void ds2_qp_attach_resync_side_data(AVPacket *pkt, DS2DemuxContext *ctx)
-{
-  int qlen = ctx->qp_cont_queue_len;
-  int sd_size = 12 + FFMAX(0, qlen);
-  uint8_t *sd;
-
-  if (ctx->qp_resync_remaining <= 0 && !ctx->qp_cont_queue_pending)
-    return;
-
-  sd = av_packet_new_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA, sd_size);
-  if (!sd)
-    return;
-
-  AV_WL32(sd, MKTAG('r', 's', 'y', 'n'));
-  AV_WL32(sd + 4, ctx->qp_resync_remaining);
-  AV_WL32(sd + 8, qlen);
-  if (qlen > 0)
-    memcpy(sd + 12, ctx->qp_cont_queue, qlen);
-
-  if (ctx->qp_cont_queue_pending) {
-    ctx->qp_cont_queue_pending = 0;
-    ctx->qp_cont_queue_len     = 0;
-  }
-}
-
 static int ds2_qp_count_output_frames(const DS2DemuxContext *ctx)
 {
   int f, n = 0;
@@ -519,18 +459,6 @@ static int ds2_qp_count_output_frames(const DS2DemuxContext *ctx)
   return n;
 }
 
-static int ds2_qp_payload_off(const DS2DemuxContext *ctx, const uint8_t *hdr,
-                              int block_idx)
-{
-  /*
-   * Annotation slice exports (magic 0x01) keep the first audio-bearing blocks
-   * at payload offset 0; later blocks use the normal anchor.
-   */
-  if (ctx->file_magic_byte == 0x01 && block_idx <= 1)
-    return 0;
-  return FFMAX(0, hdr[1] * 2 - DS2_AUDIO_BLOCK_HEADER_SIZE);
-}
-
 static int ds2_qp_cont_size(const uint8_t *hdr)
 {
   return FFMAX(0, 2 * hdr[1] + 2 * (hdr[0] >> 7) -
@@ -538,220 +466,188 @@ static int ds2_qp_cont_size(const uint8_t *hdr)
 }
 
 /**
- * Next block used for byte-cap alignment when counting frames only.
- * Block 0 in annotation slices caps at block2 anchor; demux still reads block1.
+ * Fresh frames that can start in a block entered with entry_off payload
+ * bytes already consumed (straddle tail of the previous block's last frame).
+ * Caps recorders that over-declare the header frame count (Grundig).
  */
-static int ds2_qp_next_cap_block_idx(const DS2DemuxContext *ctx, int block_idx)
+static int ds2_qp_entry_cap(int entry_off)
 {
-  if (ctx->file_magic_byte == 0x01 && block_idx == 0 && ctx->qp_nb_blocks > 2)
-    return 2;
-  return block_idx + 1;
+  return (DS2_BLOCK_PAYLOAD_SIZE - entry_off + DS2_QP_FRAME_SIZE - 1) /
+         DS2_QP_FRAME_SIZE;
 }
 
-static int ds2_qp_block_frame_bytes(AVFormatContext *s, DS2DemuxContext *ctx,
-                                    int block_idx, const uint8_t *hdr,
-                                    int raw_pos)
-{
-  AVIOContext *pb = s->pb;
-  int fc = hdr[2];
-  int want_bytes = fc * DS2_QP_FRAME_SIZE;
-  int capped = want_bytes;
-  int next_bi = ds2_qp_next_cap_block_idx(ctx, block_idx);
-  int64_t saved_pos = avio_tell(pb);
+/**
+ * Walk QP blocks simulating the block-quantized read used by the reference
+ * players: per block, an inbound straddling frame is finished first, then up
+ * to min(header frame count, geometric cap) fresh frames start back-to-back
+ * at the current offset; the last fresh frame may straddle into the next
+ * block; when a block's fresh frames end before the payload does, the tail
+ * bytes are dead and the next block starts a new frame at payload offset 0.
+ * The byte-1 anchor is not consulted during linear reads - NCH
+ * selective-extraction cut files rely on this (verified sample-exact
+ * against NCH decodes of such files).
+ *
+ * With target_frame >= 0, stops at the block in which that frame starts and
+ * fills *out; otherwise walks to end of file and returns the total number of
+ * frames.
+ */
+typedef struct DS2QPWalk {
+  int64_t block_start;  /* file offset of the block holding target_frame */
+  int entry_off;        /* payload bytes consumed by the inbound straddle */
+  int frames_before;    /* frames starting in earlier blocks */
+} DS2QPWalk;
 
-  if (next_bi < ctx->qp_nb_blocks) {
-    uint8_t nh[DS2_AUDIO_BLOCK_HEADER_SIZE];
-    int64_t bstart = ctx->header_size + (int64_t)next_bi * DS2_BLOCK_SIZE;
-    int next_start, ret;
-
-    avio_seek(pb, bstart, SEEK_SET);
-    ret = ds2_io_read(s, nh, sizeof(nh));
-    if (ret >= (int)sizeof(nh)) {
-      next_start = ctx->qp_block_raw_off[next_bi] +
-                   ds2_qp_payload_off(ctx, nh, next_bi);
-      capped = FFMIN(want_bytes, FFMAX(0, next_start - raw_pos));
-    }
-  }
-
-  avio_seek(pb, saved_pos, SEEK_SET);
-  return capped;
-}
-
-static int ds2_qp_count_block_frames(AVFormatContext *s, DS2DemuxContext *ctx,
-                                     int bi, int *raw_read_pos)
-{
-  AVIOContext *pb = s->pb;
-  uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
-  int fc, frames_raw_start, want_bytes, capped, next_bi, ret;
-  int64_t bstart = ctx->header_size + (int64_t)bi * DS2_BLOCK_SIZE;
-
-  avio_seek(pb, bstart, SEEK_SET);
-  ret = ds2_io_read(s, hdr, sizeof(hdr));
-  if (ret < sizeof(hdr))
-    return ret < 0 ? ret : AVERROR_EOF;
-
-  fc = hdr[2];
-  frames_raw_start = ctx->qp_block_raw_off[bi] + ds2_qp_payload_off(ctx, hdr, bi);
-
-  if (bi == 0)
-    *raw_read_pos = frames_raw_start;
-  else if (frames_raw_start != *raw_read_pos)
-    *raw_read_pos = frames_raw_start;
-
-  if (fc == 0) {
-    *raw_read_pos += ds2_qp_cont_size(hdr);
-    return 0;
-  }
-
-  want_bytes = fc * DS2_QP_FRAME_SIZE;
-  next_bi    = ds2_qp_next_cap_block_idx(ctx, bi);
-  if (next_bi < ctx->qp_nb_blocks) {
-    uint8_t nh[DS2_AUDIO_BLOCK_HEADER_SIZE];
-
-    avio_seek(pb, ctx->header_size + (int64_t)next_bi * DS2_BLOCK_SIZE, SEEK_SET);
-    ret = ds2_io_read(s, nh, sizeof(nh));
-    if (ret < sizeof(nh))
-      return ret < 0 ? ret : AVERROR_EOF;
-    capped = FFMIN(want_bytes, FFMAX(0,
-        ctx->qp_block_raw_off[next_bi] + ds2_qp_payload_off(ctx, nh, next_bi) -
-        *raw_read_pos));
-  } else {
-    capped = want_bytes;
-  }
-
-  ret = capped / DS2_QP_FRAME_SIZE;
-  *raw_read_pos += capped;
-  return ret;
-}
-
-static int ds2_qp_build_block_offsets(AVFormatContext *s)
+static int ds2_qp_walk_blocks(AVFormatContext *s, int target_frame,
+                              DS2QPWalk *out)
 {
   DS2DemuxContext *ctx = s->priv_data;
   AVIOContext *pb = s->pb;
   int64_t fsize = avio_size(pb);
-  int blocks, i, off = 0, ret;
-
-  if (fsize < ctx->header_size)
-    return AVERROR_INVALIDDATA;
-
-  blocks = (fsize - ctx->header_size) / DS2_BLOCK_SIZE;
-  av_freep(&ctx->qp_block_raw_off);
-  ctx->qp_block_raw_off = av_malloc_array(blocks, sizeof(*ctx->qp_block_raw_off));
-  if (!ctx->qp_block_raw_off)
-    return AVERROR(ENOMEM);
-  ctx->qp_nb_blocks = blocks;
-
-  for (i = 0; i < blocks; i++) {
-    uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
-    int fc, cont_size;
-
-    ctx->qp_block_raw_off[i] = off;
-    avio_seek(pb, ctx->header_size + (int64_t)i * DS2_BLOCK_SIZE, SEEK_SET);
-    ret = ds2_io_read(s, hdr, sizeof(hdr));
-    if (ret < sizeof(hdr))
-      return ret < 0 ? ret : AVERROR_EOF;
-
-    fc        = hdr[2];
-    cont_size = ds2_qp_cont_size(hdr);
-    off += fc == 0 ? cont_size : DS2_BLOCK_PAYLOAD_SIZE;
-  }
-
-  return 0;
-}
-
-/**
- * QP frame total for EOF/duration: header[2] is
- * bookkeeping and can over-count (e.g. 19 at a 28-block boundary).
- * feeds full block payloads but stops after min(fc*56, next_block_alignment)
- * bytes of stream per block, not the raw sum of header frame counts.
- */
-static int ds2_qp_count_frames(AVFormatContext *s)
-{
-  DS2DemuxContext *ctx = s->priv_data;
-  AVIOContext *pb = s->pb;
-  int bi, raw_read_pos = 0, total = 0, ret, n;
   int64_t saved_pos = avio_tell(pb);
+  int64_t bstart;
+  int total = 0, entry = 0, ret;
 
-  if (!ctx->qp_block_raw_off || ctx->qp_nb_blocks <= 0)
-    return AVERROR(EINVAL);
+  for (bstart = ctx->header_size;
+       bstart + DS2_AUDIO_BLOCK_HEADER_SIZE <= fsize;
+       bstart += DS2_BLOCK_SIZE) {
+    uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
+    int fc, take, end;
 
-  for (bi = 0; bi < ctx->qp_nb_blocks; bi++) {
-    if (ctx->file_magic_byte == 0x01 && bi == 1)
-      continue;
-    n = ds2_qp_count_block_frames(s, ctx, bi, &raw_read_pos);
-    if (n < 0) {
-      ret = n;
+    avio_seek(pb, bstart, SEEK_SET);
+    ret = ds2_io_read(s, hdr, sizeof(hdr));
+    if (ret < (int)sizeof(hdr)) {
+      ret = ret < 0 ? ret : AVERROR_EOF;
       goto done;
     }
-    total += n;
-  }
-
-  if (ctx->file_magic_byte == 0x01 && ctx->qp_nb_blocks > 1) {
-    n = ds2_qp_count_block_frames(s, ctx, 1, &raw_read_pos);
-    if (n < 0) {
-      ret = n;
+    fc   = hdr[2];
+    take = FFMIN(fc, ds2_qp_entry_cap(entry));
+    if (out && target_frame >= 0 && target_frame < total + take) {
+      out->block_start   = bstart;
+      out->entry_off     = entry;
+      out->frames_before = total;
+      ret = 0;
       goto done;
     }
-    total += n;
+    if (take > 0) {
+      end   = entry + take * DS2_QP_FRAME_SIZE;
+      entry = end > DS2_BLOCK_PAYLOAD_SIZE ? end - DS2_BLOCK_PAYLOAD_SIZE : 0;
+    } else {
+      entry = 0; /* pause/end block: any straddle tail ends inside it */
+    }
+    total += take;
   }
-  ret = total;
+  ret = (out && target_frame >= 0) ? AVERROR_EOF : total;
 
 done:
   avio_seek(pb, saved_pos, SEEK_SET);
   return ret;
 }
 
-static int64_t ds2_qp_file_pos_for_raw(AVFormatContext *s, int raw_pos)
+static int ds2_qp_count_frames(AVFormatContext *s)
+{
+  return ds2_qp_walk_blocks(s, -1, NULL);
+}
+
+/*
+ * Precompute the QP7 (format 7) record list. QP7 packs the payload as a
+ * continuous stream of byte-aligned records; each record's second byte's top
+ * bit selects a 12-byte "short" or 56-byte "long" record. Per block, the
+ * byte-1 anchor gives the first record's stream offset (never rewinding), and
+ * the header frame count is the number of records that start there. A frame
+ * count of 0 is a pause: it forces a decoder reset before the next record.
+ * The whole payload is read into ctx->qp7_raw and the records are described in
+ * ctx->qp7_records (mirrors the dss-codec Rust reference demuxer).
+ */
+static int ds2_qp7_build_records(AVFormatContext *s)
 {
   DS2DemuxContext *ctx = s->priv_data;
-  int bi, block_end;
+  AVIOContext *pb = s->pb;
+  int64_t fsize = avio_size(pb);
+  int64_t saved = avio_tell(pb);
+  const int payload = DS2_BLOCK_PAYLOAD_SIZE;
+  int num_blocks, bi, cap, raw_read_pos = 0, reset_next = 0, seg_has = 0, ret = 0;
 
-  if (!ctx->qp_block_raw_off || raw_pos < 0)
-    return AVERROR(EINVAL);
+  if (fsize < ctx->header_size)
+    return AVERROR_INVALIDDATA;
+  num_blocks = (fsize - ctx->header_size) / DS2_BLOCK_SIZE;
 
-  for (bi = 0; bi < ctx->qp_nb_blocks; bi++) {
-    uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
-    int fc, cont_size, block_size;
-    int64_t bstart = ctx->header_size + (int64_t)bi * DS2_BLOCK_SIZE;
-    int ret;
+  ctx->qp7_raw_len = num_blocks * payload;
+  ctx->qp7_raw = av_malloc(FFMAX(ctx->qp7_raw_len, 1));
+  if (!ctx->qp7_raw)
+    return AVERROR(ENOMEM);
 
-    avio_seek(s->pb, bstart, SEEK_SET);
-    ret = ds2_io_read(s, hdr, sizeof(hdr));
-    if (ret < sizeof(hdr))
-      return ret < 0 ? ret : AVERROR_EOF;
-
-    fc        = hdr[2];
-    cont_size = ds2_qp_cont_size(hdr);
-    block_size = fc == 0 ? cont_size : DS2_BLOCK_PAYLOAD_SIZE;
-    block_end  = ctx->qp_block_raw_off[bi] + block_size;
-
-    if (raw_pos < block_end) {
-      return bstart + DS2_AUDIO_BLOCK_HEADER_SIZE +
-             (raw_pos - ctx->qp_block_raw_off[bi]);
+  for (bi = 0; bi < num_blocks; bi++) {
+    avio_seek(pb, ctx->header_size + (int64_t)bi * DS2_BLOCK_SIZE +
+                      DS2_AUDIO_BLOCK_HEADER_SIZE, SEEK_SET);
+    if (ds2_io_read(s, ctx->qp7_raw + bi * payload, payload) < payload) {
+      ret = AVERROR_EOF;
+      goto done;
     }
   }
 
-  return ctx->header_size + (int64_t)ctx->qp_nb_blocks * DS2_BLOCK_SIZE;
-}
+  cap = ctx->qp7_raw_len / DS2_QP7_SHORT_SIZE + 1;
+  ctx->qp7_records = av_malloc_array(cap, sizeof(*ctx->qp7_records));
+  if (!ctx->qp7_records) {
+    ret = AVERROR(ENOMEM);
+    goto done;
+  }
+  ctx->qp7_nb_records = 0;
 
-static int ds2_qp_seek_to_raw(AVFormatContext *s, DS2DemuxContext *ctx,
-                              AVIOContext *pb, int64_t block_pos,
-                              int frames_raw_start, int set_reset)
-{
-  int64_t seekto = ds2_qp_file_pos_for_raw(s, frames_raw_start);
-  int counter_bytes;
+  for (bi = 0; bi < num_blocks; bi++) {
+    int fc, payload_off, frames_raw_start, f;
+    uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
 
-  if (seekto < 0)
-    return (int)seekto;
+    avio_seek(pb, ctx->header_size + (int64_t)bi * DS2_BLOCK_SIZE, SEEK_SET);
+    if (ds2_io_read(s, hdr, sizeof(hdr)) < (int)sizeof(hdr)) {
+      ret = AVERROR_EOF;
+      goto done;
+    }
+    fc = hdr[2];
 
-  avio_seek(pb, seekto, SEEK_SET);
-  counter_bytes = DS2_BLOCK_PAYLOAD_SIZE -
-                  (int)(seekto - (block_pos + DS2_AUDIO_BLOCK_HEADER_SIZE));
-  ctx->raw_read_pos = frames_raw_start;
-  ctx->counter      = FFMAX(0, counter_bytes);
-  if (set_reset)
-    ctx->qp_reset_next = 1;
+    if (fc == 0) {
+      int zero_end = (bi + 1) * payload;
+
+      if (seg_has) {
+        reset_next = 1;
+        seg_has = 0;
+      }
+      if (zero_end > raw_read_pos)
+        raw_read_pos = zero_end;
+      continue;
+    }
+
+    payload_off = FFMAX(0, hdr[1] * 2 - DS2_AUDIO_BLOCK_HEADER_SIZE);
+    frames_raw_start = bi * payload + payload_off;
+    if (frames_raw_start > raw_read_pos)
+      raw_read_pos = frames_raw_start;
+
+    for (f = 0; f < fc; f++) {
+      int size;
+
+      if (raw_read_pos + 2 > ctx->qp7_raw_len)
+        goto finish; /* trailing partial record: stop (lenient) */
+      size = (ctx->qp7_raw[raw_read_pos + 1] & 0x80) ? DS2_QP7_LONG_SIZE
+                                                     : DS2_QP7_SHORT_SIZE;
+      if (raw_read_pos + size > ctx->qp7_raw_len)
+        goto finish;
+
+      ctx->qp7_records[ctx->qp7_nb_records].off   = raw_read_pos;
+      ctx->qp7_records[ctx->qp7_nb_records].size  = size;
+      ctx->qp7_records[ctx->qp7_nb_records].reset = reset_next;
+      ctx->qp7_nb_records++;
+      reset_next = 0;
+      seg_has = 1;
+      raw_read_pos += size;
+    }
+  }
+
+finish:
+  avio_seek(pb, saved, SEEK_SET);
   return 0;
+
+done:
+  avio_seek(pb, saved, SEEK_SET);
+  return ret;
 }
 
 static int ds2_find_next_nonempty_swap(AVFormatContext *s, int block_idx) {
@@ -783,32 +679,6 @@ static int ds2_find_next_nonempty_swap(AVFormatContext *s, int block_idx) {
   return 0;
 }
 
-static void ds2_qp_ann_enter_deferred(DS2DemuxContext *ctx, AVIOContext *pb,
-                                      int64_t *block_pos, int *block_idx)
-{
-  int blk0_fc = 0;
-  int64_t saved_pos = avio_tell(pb);
-
-  if (ctx->qp_nb_blocks > 0) {
-    uint8_t b0hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
-
-    avio_seek(pb, ctx->header_size, SEEK_SET);
-    if (avio_read(pb, b0hdr, sizeof(b0hdr)) == sizeof(b0hdr))
-      blk0_fc = b0hdr[2];
-    if (blk0_fc > 0)
-      ds2_qp_capture_ann_block0_tail(ctx, pb, 0, blk0_fc * DS2_QP_FRAME_SIZE);
-    avio_seek(pb, saved_pos, SEEK_SET);
-  }
-
-  ctx->qp_ann_block1_phase = 1;
-  avio_seek(pb, ctx->header_size + DS2_BLOCK_SIZE, SEEK_SET);
-  *block_pos = avio_tell(pb);
-  *block_idx = 1;
-  if (ctx->qp_block_raw_off)
-    ctx->raw_read_pos = ctx->qp_block_raw_off[1];
-  ctx->counter = 0;
-}
-
 static int ds2_load_block(AVFormatContext *s, int align_check) {
   DS2DemuxContext *ctx = s->priv_data;
   AVIOContext *pb = s->pb;
@@ -816,70 +686,11 @@ static int ds2_load_block(AVFormatContext *s, int align_check) {
   int64_t block_pos;
   int ret, frame_count, cont_size, block_idx;
 
-  if (ctx->format_type == DS2_FORMAT_QP) {
-    if (ctx->total_frames > 0 && ctx->abs_frame >= ctx->total_frames)
-      return AVERROR_EOF;
-  } else if (ctx->total_frames > 0 && ctx->frames_read >= ctx->total_frames) {
+  if (ctx->total_frames > 0 && ctx->frames_read >= ctx->total_frames)
     return AVERROR_EOF;
-  }
 
   block_pos = avio_tell(pb);
   block_idx = (block_pos - ctx->header_size) / DS2_BLOCK_SIZE;
-
-  if (ctx->format_type == DS2_FORMAT_QP && ctx->file_magic_byte == 0x01) {
-    if (!ctx->qp_ann_block1_phase &&
-        ctx->qp_ann_block1_fc > 0 &&
-        ctx->abs_frame >= ctx->total_frames - ctx->qp_ann_block1_fc) {
-      ds2_qp_ann_enter_deferred(ctx, pb, &block_pos, &block_idx);
-    } else if (!ctx->qp_ann_block1_phase) {
-      /*
-       * Forward pass reads block1 continuation packets (payload offset 0).
-       * Do not jump to block2 here: NCH replays block1 bytes as output f2+
-       * (see WKju6639i_annotation: f2 @2054, not block2 anchor @2618).
-       */
-      if (block_idx >= ctx->qp_nb_blocks) {
-        ds2_qp_ann_enter_deferred(ctx, pb, &block_pos, &block_idx);
-      }
-    }
-  }
-
-  if (ctx->format_type == DS2_FORMAT_QP && align_check) {
-    int64_t rel = (block_pos - ctx->header_size) % DS2_BLOCK_SIZE;
-
-    if (rel == DS2_AUDIO_BLOCK_HEADER_SIZE) {
-      /* read_header left the file offset at payload start; re-read header. */
-      avio_seek(pb, block_pos - DS2_AUDIO_BLOCK_HEADER_SIZE, SEEK_SET);
-      block_pos -= DS2_AUDIO_BLOCK_HEADER_SIZE;
-    }
-  }
-
-  if (ctx->format_type == DS2_FORMAT_QP && align_check &&
-      (block_pos - ctx->header_size) % DS2_BLOCK_SIZE >
-          DS2_AUDIO_BLOCK_HEADER_SIZE) {
-    int remain = DS2_BLOCK_SIZE -
-                 (int)((block_pos - ctx->header_size) % DS2_BLOCK_SIZE);
-
-  /*
-   * Block tail bytes may complete a straddle frame (main_text f18: 4 bytes
-   * before block2 header).  Do not skip them while mid-frame or when a new
-   * frame can start from the tail.
-   */
-    if (ctx->qp_frame_part > 0 || (ctx->counter == 0 && remain > 0 &&
-                                   remain < DS2_QP_FRAME_SIZE)) {
-      ctx->counter = remain;
-      return 0;
-    }
-    /* Straddle tail already consumed; skip payload remainder only. */
-    if (ctx->file_magic_byte == 0x01 && !ctx->qp_ann_block1_phase &&
-        block_idx == 0 && ctx->qp_nb_blocks > 1) {
-      /* Annotation slice: keep compact-stream offset aligned at block1. */
-      ctx->raw_read_pos = ctx->qp_block_raw_off[1];
-    }
-    avio_skip(pb, DS2_BLOCK_SIZE -
-                     (int)((block_pos - ctx->header_size) % DS2_BLOCK_SIZE));
-    ctx->counter = 0;
-    return 0;
-  }
 
   ret = ds2_io_read(s, hdr, sizeof(hdr));
   if (ret < sizeof(hdr))
@@ -888,150 +699,172 @@ static int ds2_load_block(AVFormatContext *s, int align_check) {
   frame_count = hdr[2];
   cont_size   = ds2_qp_cont_size(hdr);
 
-  if (ctx->format_type == DS2_FORMAT_QP && ctx->file_magic_byte == 0x01 &&
-      !ctx->qp_ann_block1_phase && block_idx == 1 && !ctx->qp_cont_queue_pending) {
-    uint8_t b0hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
-    int64_t saved = avio_tell(pb);
-
-    avio_seek(pb, ctx->header_size, SEEK_SET);
-    if (avio_read(pb, b0hdr, sizeof(b0hdr)) == sizeof(b0hdr) && b0hdr[2] > 0)
-      ds2_qp_capture_ann_block0_tail(ctx, pb, 0, b0hdr[2] * DS2_QP_FRAME_SIZE);
-    avio_seek(pb, saved, SEEK_SET);
-  }
-
   if (frame_count == 0) {
-    if (ctx->format_type == DS2_FORMAT_SP) {
-      if (cont_size > 0)
-        avio_skip(pb, cont_size);
-      avio_skip(pb, DS2_BLOCK_PAYLOAD_SIZE - cont_size);
-      ctx->counter = 0;
-      ctx->swap_reset_pending = 1;
-      ctx->next_blk_swap = ds2_find_next_nonempty_swap(s, block_idx);
-    } else if (ctx->format_type == DS2_FORMAT_QP) {
-      if (!align_check && cont_size > 0) {
-        /* Straddle tail in a count=0 block (e.g. final block); read cont bytes. */
-        ctx->counter = cont_size;
-      } else {
-        /* Pause/segment marker: discard payload, keep cont in raw stream only. */
-        if (cont_size > 0) {
-          avio_skip(pb, cont_size);
-          ctx->raw_read_pos += cont_size;
-        }
-        avio_skip(pb, DS2_BLOCK_PAYLOAD_SIZE - cont_size);
-        ctx->counter = 0;
-        ctx->qp_reset_next = 1;
-      }
-    }
+    if (cont_size > 0)
+      avio_skip(pb, cont_size);
+    avio_skip(pb, DS2_BLOCK_PAYLOAD_SIZE - cont_size);
+    ctx->counter = 0;
+    ctx->swap_reset_pending = 1;
+    ctx->next_blk_swap = ds2_find_next_nonempty_swap(s, block_idx);
   } else {
-    if (ctx->format_type == DS2_FORMAT_QP) {
-      if (!align_check) {
-        /*
-         * Mid-frame block entry: re-anchor when straddle head + byte1 anchor
-         * is not a full frame (DssParser FUN_10009910 / doc 07).
-         */
-        int anchor = ds2_qp_payload_off(ctx, hdr, block_idx);
-        int part   = ctx->qp_frame_part;
-
-        if (part > 0 &&
-            !((part == 0 && anchor == 0) ||
-              (part > 0 && part + anchor == DS2_QP_FRAME_SIZE))) {
-          /*
-           * Re-sync blocks (fc=1, large anchor) prefix the payload with a
-           * continuation run before the anchored frame. Finish the straddle
-           * from that prefix instead of jumping to the anchor (main_text f18).
-           */
-          if (cont_size >= DS2_QP_FRAME_SIZE - part) {
-            avio_seek(pb, block_pos + DS2_AUDIO_BLOCK_HEADER_SIZE, SEEK_SET);
-            ctx->raw_read_pos = ctx->qp_block_raw_off[block_idx];
-            ctx->counter      = cont_size;
-            /*
-             * tssink arms ctx+0x6c from parser queue metadata (not cont/56).
-             * main_text band is f18..f100 (~83 frames) while cont/56=8.
-             * Until parser metadata is wired, scale from prefix frame count.
-             */
-            {
-              int prefix_frames = cont_size / DS2_QP_FRAME_SIZE;
-
-              ctx->qp_resync_remaining =
-                  FFMAX(ctx->qp_resync_remaining,
-                        prefix_frames > 0 ? prefix_frames * 10 + 3 : 1);
-            }
-            ds2_qp_capture_cont_prefix(ctx, pb, block_pos, cont_size);
-            ctx->qp_reset_next = 1;
-          } else {
-            int64_t seekto = block_pos + DS2_AUDIO_BLOCK_HEADER_SIZE + anchor;
-
-            avio_seek(pb, seekto, SEEK_SET);
-            ctx->raw_read_pos      = ctx->qp_block_raw_off[block_idx] + anchor;
-            ctx->counter           = DS2_BLOCK_PAYLOAD_SIZE - anchor;
-            ctx->qp_frame_part     = 0;
-            ctx->qp_frame_restart  = 1;
-            ctx->qp_reset_next     = 1;
-          }
-        } else {
-          ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
-        }
-      } else {
-        int payload_off      = ds2_qp_payload_off(ctx, hdr, block_idx);
-        int frames_raw_start = ctx->qp_block_raw_off[block_idx] + payload_off;
-        int counter_bytes    = DS2_BLOCK_PAYLOAD_SIZE - payload_off;
-        int ret;
-
-        if (block_idx > 0 && frames_raw_start < ctx->raw_read_pos) {
-          int set_reset = !(ctx->file_magic_byte == 0x01 && ctx->qp_ann_block1_phase);
-
-          ret = ds2_qp_seek_to_raw(s, ctx, pb, block_pos, frames_raw_start,
-                                   set_reset);
-          if (ret < 0)
-            return ret;
-          ctx->counter = FFMIN(ctx->counter,
-                               ds2_qp_block_frame_bytes(s, ctx, block_idx, hdr,
-                                                        ctx->raw_read_pos));
-        } else if (ctx->qp_reset_next) {
-          ret = ds2_qp_seek_to_raw(s, ctx, pb, block_pos, frames_raw_start, 0);
-          if (ret < 0)
-            return ret;
-          ctx->counter = FFMIN(ctx->counter,
-                               ds2_qp_block_frame_bytes(s, ctx, block_idx, hdr,
-                                                        ctx->raw_read_pos));
-        } else if (frames_raw_start > ctx->raw_read_pos) {
-          int set_reset = 1;
-
-          if (ctx->file_magic_byte == 0x01 && !ctx->qp_ann_block1_phase)
-            set_reset = 0;
-          ret = ds2_qp_seek_to_raw(s, ctx, pb, block_pos, frames_raw_start,
-                                   set_reset);
-          if (ret < 0)
-            return ret;
-          ctx->counter = FFMIN(ctx->counter,
-                               ds2_qp_block_frame_bytes(s, ctx, block_idx, hdr,
-                                                        ctx->raw_read_pos));
-        } else {
-          int frame_bytes;
-
-          ctx->raw_read_pos = frames_raw_start;
-          ctx->counter      = FFMAX(0, counter_bytes);
-          frame_bytes = ds2_qp_block_frame_bytes(s, ctx, block_idx, hdr,
-                                                   ctx->raw_read_pos);
-          ctx->counter = FFMIN(ctx->counter, frame_bytes);
-        }
-      }
-    }
-    if (ctx->format_type == DS2_FORMAT_SP && ctx->swap_reset_pending) {
+    if (ctx->swap_reset_pending) {
       ctx->swap = ctx->next_blk_swap;
       ctx->ds2_sp_swap_byte = -1;
       ctx->swap_reset_pending = 0;
-    } else if (ctx->format_type != DS2_FORMAT_QP) {
+    } else {
       ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
-    }
-    if (ctx->format_type == DS2_FORMAT_QP && frame_count > 0 && align_check) {
-      int frame_bytes = ds2_qp_block_frame_bytes(s, ctx, block_idx, hdr,
-                                                   ctx->raw_read_pos);
-      ctx->counter = FFMIN(ctx->counter, frame_bytes);
     }
   }
 
   return 0;
+}
+
+/**
+ * Position the stream at the payload of the next block that declares fresh
+ * frames, skipping dead tail bytes and whole pause blocks (frame count 0).
+ * Sets counter and qp_blk_frames_left.
+ */
+static int ds2_qp_enter_next_block(AVFormatContext *s)
+{
+  DS2DemuxContext *ctx = s->priv_data;
+  AVIOContext *pb = s->pb;
+  int64_t fsize = avio_size(pb);
+
+  for (;;) {
+    int64_t pos = avio_tell(pb);
+    int64_t rel = pos - ctx->header_size;
+    int64_t bstart;
+    uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
+    int ret, fc;
+
+    if (rel < 0)
+      rel = 0;
+    bstart = ctx->header_size +
+             ((rel + DS2_BLOCK_SIZE - 1) / DS2_BLOCK_SIZE) * DS2_BLOCK_SIZE;
+    if (bstart + DS2_AUDIO_BLOCK_HEADER_SIZE > fsize)
+      return AVERROR_EOF;
+
+    avio_seek(pb, bstart, SEEK_SET);
+    ret = ds2_io_read(s, hdr, sizeof(hdr));
+    if (ret < (int)sizeof(hdr))
+      return ret < 0 ? ret : AVERROR_EOF;
+
+    fc = hdr[2];
+    if (fc > 0) {
+      ctx->qp_blk_frames_left = FFMIN(fc, ds2_qp_entry_cap(0));
+      ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+      return 0;
+    }
+
+    /* Pause/segment marker: skip the whole block, reset the decoder at the
+     * next emitted frame. */
+    avio_skip(pb, DS2_BLOCK_PAYLOAD_SIZE);
+    ctx->qp_reset_next = 1;
+  }
+}
+
+/**
+ * Read the next 56-byte QP frame from the block-quantized stream into dst.
+ * A frame that runs past the current payload straddles into the next block,
+ * whose header is consumed in passing and whose (capped) frame count
+ * becomes current.
+ */
+static int ds2_qp_next_frame_bytes(AVFormatContext *s, uint8_t *dst)
+{
+  DS2DemuxContext *ctx = s->priv_data;
+  int ret, offset = 0;
+
+  if (ctx->qp_blk_frames_left <= 0) {
+    ret = ds2_qp_enter_next_block(s);
+    if (ret < 0)
+      return ret;
+  }
+  ctx->qp_blk_frames_left--;
+
+  while (offset < DS2_QP_FRAME_SIZE) {
+    int to_read;
+
+    if (ctx->counter == 0) {
+      uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
+      int rem = DS2_QP_FRAME_SIZE - offset;
+
+      ret = ds2_io_read(s, hdr, sizeof(hdr));
+      if (ret < (int)sizeof(hdr))
+        return ret < 0 ? ret : AVERROR_EOF;
+      ctx->qp_blk_frames_left = FFMIN(hdr[2], ds2_qp_entry_cap(rem));
+      ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+    }
+
+    to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
+    ret = ds2_io_read(s, dst + offset, to_read);
+    if (ret < to_read)
+      return ret < 0 ? ret : AVERROR_EOF;
+
+    offset       += to_read;
+    ctx->counter -= to_read;
+  }
+
+  return 0;
+}
+
+/* Heuristic check for a valid DS2 audio block header (byte 0 = 0x0f, the two
+ * 0xff markers, a nonzero frame count, and a known format type). */
+static int ds2_is_audio_block_header(const uint8_t *h)
+{
+  int fmt = h[4];
+
+  return h[0] == 0x0f && h[3] == 0xff && h[5] == 0xff && h[2] > 0 &&
+         (fmt == 0 || fmt == 1 || fmt == 2 || fmt == 3 || fmt == 6 || fmt == 7);
+}
+
+/*
+ * Locate the first audio block in a Grundig format-7 ("\x07ds2") file. Its
+ * header size is not byte0*512: scan the 512-byte grid for the first run of at
+ * least four consecutive valid audio-block headers (mirrors the dss-codec
+ * reference detect_ds2_audio_start); fall back to the best partial run, or
+ * 0x1000. Only used for byte0 == 0x07; other layouts use byte0*512.
+ */
+static int64_t ds2_detect_audio_start(AVFormatContext *s)
+{
+  AVIOContext *pb = s->pb;
+  int64_t fsize = avio_size(pb);
+  int64_t scan_end = FFMIN(fsize - DS2_AUDIO_BLOCK_HEADER_SIZE, 0x10000);
+  int64_t off, best_start = 0x1000;
+  int best_score = 0;
+
+  for (off = DS2_BLOCK_SIZE; off <= scan_end; off += DS2_BLOCK_SIZE) {
+    uint8_t h[DS2_AUDIO_BLOCK_HEADER_SIZE];
+    int valid = 0, i;
+
+    avio_seek(pb, off, SEEK_SET);
+    if (ds2_io_read(s, h, sizeof(h)) < (int)sizeof(h))
+      break;
+    if (!ds2_is_audio_block_header(h))
+      continue;
+
+    for (i = 0; i < 16; i++) {
+      int64_t bs = off + (int64_t)i * DS2_BLOCK_SIZE;
+      uint8_t bh[DS2_AUDIO_BLOCK_HEADER_SIZE];
+
+      if (bs + DS2_AUDIO_BLOCK_HEADER_SIZE > fsize)
+        break;
+      avio_seek(pb, bs, SEEK_SET);
+      if (ds2_io_read(s, bh, sizeof(bh)) < (int)sizeof(bh))
+        break;
+      if (!ds2_is_audio_block_header(bh))
+        break;
+      valid++;
+    }
+
+    if (valid >= 4)
+      return off;
+    if (valid > best_score) {
+      best_score = valid;
+      best_start = off;
+    }
+  }
+
+  return best_start;
 }
 
 static int ds2_read_header(AVFormatContext *s) {
@@ -1051,12 +884,16 @@ static int ds2_read_header(AVFormatContext *s) {
   ctx->file_magic_byte = file_magic[0];
 
   /* Byte 0 is the header size in 512-byte blocks. Olympus DS2 uses 3 (0x600);
-   * Grundig/Philips recorders use 6/7 (0xc00/0xe00), reserving the extra blocks
-   * for GR___ device-id records before the audio. Magic 0x01 annotation slices
+   * Grundig/Philips 6 recorders use 6 (0xc00), reserving the extra blocks for
+   * GR___ device-id records before the audio. Magic 0x01 annotation slices
    * keep the standard 0x600 layout (byte 0 is a type tag there, not a size).
-   * Encrypted files (magic "\x03enc") are byte 0 == 3 -> 0x600 as well. */
+   * Encrypted files (magic "\x03enc") are byte 0 == 3 -> 0x600 as well. The
+   * format-7 magic "\x07ds2" is a type marker, not a block count, so its audio
+   * start is found by scanning (mirrors the dss-codec reference). */
   if (ctx->file_magic_byte == 0x01)
     ctx->header_size = DS2_HEADER_SIZE;
+  else if (ctx->file_magic_byte == 0x07)
+    ctx->header_size = ds2_detect_audio_start(s);
   else
     ctx->header_size = ctx->file_magic_byte * DS2_BLOCK_SIZE;
 
@@ -1124,6 +961,7 @@ static int ds2_read_header(AVFormatContext *s) {
     return ret < 0 ? ret : AVERROR_EOF;
 
   ctx->format_type = block_header[4];
+  ctx->is_qp7      = ctx->format_type == DS2_FORMAT_QP7;
 
   st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
   st->codecpar->codec_id = AV_CODEC_ID_DS2;
@@ -1153,27 +991,21 @@ static int ds2_read_header(AVFormatContext *s) {
         return ret < 0 ? ret : AVERROR_EOF;
 
       ds2_read_annotations(ctx, file_hdr, sizeof(file_hdr));
-      ret = ds2_qp_build_block_offsets(s);
-      if (ret < 0)
-        return ret;
-      ret = ds2_qp_count_frames(s);
-      if (ret < 0)
-        return ret;
-      ctx->total_frames = ret;
-      ctx->abs_frame          = 0;
-      ctx->raw_read_pos       = ds2_qp_payload_off(ctx, block_header, 0);
-      ctx->qp_reset_next      = 0;
-      ctx->qp_ann_block1_phase = 0;
-      ctx->qp_ann_block1_fc    = 0;
-      if (ctx->file_magic_byte == 0x01 && ctx->qp_nb_blocks > 1) {
-        uint8_t b1hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
-        int ret_b1;
-
-        avio_seek(pb, ctx->header_size + DS2_BLOCK_SIZE, SEEK_SET);
-        ret_b1 = ds2_io_read(s, b1hdr, sizeof(b1hdr));
-        if (ret_b1 >= (int)sizeof(b1hdr))
-          ctx->qp_ann_block1_fc = b1hdr[2];
+      if (ctx->is_qp7) {
+        ret = ds2_qp7_build_records(s);
+        if (ret < 0)
+          return ret;
+        ctx->total_frames = ctx->qp7_nb_records;
+        ctx->qp7_rec_idx  = 0;
+      } else {
+        ret = ds2_qp_count_frames(s);
+        if (ret < 0)
+          return ret;
+        ctx->total_frames = ret;
       }
+      ctx->abs_frame          = 0;
+      ctx->qp_blk_frames_left = 0;
+      ctx->qp_reset_next      = 0;
 
       out_frames = ctx->extract == DS2_EXTRACT_ALL ? ctx->total_frames
                                                    : ds2_qp_count_output_frames(ctx);
@@ -1194,9 +1026,13 @@ static int ds2_read_header(AVFormatContext *s) {
         st->codecpar->bit_rate = (int)s->bit_rate;
       }
 
-      if ((ret64 = avio_seek(pb, ctx->header_size + DS2_AUDIO_BLOCK_HEADER_SIZE +
-                                        ctx->raw_read_pos, SEEK_SET)) < 0)
-        return (int)ret64;
+      /* QP6 reads the file lazily from the first block; QP7 emits from its
+       * precomputed record list, so no stream positioning is needed. */
+      if (!ctx->is_qp7) {
+        if ((ret64 = avio_seek(pb, ctx->header_size, SEEK_SET)) < 0)
+          return (int)ret64;
+        ctx->counter = 0;
+      }
     }
   }
 
@@ -1230,19 +1066,11 @@ static int ds2_read_header(AVFormatContext *s) {
   ctx->swap_reset_pending = 0;
   ctx->frames_read = 0;
 
-  if (frame_count == 0) {
-    ctx->counter = cont_size;
-  } else if (ctx->format_type == DS2_FORMAT_QP && ctx->file_magic_byte == 0x01) {
-    int frame_bytes;
-
-    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE - ctx->raw_read_pos;
-    frame_bytes = ds2_qp_block_frame_bytes(s, ctx, 0, block_header,
-                                           ctx->raw_read_pos);
-    ctx->counter = FFMIN(ctx->counter, frame_bytes);
-  } else if (ctx->format_type == DS2_FORMAT_QP && ctx->raw_read_pos > 0) {
-    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE - ctx->raw_read_pos;
-  } else {
-    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+  if (ctx->format_type != DS2_FORMAT_QP) {
+    if (frame_count == 0)
+      ctx->counter = cont_size;
+    else
+      ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
   }
 
   return 0;
@@ -1337,109 +1165,46 @@ error_eof:
   return ret < 0 ? ret : AVERROR_EOF;
 }
 
-static void ds2_qp_skip_into_payload(AVFormatContext *s)
-{
-  DS2DemuxContext *ctx = s->priv_data;
-  AVIOContext *pb = s->pb;
-  int64_t rel = (avio_tell(pb) - ctx->header_size) % DS2_BLOCK_SIZE;
-
-  if (rel < DS2_AUDIO_BLOCK_HEADER_SIZE)
-    avio_skip(pb, DS2_AUDIO_BLOCK_HEADER_SIZE - rel);
-}
-
-static int ds2_qp_read_one_frame(AVFormatContext *s, AVPacket *pkt)
-{
-  DS2DemuxContext *ctx = s->priv_data;
-  int ret, offset = 0;
-  int64_t pos;
-
-  while (ctx->counter == 0) {
-    if (ctx->total_frames > 0 && ctx->abs_frame >= ctx->total_frames)
-      return AVERROR_EOF;
-    ret = ds2_load_block(s, 1);
-    if (ret < 0)
-      return ret;
-    if (ctx->counter == 0 && avio_feof(s->pb))
-      return AVERROR_EOF;
-  }
-
-  if (ctx->file_magic_byte == 0x01 && !ctx->qp_ann_block1_phase &&
-      ctx->qp_ann_block1_fc > 0 &&
-      ctx->abs_frame >= ctx->total_frames - ctx->qp_ann_block1_fc) {
-    ctx->counter = 0;
-    ret = ds2_load_block(s, 1);
-    if (ret < 0)
-      return ret;
-    if (ctx->counter == 0)
-      return AVERROR_EOF;
-  }
-
-  pos = avio_tell(s->pb);
-
-  ret = av_new_packet(pkt, DS2_QP_FRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
-  if (ret < 0)
-    return ret;
-  pkt->size = DS2_QP_FRAME_SIZE;
-
-  pkt->duration     = DS2_QP_SAMPLES_PER_FRAME;
-  pkt->pos          = pos;
-  pkt->stream_index = 0;
-  pkt->flags        = 0;
-
-  while (offset < DS2_QP_FRAME_SIZE) {
-    int to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
-    if (to_read <= 0) {
-      ctx->qp_frame_part = offset;
-      ret = ds2_load_block(s, 0);
-      if (ret < 0)
-        return ret;
-      if (ctx->qp_frame_restart) {
-        ctx->qp_frame_restart = 0;
-        offset = 0;
-        memset(pkt->data, 0, DS2_QP_FRAME_SIZE);
-      }
-      to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
-      if (to_read <= 0)
-        return AVERROR_EOF;
-    }
-
-    if (offset > 0)
-      ds2_qp_skip_into_payload(s);
-
-    ret = ds2_io_read(s, pkt->data + offset, to_read);
-    if (ret < to_read)
-      return ret < 0 ? ret : AVERROR_EOF;
-
-    offset += to_read;
-    ctx->counter -= to_read;
-  }
-
-  ctx->raw_read_pos  += DS2_QP_FRAME_SIZE;
-  ctx->qp_frame_part  = 0;
-  return 0;
-}
-
 static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
   DS2DemuxContext *ctx = s->priv_data;
   int ret;
 
-  if (ctx->total_frames > 0 && ctx->abs_frame >= ctx->total_frames)
-    return AVERROR_EOF;
-
   for (;;) {
-    ret = ds2_qp_read_one_frame(s, pkt);
+    int64_t pos;
+
+    if (ctx->total_frames > 0 && ctx->abs_frame >= ctx->total_frames)
+      return AVERROR_EOF;
+
+    /* Enter the next block up front (skipping dead tail bytes and pause
+     * blocks) so pkt->pos records the frame's true start offset. */
+    if (ctx->qp_blk_frames_left <= 0) {
+      ret = ds2_qp_enter_next_block(s);
+      if (ret < 0)
+        return ret;
+    }
+    pos = avio_tell(s->pb);
+
+    ret = av_new_packet(pkt, DS2_QP_FRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
     if (ret < 0)
       return ret;
+    pkt->size         = DS2_QP_FRAME_SIZE;
+    pkt->duration     = DS2_QP_SAMPLES_PER_FRAME;
+    pkt->pos          = pos;
+    pkt->stream_index = 0;
+    pkt->flags        = 0;
+
+    ret = ds2_qp_next_frame_bytes(s, pkt->data);
+    if (ret < 0) {
+      av_packet_unref(pkt);
+      return ret;
+    }
 
     if (ds2_qp_frame_included(ctx, ctx->abs_frame)) {
       if (ctx->qp_reset_next) {
         pkt->flags |= AV_PKT_FLAG_CORRUPT;
         ctx->qp_reset_next = 0;
       }
-      ds2_qp_attach_resync_side_data(pkt, ctx);
-      if (ctx->qp_resync_remaining > 0)
-        ctx->qp_resync_remaining--;
       ctx->abs_frame++;
       ctx->frames_read++;
       return 0;
@@ -1450,11 +1215,40 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt)
   }
 }
 
+static int ds2_qp7_read_packet(AVFormatContext *s, AVPacket *pkt)
+{
+  DS2DemuxContext *ctx = s->priv_data;
+  DS2Qp7Record *rec;
+  int bi, within, ret;
+
+  if (ctx->qp7_rec_idx >= ctx->qp7_nb_records)
+    return AVERROR_EOF;
+
+  rec = &ctx->qp7_records[ctx->qp7_rec_idx];
+  ret = av_new_packet(pkt, rec->size);
+  if (ret < 0)
+    return ret;
+  memcpy(pkt->data, ctx->qp7_raw + rec->off, rec->size);
+
+  bi     = rec->off / DS2_BLOCK_PAYLOAD_SIZE;
+  within = rec->off % DS2_BLOCK_PAYLOAD_SIZE;
+  pkt->pos          = ctx->header_size + (int64_t)bi * DS2_BLOCK_SIZE +
+                      DS2_AUDIO_BLOCK_HEADER_SIZE + within;
+  pkt->duration     = DS2_QP_SAMPLES_PER_FRAME;
+  pkt->stream_index = 0;
+  pkt->flags        = rec->reset ? AV_PKT_FLAG_CORRUPT : 0;
+
+  ctx->qp7_rec_idx++;
+  return 0;
+}
+
 static int ds2_read_packet(AVFormatContext *s, AVPacket *pkt) {
   DS2DemuxContext *ctx = s->priv_data;
 
   if (ctx->format_type == DS2_FORMAT_SP)
     return ds2_sp_read_packet(s, pkt);
+  else if (ctx->is_qp7)
+    return ds2_qp7_read_packet(s, pkt);
   else
     return ds2_qp_read_packet(s, pkt);
 }
@@ -1464,17 +1258,63 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   DS2DemuxContext *ctx = s->priv_data;
   int64_t ret, seekto;
   uint8_t header[DS2_AUDIO_BLOCK_HEADER_SIZE];
-  int offset, frame_count, cont_size, blk_swap;
+  int offset, blk_swap;
 
-  if (ctx->format_type == DS2_FORMAT_SP) {
-    /* SP: 42-byte frames (avg 41 bytes with swap interleaving) */
-    seekto = timestamp / DS2_SP_SAMPLES_PER_FRAME * 41 /
-             DS2_BLOCK_PAYLOAD_SIZE * DS2_BLOCK_SIZE;
-  } else {
-    /* QP: 56-byte frames */
-    seekto = timestamp / DS2_QP_SAMPLES_PER_FRAME * DS2_QP_FRAME_SIZE /
-             DS2_BLOCK_PAYLOAD_SIZE * DS2_BLOCK_SIZE;
+  if (ctx->is_qp7) {
+    /* One record == one output frame; seek to the record index. */
+    int target = timestamp / DS2_QP_SAMPLES_PER_FRAME;
+
+    if (target < 0)
+      target = 0;
+    if (ctx->qp7_nb_records > 0 && target >= ctx->qp7_nb_records)
+      target = ctx->qp7_nb_records - 1;
+    ctx->qp7_rec_idx = target;
+    return 0;
   }
+
+  if (ctx->format_type == DS2_FORMAT_QP) {
+    DS2QPWalk walk;
+    int target = timestamp / DS2_QP_SAMPLES_PER_FRAME;
+    int i, skip, err;
+    uint8_t scratch[DS2_QP_FRAME_SIZE];
+
+    if (target < 0)
+      target = 0;
+    if (ctx->total_frames > 0 && target >= ctx->total_frames)
+      target = ctx->total_frames - 1;
+
+    err = ds2_qp_walk_blocks(s, target, &walk);
+    if (err < 0)
+      return err;
+
+    ds2_invalidate_block_cache(ctx);
+    avio_seek(s->pb, walk.block_start, SEEK_SET);
+    err = ds2_io_read(s, header, DS2_AUDIO_BLOCK_HEADER_SIZE);
+    if (err < DS2_AUDIO_BLOCK_HEADER_SIZE)
+      return err < 0 ? err : AVERROR_EOF;
+
+    avio_skip(s->pb, walk.entry_off);
+    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE - walk.entry_off;
+    ctx->qp_blk_frames_left = FFMIN(header[2],
+                                    ds2_qp_entry_cap(walk.entry_off));
+    ctx->qp_reset_next = 0;
+    ctx->abs_frame     = walk.frames_before;
+    ctx->frames_read   = walk.frames_before;
+
+    skip = target - walk.frames_before;
+    for (i = 0; i < skip; i++) {
+      err = ds2_qp_next_frame_bytes(s, scratch);
+      if (err < 0)
+        return err;
+      ctx->abs_frame++;
+      ctx->frames_read++;
+    }
+    return 0;
+  }
+
+  /* SP: 42-byte frames (avg 41 bytes with swap interleaving) */
+  seekto = timestamp / DS2_SP_SAMPLES_PER_FRAME * 41 /
+           DS2_BLOCK_PAYLOAD_SIZE * DS2_BLOCK_SIZE;
 
   if (seekto < 0)
     seekto = 0;
@@ -1491,34 +1331,23 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   if (ret < DS2_AUDIO_BLOCK_HEADER_SIZE)
     return ret < 0 ? ret : AVERROR_EOF;
 
-  blk_swap    = header[0] >> 7;
-  frame_count = header[2];
-  cont_size   = ds2_qp_cont_size(header);
+  blk_swap = header[0] >> 7;
 
-  ctx->frames_read = timestamp /
-      (ctx->format_type == DS2_FORMAT_SP ? DS2_SP_SAMPLES_PER_FRAME
-                                         : DS2_QP_SAMPLES_PER_FRAME);
+  ctx->frames_read = timestamp / DS2_SP_SAMPLES_PER_FRAME;
   ctx->swap_reset_pending = 0;
 
-  if (ctx->format_type == DS2_FORMAT_SP) {
-    ctx->swap = blk_swap;
-    offset = 2 * header[1] + 2 * ctx->swap;
-    if (offset < DS2_AUDIO_BLOCK_HEADER_SIZE)
-      return AVERROR_INVALIDDATA;
-    if (offset == DS2_AUDIO_BLOCK_HEADER_SIZE) {
-      ctx->counter = 0;
-      avio_skip(s->pb, -DS2_AUDIO_BLOCK_HEADER_SIZE);
-    } else {
-      ctx->counter = DS2_BLOCK_SIZE - offset;
-      avio_skip(s->pb, offset - DS2_AUDIO_BLOCK_HEADER_SIZE);
-    }
-    ctx->ds2_sp_swap_byte = -1;
+  ctx->swap = blk_swap;
+  offset = 2 * header[1] + 2 * ctx->swap;
+  if (offset < DS2_AUDIO_BLOCK_HEADER_SIZE)
+    return AVERROR_INVALIDDATA;
+  if (offset == DS2_AUDIO_BLOCK_HEADER_SIZE) {
+    ctx->counter = 0;
+    avio_skip(s->pb, -DS2_AUDIO_BLOCK_HEADER_SIZE);
   } else {
-    if (frame_count == 0)
-      ctx->counter = cont_size;
-    else
-      ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+    ctx->counter = DS2_BLOCK_SIZE - offset;
+    avio_skip(s->pb, offset - DS2_AUDIO_BLOCK_HEADER_SIZE);
   }
+  ctx->ds2_sp_swap_byte = -1;
 
   return 0;
 }
@@ -1550,8 +1379,8 @@ static int ds2_read_close(AVFormatContext *s)
 {
   DS2DemuxContext *ctx = s->priv_data;
 
-  av_freep(&ctx->qp_block_raw_off);
-  ctx->qp_nb_blocks = 0;
+  av_freep(&ctx->qp7_raw);
+  av_freep(&ctx->qp7_records);
   return 0;
 }
 
