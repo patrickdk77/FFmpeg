@@ -65,7 +65,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "lpec_tables.h"
+#include "lpecdata.h"
 #include "lpec_excit.h"
 #include "lpec_excit_route.h"
 #include "lpec_ab80.h"

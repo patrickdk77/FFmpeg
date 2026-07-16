@@ -23,8 +23,8 @@
  */
 #include "lpec_excit.h"
 #include "lpec_excit_route.h"
-#include "lpec_tables.h"
-#include "lpec_excit_tables.h"
+#include "lpecdata.h"
+#include "lpec_excit_data.h"
 #include "libavutil/error.h"
 #include <math.h>
 #include <stdio.h>
