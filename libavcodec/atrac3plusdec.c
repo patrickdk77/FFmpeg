@@ -380,8 +380,10 @@ static int atrac3p_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     while (get_bits_left(&ctx->gb) >= 2 &&
            (ch_unit_id = get_bits(&ctx->gb, 2)) != CH_UNIT_TERMINATOR) {
         if (ch_unit_id == CH_UNIT_EXTENSION) {
-            avpriv_report_missing_feature(avctx, "Channel unit extension");
-            return AVERROR_PATCHWELCOME;
+            /* HF extension unit (SBR-like) is unimplemented; skip it and keep
+             * the base-band output. Matches the Sony AT-X decoder run with
+             * high-frequency coupling disabled. */
+            break;
         }
         if (ch_block >= ctx->num_channel_blocks ||
             ctx->channel_blocks[ch_block] != ch_unit_id) {
