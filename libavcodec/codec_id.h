@@ -561,6 +561,9 @@ enum AVCodecID {
     AV_CODEC_ID_APPLE_APAC,
     AV_CODEC_ID_DS2,
     AV_CODEC_ID_GRUNDIG_SP,
+    AV_CODEC_ID_LPEC,
+    AV_CODEC_ID_MSV_ADPCM,
+    AV_CODEC_ID_TRC,
 
     /* subtitle codecs */
     AV_CODEC_ID_FIRST_SUBTITLE = 0x17000,          ///< A dummy ID pointing at the start of subtitle codecs.
