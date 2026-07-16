@@ -767,6 +767,8 @@ OBJS-$(CONFIG_TRUEMOTION1_DECODER)     += truemotion1.o
 OBJS-$(CONFIG_TRUEMOTION2_DECODER)     += truemotion2.o
 OBJS-$(CONFIG_TRUEMOTION2RT_DECODER)   += truemotion2rt.o
 OBJS-$(CONFIG_TRUESPEECH_DECODER)      += truespeech.o
+OBJS-$(CONFIG_TRC_DECODER)             += trcdec.o trc_unpack.o trc_lsp.o \
+                                          trc_excit.o trc_synth.o
 OBJS-$(CONFIG_TSCC_DECODER)            += tscc.o msrledec.o
 OBJS-$(CONFIG_TSCC2_DECODER)           += tscc2.o
 OBJS-$(CONFIG_TTA_DECODER)             += tta.o ttadata.o ttadsp.o
