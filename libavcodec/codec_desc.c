@@ -3582,6 +3582,27 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
     },
     {
+        .id        = AV_CODEC_ID_LPEC,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "lpec",
+        .long_name = NULL_IF_CONFIG_SMALL("Sony LPEC"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+    },
+    {
+        .id        = AV_CODEC_ID_MSV_ADPCM,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "msv_adpcm",
+        .long_name = NULL_IF_CONFIG_SMALL("Sony MSV ADPCM"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+    },
+    {
+        .id        = AV_CODEC_ID_TRC,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "trc",
+        .long_name = NULL_IF_CONFIG_SMALL("Sony TRC"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+    },
+    {
         .id        = AV_CODEC_ID_GRUNDIG_SP,
         .type      = AVMEDIA_TYPE_AUDIO,
         .name      = "grundig_sp",
