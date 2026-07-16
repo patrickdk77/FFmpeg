@@ -372,7 +372,9 @@ static void msv_set_frame_sizes(MSVDemuxContext *ctx)
         fs = 80;
         break;
     case MSV_CODEC_LCST:
-        fs = (ctx->sample_rate > 12000) ? 160 : 160;
+        /* [3-byte MSV frame header][280-byte ATRAC3+ payload] = 283 bytes;
+         * assembled across sector boundaries, then deframed in read_packet. */
+        fs = 283;
         break;
     case MSV_CODEC_ADPCM:
         fs = ctx->adpcm_frame_size > 0 ? ctx->adpcm_frame_size : 48;
@@ -418,7 +420,7 @@ static int msv_guess_sample_rate(enum MSVCodecType type, int quality)
             return 7200;
         return 8000;
     case MSV_CODEC_LCST:
-        return 16000;
+        return 44100;
     case MSV_CODEC_LPEC:
         return msv_lpec_output_rate(quality) ?: 8000;
     default:
@@ -434,6 +436,9 @@ static int msv_pick_codec_id(enum MSVCodecType type)
     case MSV_CODEC_TRC:
         return AV_CODEC_ID_TRC;
     case MSV_CODEC_LCST:
+        /* LCST = Sony "AT-X" = ATRAC3+ (byte-identical tables) in an MSV
+         * container; decode with FFmpeg's ATRAC3+ decoder. */
+        return AV_CODEC_ID_ATRAC3P;
     case MSV_CODEC_LPEC:
         return AV_CODEC_ID_LPEC;
     default:
@@ -484,13 +489,17 @@ static int msv_read_header(AVFormatContext *s)
     }
 
     if (ctx->codec == MSV_CODEC_LCST)
-        ctx->channels = 1; // FORCED TO 1 FOR TESTING
+        ctx->channels = 2; /* AT-X/ATRAC3+ format 0x24 is stereo */
     else
         ctx->channels = 1;
 
     avio_seek(pb, MSV_HEAD_OFFSET_RATE, SEEK_SET);
     ctx->sample_rate = avio_rb16(pb);
-    if (ctx->sample_rate <= 0)
+    /* LCST/AT-X stores an internal rate (48234) in the header; the decoded
+     * output is always 44100 Hz. */
+    if (ctx->codec == MSV_CODEC_LCST)
+        ctx->sample_rate = 44100;
+    else if (ctx->sample_rate <= 0)
         ctx->sample_rate = msv_guess_sample_rate(ctx->codec, ctx->quality);
     else if (ctx->codec == MSV_CODEC_LPEC) {
         int out_rate = msv_lpec_output_rate(ctx->quality);
@@ -552,6 +561,10 @@ static int msv_read_header(AVFormatContext *s)
     if (ctx->codec == MSV_CODEC_ADPCM) {
         st->codecpar->block_align = ctx->adpcm_frame_size * ctx->channels;
         st->codecpar->bits_per_coded_sample = ctx->adpcm_mode;
+    } else if (ctx->codec == MSV_CODEC_LCST) {
+        /* ATRAC3+ decoder derives its layout from block_align (payload bytes
+         * per frame, after the 3-byte MSV header is stripped in read_packet). */
+        st->codecpar->block_align = 280;
     }
 
     msv_trim_string(spi, MSV_SPI_SIZE);
@@ -612,7 +625,40 @@ static void msv_skip_sector_index(AVFormatContext *s, MSVDemuxContext *ctx)
                   SEEK_SET);
 }
 
-static int msv_read_packet(AVFormatContext *s, AVPacket *pkt)
+/*
+ * LCST/AT-X (ATRAC3+) frames are stored as [3-byte MSV frame header][payload].
+ * Header byte 2 selects an optional XOR descramble of the payload's first 8
+ * bytes (lcstde.ax FUN_10002950, key table DAT_100e47d0). Strip the header and
+ * descramble to recover a raw ATRAC3+ channel-unit frame.
+ */
+static const uint8_t msv_lcst_xor_key[64] = {
+    0xa2,0x35,0x30,0x95,0x15,0x75,0xe7,0x43,0xc9,0x61,0x4a,0xeb,0xa2,0xa1,0x6e,0x19,
+    0x90,0xb2,0xe9,0xd5,0x06,0x8b,0xea,0x6e,0xad,0x81,0x84,0x77,0x5b,0x68,0x45,0x0f,
+    0x3f,0xfa,0x10,0x64,0x5e,0x7d,0x28,0x79,0x42,0xa1,0x8b,0x28,0xf0,0xa7,0x82,0x64,
+    0x18,0x06,0x0e,0x10,0x00,0x00,0x00,0x00,0x2e,0x3f,0x41,0x56,0x43,0x43,0x6c,0x61,
+};
+
+static void msv_lcst_deframe(AVPacket *pkt)
+{
+    uint8_t *p = pkt->data;
+    uint8_t sc;
+    int i;
+
+    if (pkt->size <= 3)
+        return;
+    sc = p[2];
+    if ((sc >> 6) == 1) {
+        unsigned lo   = sc & 0xf;
+        unsigned base = ((sc >> 4) & 3) * 0x10;
+        for (i = 0; i < 8 && 3 + i < pkt->size; i++)
+            p[3 + i] ^= msv_lcst_xor_key[base + ((lo + i) & 0xf)];
+    }
+    memmove(p, p + 3, pkt->size - 3);
+    pkt->size    -= 3;
+    pkt->duration = 2048;   /* ATRAC3+ emits 2048 samples/channel per frame */
+}
+
+static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MSVDemuxContext *ctx = s->priv_data;
     AVIOContext *pb = s->pb;
@@ -727,6 +773,18 @@ static int msv_read_packet(AVFormatContext *s, AVPacket *pkt)
         return ret < 0 ? ret : AVERROR_EOF;
     }
 
+    return 0;
+}
+
+static int msv_read_packet(AVFormatContext *s, AVPacket *pkt)
+{
+    MSVDemuxContext *ctx = s->priv_data;
+    int ret = msv_read_raw_packet(s, pkt);
+
+    if (ret < 0)
+        return ret;
+    if (ctx->codec == MSV_CODEC_LCST)
+        msv_lcst_deframe(pkt);
     return 0;
 }
 
