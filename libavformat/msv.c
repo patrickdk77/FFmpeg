@@ -258,11 +258,11 @@ static int msv_payload_density(const uint8_t *buf, int len)
     return nz;
 }
 
-/* Sector index at each 0x400 boundary (the reference decoder ). */
 /*
+ * Sector index at each 0x400 boundary.
  * Older DVF (e.g. ICD-U70) space-pads index fields: 20 0a 20 0a 04 20
  * instead of 00 0a 00 0a 04 00. Parse both layouts.
-*/
+ */
 static unsigned msv_index_u16(const uint8_t *p)
 {
     /* Space-padded DVF indices use 0x20 only as a leading pad byte (20 0a...). */
@@ -356,6 +356,66 @@ static int64_t msv_find_data_offset(AVIOContext *pb, enum MSVCodecType codec)
 }
 
 /*
+ * Locate the audio (type 4) chunk from the chunk table.  The audio data begins
+ * at MSV_CHUNK_TABLE plus the accumulated size of every preceding chunk (a
+ * logical offset that does not count the interleaved 10-byte sector indices).
+ */
+static int msv_chunk_data_offset(AVIOContext *pb, int64_t *offset)
+{
+    uint8_t ent[8];
+    int64_t pc = MSV_CHUNK_TABLE;
+    int64_t istack = 0;
+    int i, typ;
+    unsigned inc;
+
+    for (i = 0; i < 16; i++) {
+        avio_seek(pb, pc, SEEK_SET);
+        if (avio_read(pb, ent, 8) < 8)
+            return 0;
+        typ = ent[0];
+        inc = (ent[4] << 8) | ent[5] | (ent[6] << 8) | ent[7];
+        if (typ == 4) {
+            *offset = MSV_CHUNK_TABLE + istack;
+            return 1;
+        }
+        istack += inc;
+        if (typ == 0)
+            break;
+        pc += 8;
+    }
+    return 0;
+}
+
+/*
+ * End of sector-based TRC audio: each 0x400 sector starts with a 10-byte
+ * index whose BE16 field at +4 is the offset (within the sector) where valid
+ * payload ends. Full sectors carry 0x400; the final data sector carries a
+ * smaller value, and trailing sectors are padding with an invalid index.
+ * TRC padding would decode as phantom pause frames, so the end bound matters
+ * (unlike LPEC, whose reference decoder walks to EOF).
+ */
+static int64_t msv_sector_data_end(AVIOContext *pb, int64_t data_offset)
+{
+    int64_t fsize = avio_size(pb);
+    int64_t sec;
+    uint8_t idx[MSV_INDEX_SIZE];
+
+    for (sec = data_offset; sec + MSV_INDEX_SIZE <= fsize; sec += MSV_SECTOR_SIZE) {
+        unsigned end_off;
+
+        avio_seek(pb, sec, SEEK_SET);
+        if (avio_read(pb, idx, MSV_INDEX_SIZE) < MSV_INDEX_SIZE)
+            break;
+        if (!msv_sector_index_valid(idx))
+            return sec;
+        end_off = msv_index_u16(idx + 4);
+        if (end_off >= MSV_INDEX_SIZE && end_off < MSV_SECTOR_SIZE)
+            return sec + end_off;
+    }
+    return fsize;
+}
+
+/*
  * True end of sector-based audio (LPEC/LCST/TRC). Each 0x400 sector starts
  * with a 10-byte index whose BE16 field at +4 is the offset (within the
  * sector) where valid payload ends. Full sectors carry 0x400; the final data
@@ -389,6 +449,32 @@ static void msv_set_frame_sizes(MSVDemuxContext *ctx)
     ctx->frame_sizes[1] = fs;
     ctx->frame_sizes[2] = fs;
     ctx->frame_sizes[3] = fs;
+}
+
+/* TRC packet size from the first byte's 2/3-bit rate prefix. */
+static int msv_trc_packet_size(uint8_t byte0)
+{
+    int top2 = byte0 >> 6;
+    int rate = top2 != 3 ? top2 : ((byte0 & 0x20) ? 4 : 3);
+    static const int sizes[] = { 11, 18, 24, 4, 2, 0 };
+
+    if (rate < 0 || rate > 5)
+        return 0;
+    return sizes[rate];
+}
+
+/* TRC reference decoder output rate (WAV rate). */
+static int msv_trc_output_rate(int quality)
+{
+    switch (quality) {
+    case 0x30:
+        return 16000;
+    case 0x35:
+    case 0x37:
+        return 8000;
+    default:
+        return 0;
+    }
 }
 
 /* the reference decoder output rate (WAV rate). */
@@ -506,6 +592,11 @@ static int msv_read_header(AVFormatContext *s)
 
         if (out_rate > 0)
             ctx->sample_rate = out_rate;
+    } else if (ctx->codec == MSV_CODEC_TRC) {
+        int out_rate = msv_trc_output_rate(ctx->quality);
+
+        if (out_rate > 0)
+            ctx->sample_rate = out_rate;
     }
 
     avio_seek(pb, MSV_HEAD_OFFSET_PERIOD, SEEK_SET);
@@ -524,14 +615,25 @@ static int msv_read_header(AVFormatContext *s)
  * padding check in read_packet.*/
         ctx->data_offset = MSV_DATA_BASE;
         ctx->data_size   = avio_size(pb) - MSV_DATA_BASE;
+    } else if (ctx->codec == MSV_CODEC_TRC &&
+               msv_chunk_data_offset(pb, &pos)) {
+        /*
+         * The chunk-table sum lands mid-frame (it ignores the interleaved
+         * sector indices); the audio actually starts at the first data byte
+         * of the sector containing that offset. Verified bit-exact against
+         * the reference decoder. TRC sector geometry is absolute to the file.
+         */
+        int64_t base = (pos / MSV_SECTOR_SIZE) * MSV_SECTOR_SIZE;
+        ctx->data_offset = base + MSV_INDEX_SIZE;
+        ctx->data_size   = msv_sector_data_end(pb, base) - ctx->data_offset;
     } else {
         pos = msv_find_data_offset(pb, ctx->codec);
         if (pos < 0)
             return pos;
         ctx->data_offset = pos;
         /*
- * LPEC/LCST/TRC: the reference decoder walks packets to EOF (tools/lpec_wine_decode.c
- * collect_msv_packets). Sector index end markers can sit above the last
+ * LPEC/LCST: the reference decoder walks packets to EOF. Sector index
+ * end markers can sit above the last
  * 0xFF-padded frame(s) in the final 0x400 block; truncating there drops
  * tail frames (e.g. short 0x2a clips lose 2-3 packets vs the reference).
 */
@@ -611,25 +713,43 @@ static int msv_frame_size_from_byte(MSVDemuxContext *ctx, uint8_t b)
 static void msv_skip_sector_index(AVFormatContext *s, MSVDemuxContext *ctx)
 {
     AVIOContext *pb = s->pb;
-    int64_t pos = avio_tell(pb) - ctx->data_offset;
-    int64_t sec = pos / MSV_SECTOR_SIZE;
-    int off   = pos % MSV_SECTOR_SIZE;
-    /*
- * LPEC/LCST/TRC: data_offset is the sector base (index at +0); skip it on
- * the first read too. MSV ADPCM chunk offset already lands past index.
-*/
-    int skip_at_start = ctx->codec != MSV_CODEC_ADPCM;
 
-    if ((pos > 0 || skip_at_start) && off < MSV_INDEX_SIZE)
-        avio_seek(pb, ctx->data_offset + sec * MSV_SECTOR_SIZE + MSV_INDEX_SIZE,
-                  SEEK_SET);
+    /*
+     * TRC data starts at an exact (non sector-aligned) chunk offset, so its
+     * sector indices are at absolute file 0x400 boundaries.  LPEC/LCST keep
+     * the original relative-to-data_offset geometry.
+     */
+    if (ctx->codec == MSV_CODEC_TRC) {
+        int64_t tell = avio_tell(pb);
+        int off = tell % MSV_SECTOR_SIZE;
+
+        if (off < MSV_INDEX_SIZE)
+            avio_seek(pb, (tell / MSV_SECTOR_SIZE) * MSV_SECTOR_SIZE +
+                      MSV_INDEX_SIZE, SEEK_SET);
+        return;
+    }
+
+    {
+        int64_t pos = avio_tell(pb) - ctx->data_offset;
+        int64_t sec = pos / MSV_SECTOR_SIZE;
+        int off   = pos % MSV_SECTOR_SIZE;
+        /*
+         * LPEC/LCST: data_offset is the sector base (index at +0); skip it on
+         * the first read too. MSV ADPCM chunk offset already lands past index.
+         */
+        int skip_at_start = ctx->codec != MSV_CODEC_ADPCM;
+
+        if ((pos > 0 || skip_at_start) && off < MSV_INDEX_SIZE)
+            avio_seek(pb, ctx->data_offset + sec * MSV_SECTOR_SIZE +
+                      MSV_INDEX_SIZE, SEEK_SET);
+    }
 }
 
 /*
  * LCST/AT-X (ATRAC3+) frames are stored as [3-byte MSV frame header][payload].
  * Header byte 2 selects an optional XOR descramble of the payload's first 8
- * bytes (lcstde.ax FUN_10002950, key table DAT_100e47d0). Strip the header and
- * descramble to recover a raw ATRAC3+ channel-unit frame.
+ * bytes. Strip the header and descramble to recover a raw ATRAC3+
+ * channel-unit frame.
  */
 static const uint8_t msv_lcst_xor_key[64] = {
     0xa2,0x35,0x30,0x95,0x15,0x75,0xe7,0x43,0xc9,0x61,0x4a,0xeb,0xa2,0xa1,0x6e,0x19,
@@ -674,6 +794,11 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
         tell = avio_tell(pb);
         if (tell < ctx->data_offset || tell >= fsize)
             return AVERROR_EOF;
+        /* TRC padding would decode as phantom pause frames; stop at the
+         * sector-index end bound instead of walking to EOF. */
+        if (ctx->codec == MSV_CODEC_TRC &&
+            tell >= ctx->data_offset + ctx->data_size)
+            return AVERROR_EOF;
 
         if (ctx->codec == MSV_CODEC_ADPCM) {
             int fs = ctx->adpcm_frame_size;
@@ -699,9 +824,61 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
         if (use_sectors)
             msv_skip_sector_index(s, ctx);
         tell = avio_tell(pb);
-        pos  = tell - ctx->data_offset;
+        /* TRC uses absolute file sector geometry; the others stay relative. */
+        pos  = ctx->codec == MSV_CODEC_TRC ? tell : tell - ctx->data_offset;
         sec_end = use_sectors ? ((pos / MSV_SECTOR_SIZE) + 1) * MSV_SECTOR_SIZE
                               : ctx->data_size;
+
+        if (ctx->codec == MSV_CODEC_TRC) {
+            int64_t next_sec;
+
+            ret = avio_read(pb, &hdr, 1);
+            if (ret < 1)
+                return ret < 0 ? ret : AVERROR_EOF;
+
+            size = msv_trc_packet_size(hdr);
+            if (size <= 0) {
+                avio_seek(pb, -1, SEEK_CUR);
+                return AVERROR_INVALIDDATA;
+            }
+            if (pos + size > sec_end) {
+                int in_sec = sec_end - pos;
+
+                ret = av_new_packet(pkt, size);
+                if (ret < 0)
+                    return ret;
+                pkt->data[0] = hdr;
+                ret = avio_read(pb, pkt->data + 1, in_sec - 1);
+                if (ret < in_sec - 1) {
+                    av_packet_unref(pkt);
+                    return ret < 0 ? ret : AVERROR_EOF;
+                }
+                next_sec = (pos / MSV_SECTOR_SIZE + 1) * MSV_SECTOR_SIZE +
+                           MSV_INDEX_SIZE;
+                if (next_sec + (size - in_sec) > fsize) {
+                    av_packet_unref(pkt);
+                    return AVERROR_EOF;
+                }
+                avio_seek(pb, next_sec, SEEK_SET);
+                ret = avio_read(pb, pkt->data + in_sec, size - in_sec);
+                if (ret < size - in_sec) {
+                    av_packet_unref(pkt);
+                    return ret < 0 ? ret : AVERROR_EOF;
+                }
+                return 0;
+            }
+
+            ret = av_new_packet(pkt, size);
+            if (ret < 0)
+                return ret;
+            pkt->data[0] = hdr;
+            ret = avio_read(pb, pkt->data + 1, size - 1);
+            if (ret < size - 1) {
+                av_packet_unref(pkt);
+                return ret < 0 ? ret : AVERROR_EOF;
+            }
+            return 0;
+        }
 
         if (ctx->frame_sizes[0] == 0) {
             size = sec_end - pos;
