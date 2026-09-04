@@ -65,26 +65,14 @@ typedef struct DSSDemuxContext {
     unsigned int audio_codec;
     int counter;
     int swap;
+    int64_t block_pos;      /* offset of the current audio block header */
+    int frames_left;        /* frames still to come from that block */
     int dss_sp_swap_byte;
 
     int packet_size;
     int dss_header_size;
-    int resync_pending;    /* VOX-pause (empty block) re-anchor pending (v4) */
     int total_frames;
     int frames_read;
-    int span_continues;    /* set when a frame spans into the next block */
-    int block_frames_left; /* frames remaining in compact block (fc fits in payload) */
-    int compact_fc;
-    int compact_poff;
-    int compact_next_idx;  /* frames read in current compact block */
-    int compact_stream_off;/* payload cursor (40/42-byte steps, NCH stream) */
-    int in_compact;        /* do not let linear path touch block_frames_left */
-    int compact_swap;      /* swap bit at start of current compact block */
-    int pending_block_fc;
-    int pending_compact_poff;
-    int pending_compact_swap;
-    int64_t block_start_pos;
-    int64_t pending_block_start;
 
     /* Grundig variant: pre-extracted continuous 41-byte frame stream */
     int      grundig;
@@ -92,59 +80,6 @@ typedef struct DSSDemuxContext {
     int      grundig_nb_frames;
     int      grundig_pos;
 } DSSDemuxContext;
-
-#define DSS_BLOCK_PAYLOAD_SIZE (DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE)
-
-static int dss_block_payload_fits(const uint8_t *hdr)
-{
-    int poff = FFMAX(0, 2 * hdr[1] + 2 * (hdr[0] >> 7) -
-                         DSS_AUDIO_BLOCK_HEADER_SIZE);
-    int payload = DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE;
-    int fc = hdr[2];
-
-    return fc > 0 && fc * DSS_FRAME_SIZE + poff <= payload;
-}
-
-static int dss_align_after_compact_block(AVFormatContext *s, int64_t block_start)
-{
-    DSSDemuxContext *ctx = s->priv_data;
-    AVIOContext *pb = s->pb;
-    uint8_t hdr[DSS_AUDIO_BLOCK_HEADER_SIZE];
-    int64_t next = block_start + DSS_BLOCK_SIZE;
-    int poff, ret;
-
-    if (avio_seek(pb, next, SEEK_SET) < 0)
-        return AVERROR(EIO);
-
-    ret = avio_read(pb, hdr, sizeof(hdr));
-    if (ret < (int)sizeof(hdr))
-        return ret < 0 ? ret : AVERROR_EOF;
-
-    poff = FFMAX(0, 2 * hdr[1] + 2 * (hdr[0] >> 7) -
-                     DSS_AUDIO_BLOCK_HEADER_SIZE);
-
-    ctx->block_start_pos = next;
-    ctx->swap              = hdr[0] >> 7;
-    if (dss_block_payload_fits(hdr)) {
-        ctx->block_frames_left = hdr[2];
-        ctx->compact_fc        = hdr[2];
-        ctx->compact_poff      = poff;
-        ctx->compact_next_idx  = 0;
-        ctx->compact_stream_off = 0;
-        ctx->in_compact        = 1;
-        ctx->compact_swap      = ctx->swap;
-    } else {
-        ctx->block_frames_left = 0;
-        ctx->in_compact        = 0;
-    }
-
-    if (avio_seek(pb, next + DSS_AUDIO_BLOCK_HEADER_SIZE + poff, SEEK_SET) < 0)
-        return AVERROR(EIO);
-
-    ctx->counter = DSS_BLOCK_PAYLOAD_SIZE - poff;
-
-    return 0;
-}
 
 #define DSS_SP_SAMPLES_PER_FRAME 264
 
@@ -433,115 +368,81 @@ static int dss_read_header(AVFormatContext *s)
                                     AV_TIME_BASE_Q);
     }
 
-    /* Jump over file header; first audio block header loaded below. */
     if ((ret64 = avio_seek(pb, ctx->dss_header_size, SEEK_SET)) < 0)
         return (int)ret64;
 
-    {
-        uint8_t first_hdr[DSS_AUDIO_BLOCK_HEADER_SIZE];
-        ret = avio_read(pb, first_hdr, sizeof(first_hdr));
-        if (ret < (int)sizeof(first_hdr))
-            return ret < 0 ? ret : AVERROR_EOF;
-        ctx->swap = first_hdr[0] >> 7;
-        ctx->counter = DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE;
-    }
-    ctx->resync_pending     = 0;
-    ctx->frames_read        = 0;
-    ctx->span_continues     = 0;
-    ctx->block_frames_left    = 0;
-    ctx->compact_fc           = 0;
-    ctx->compact_poff         = 0;
-    ctx->compact_next_idx     = 0;
-    ctx->compact_stream_off   = 0;
-    ctx->in_compact           = 0;
-    ctx->compact_swap         = 0;
-    ctx->pending_block_fc     = 0;
-    ctx->pending_compact_poff = 0;
-    ctx->pending_compact_swap = 0;
-    ctx->block_start_pos      = 0;
-    ctx->pending_block_start  = 0;
+    ctx->counter     = 0;
+    ctx->swap        = 0;
+    ctx->frames_left = 0;
+    ctx->block_pos   = ctx->dss_header_size - DSS_BLOCK_SIZE;
+    ctx->frames_read = 0;
+
     return 0;
 }
 
-static void dss_skip_audio_header(AVFormatContext *s, int mid_frame)
+static void dss_skip_audio_header(AVFormatContext *s, AVPacket *pkt)
 {
     DSSDemuxContext *ctx = s->priv_data;
     AVIOContext *pb = s->pb;
-    uint8_t hdr[DSS_AUDIO_BLOCK_HEADER_SIZE];
-    int64_t block_pos;
-    int frame_count, cont_size, offset;
 
-    /* Second half of the VOX-pause handling (upstream v4 DSS-SP resync): the
-     * frame that straddled into the empty block has now been completed from
-     * its leading bytes. Discard the rest of that block (padding) by aligning
-     * to the next 512-byte boundary, then re-sync the frame grid at the
-     * following block's anchor 2*byte1 (+2 when byte-swapped), restarting the
-     * byte-swap parity from that block and flagging a decoder reset. */
-    if (ctx->resync_pending) {
-        int64_t rel = avio_tell(pb) - ctx->dss_header_size;
-        int pad = (DSS_BLOCK_SIZE - (int)(rel % DSS_BLOCK_SIZE)) % DSS_BLOCK_SIZE;
+    avio_skip(pb, DSS_AUDIO_BLOCK_HEADER_SIZE);
+    ctx->counter += DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE;
+}
 
-        ctx->resync_pending = 0;
-        avio_skip(pb, pad);
-        if (avio_read(pb, hdr, sizeof(hdr)) < (int)sizeof(hdr)) {
-            ctx->counter = 0;
-            return;
+static int dss_sp_read_payload(AVFormatContext *s, uint8_t *buf, int size)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = s->pb;
+    int ret;
+
+    while (size > 0) {
+        int64_t off = (avio_tell(pb) - ctx->dss_header_size) % DSS_BLOCK_SIZE;
+        int chunk;
+
+        if (off < DSS_AUDIO_BLOCK_HEADER_SIZE) {
+            if (avio_skip(pb, DSS_AUDIO_BLOCK_HEADER_SIZE - off) < 0)
+                return AVERROR_EOF;
+            continue;
         }
-        ctx->swap = !!(hdr[0] & 0x80);
-        offset    = 2 * hdr[1] + 2 * ctx->swap;
-        if (offset < DSS_AUDIO_BLOCK_HEADER_SIZE)
-            offset = DSS_AUDIO_BLOCK_HEADER_SIZE;
-        if (offset > DSS_BLOCK_SIZE)
-            offset = DSS_BLOCK_SIZE;
-        avio_skip(pb, offset - DSS_AUDIO_BLOCK_HEADER_SIZE);
-        ctx->counter           = DSS_BLOCK_SIZE - offset;
-        ctx->dss_sp_swap_byte  = -1;
-        ctx->block_frames_left = 0;
-        ctx->in_compact        = 0;
-        return;
+        chunk = FFMIN(size, (int)(DSS_BLOCK_SIZE - off));
+        ret = ffio_read_size(pb, buf, chunk);
+        if (ret < 0)
+            return ret;
+        buf  += chunk;
+        size -= chunk;
     }
+    return 0;
+}
 
-    block_pos = avio_tell(pb);
-    if (avio_read(pb, hdr, sizeof(hdr)) < (int)sizeof(hdr))
-        return;
+static int dss_sp_next_block(AVFormatContext *s)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = s->pb;
+    uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+    int cont, ret;
 
-    frame_count = hdr[2];
-    cont_size   = FFMAX(0, 2 * hdr[1] + 2 * (hdr[0] >> 7) -
-                           DSS_AUDIO_BLOCK_HEADER_SIZE);
+    for (;;) {
+        ctx->block_pos += DSS_BLOCK_SIZE;
+        if (avio_seek(pb, ctx->block_pos, SEEK_SET) < 0)
+            return AVERROR_EOF;
+        ret = ffio_read_size(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+        if (ret < 0)
+            return ret;
 
-    /* VOX pause: an empty block (frame_count == 0) carries no fresh frames.
-     * Its leading bytes complete the frame straddling into it (read by the
-     * caller); the next call re-syncs at the following block's anchor. */
-    if (ctx->audio_codec == DSS_ACODEC_DSS_SP && frame_count == 0) {
-        ctx->counter        = ctx->swap ? DSS_FRAME_SIZE - 2 : DSS_FRAME_SIZE;
-        ctx->resync_pending = 1;
-        return;
+        ctx->swap = !!(header[0] & 0x80);
+        cont      = 2 * header[1] + 2 * ctx->swap - DSS_AUDIO_BLOCK_HEADER_SIZE;
+        if (cont < 0 || cont > DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE)
+            cont = 0;
+
+        if (!header[2])         /* an empty block: nothing to emit, move on */
+            continue;
+
+        ctx->frames_left = header[2];
+        if (avio_seek(pb, ctx->block_pos + DSS_AUDIO_BLOCK_HEADER_SIZE + cont,
+                      SEEK_SET) < 0)
+            return AVERROR_EOF;
+        return 0;
     }
-
-    if (!mid_frame) {
-        ctx->block_start_pos = block_pos;
-        if (dss_block_payload_fits(hdr)) {
-            ctx->block_frames_left = frame_count;
-            ctx->compact_fc        = frame_count;
-            ctx->compact_poff      = cont_size;
-            ctx->compact_next_idx  = 0;
-            ctx->compact_stream_off = 0;
-            ctx->in_compact        = 1;
-            ctx->compact_swap      = hdr[0] >> 7;
-            ctx->counter           = 1;
-            return;
-        }
-        ctx->block_frames_left = 0;
-        ctx->in_compact        = 0;
-    } else if (dss_block_payload_fits(hdr)) {
-        ctx->pending_block_fc     = frame_count;
-        ctx->pending_block_start  = block_pos;
-        ctx->pending_compact_poff = cont_size;
-        ctx->pending_compact_swap = hdr[0] >> 7;
-        return;
-    }
-
-    ctx->counter += DSS_BLOCK_PAYLOAD_SIZE;
 }
 
 static void dss_sp_byte_swap(DSSDemuxContext *ctx, uint8_t *data)
@@ -564,156 +465,21 @@ static void dss_sp_byte_swap(DSSDemuxContext *ctx, uint8_t *data)
     ctx->swap             ^= 1;
 }
 
-/* If linear demux drifted into compact-block padding, skip to next block. */
-static void dss_skip_compact_padding(AVFormatContext *s)
-{
-    DSSDemuxContext *ctx = s->priv_data;
-    AVIOContext *pb = s->pb;
-    int64_t tell = avio_tell(pb);
-    int64_t bstart, audio_end;
-    uint8_t hdr[DSS_AUDIO_BLOCK_HEADER_SIZE];
-    int poff, fc;
-
-    if (tell < ctx->dss_header_size || ctx->block_frames_left > 0)
-        return;
-
-    bstart = ctx->dss_header_size +
-             (tell - ctx->dss_header_size) / DSS_BLOCK_SIZE * DSS_BLOCK_SIZE;
-
-    avio_seek(pb, bstart, SEEK_SET);
-    if (avio_read(pb, hdr, sizeof(hdr)) < (int)sizeof(hdr)) {
-        avio_seek(pb, tell, SEEK_SET);
-        return;
-    }
-
-    if (!dss_block_payload_fits(hdr)) {
-        avio_seek(pb, tell, SEEK_SET);
-        return;
-    }
-
-    fc = hdr[2];
-    poff = FFMAX(0, 2 * hdr[1] + 2 * (hdr[0] >> 7) -
-                     DSS_AUDIO_BLOCK_HEADER_SIZE);
-    audio_end = bstart + DSS_AUDIO_BLOCK_HEADER_SIZE + poff +
-                  (int64_t)fc * DSS_FRAME_SIZE;
-
-    if (tell < audio_end) {
-        avio_seek(pb, tell, SEEK_SET);
-        return;
-    }
-
-    {
-        int b;
-
-        avio_seek(pb, tell, SEEK_SET);
-        b = avio_r8(pb);
-        if (b != 0xff) {
-            avio_seek(pb, tell, SEEK_SET);
-            return;
-        }
-    }
-
-    /* Last file block: normal compact exit handles EOF; do not seek past end. */
-    if (avio_size(pb) > 0 && bstart + DSS_BLOCK_SIZE >= avio_size(pb)) {
-        avio_seek(pb, tell, SEEK_SET);
-        return;
-    }
-
-    ctx->block_start_pos = bstart;
-    dss_align_after_compact_block(s, bstart);
-}
-
-static int dss_sp_read_compact_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    DSSDemuxContext *ctx = s->priv_data;
-    AVIOContext *pb = s->pb;
-    uint8_t hdr[DSS_AUDIO_BLOCK_HEADER_SIZE];
-    int idx, read_size, buff_offset, ret;
-    int64_t pos;
-
-    avio_seek(pb, ctx->block_start_pos, SEEK_SET);
-    if (avio_read(pb, hdr, sizeof(hdr)) < (int)sizeof(hdr))
-        return AVERROR_EOF;
-    ctx->compact_fc       = hdr[2];
-    ctx->compact_poff     = FFMAX(0, 2 * hdr[1] + 2 * (hdr[0] >> 7) -
-                                      DSS_AUDIO_BLOCK_HEADER_SIZE);
-    ctx->compact_swap     = hdr[0] >> 7;
-
-    idx = ctx->compact_next_idx;
-    pos = ctx->block_start_pos + DSS_AUDIO_BLOCK_HEADER_SIZE +
-          ctx->compact_poff + (int64_t)ctx->compact_stream_off;
-
-    avio_seek(pb, pos, SEEK_SET);
-    ctx->swap = ctx->compact_swap ^ (idx & 1);
-
-    if (ctx->swap) {
-        read_size   = DSS_FRAME_SIZE - 2;
-        buff_offset = 3;
-    } else {
-        read_size   = DSS_FRAME_SIZE;
-        buff_offset = 0;
-    }
-
-    ret = av_new_packet(pkt, DSS_FRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (ret < 0)
-        return ret;
-    pkt->size         = DSS_FRAME_SIZE;
-    pkt->duration     = DSS_SP_SAMPLES_PER_FRAME;
-    pkt->pos          = pos;
-    pkt->stream_index = 0;
-    pkt->flags        = 0;
-    memset(pkt->data, 0, DSS_FRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
-
-    ret = avio_read(pb, pkt->data + buff_offset, read_size);
-    if (ret < read_size)
-        return ret < 0 ? ret : AVERROR_EOF;
-
-    dss_sp_byte_swap(ctx, pkt->data);
-
-    if (ctx->dss_sp_swap_byte < 0)
-        return AVERROR(EAGAIN);
-
-    ctx->compact_stream_off += read_size;
-
-    ctx->compact_next_idx++;
-    ctx->block_frames_left = ctx->compact_fc - ctx->compact_next_idx;
-    ctx->counter           = 1;
-
-    if (ctx->compact_next_idx >= ctx->compact_fc) {
-        int64_t fsize = avio_size(pb);
-
-        ctx->in_compact = 0;
-        if (fsize <= 0 || ctx->block_start_pos + DSS_BLOCK_SIZE < fsize)
-            dss_align_after_compact_block(s, ctx->block_start_pos);
-    }
-
-    ctx->frames_read++;
-
-    return 0;
-}
-
 static int dss_sp_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    int read_size, ret, offset = 0, buff_offset = 0;
-    int spanned_start = 0, pending_new = 0;
-    int64_t pos = avio_tell(s->pb);
+    int read_size, ret, buff_offset = 0;
+    int64_t pos;
 
     if (ctx->total_frames > 0 && ctx->frames_read >= ctx->total_frames)
         return AVERROR_EOF;
 
-    dss_skip_compact_padding(s);
-
-    if (ctx->block_frames_left > 0 && !ctx->span_continues)
-        return dss_sp_read_compact_packet(s, pkt);
-
-    while (ctx->counter == 0) {
-        if (avio_feof(s->pb))
-            return AVERROR_EOF;
-        dss_skip_audio_header(s, 0);
-        if (ctx->counter == 0 && avio_feof(s->pb))
-            return AVERROR_EOF;
+    if (ctx->frames_left <= 0) {
+        ret = dss_sp_next_block(s);
+        if (ret < 0)
+            return ret;
     }
+    pos = avio_tell(s->pb);
 
     if (ctx->swap) {
         read_size   = DSS_FRAME_SIZE - 2;
@@ -731,69 +497,20 @@ static int dss_sp_read_packet(AVFormatContext *s, AVPacket *pkt)
     pkt->stream_index = 0;
     pkt->flags        = 0;
 
-    if (ctx->block_frames_left == 0 && ctx->counter < read_size) {
-        ret = avio_read(s->pb, pkt->data + buff_offset, ctx->counter);
-        if (ret < ctx->counter)
-            goto error_eof;
+    ret = dss_sp_read_payload(s, pkt->data + buff_offset, read_size);
+    if (ret < 0)
+        return ret == AVERROR_EOF ? ret : AVERROR_EOF;
 
-        offset = ctx->counter;
-        spanned_start = 1;
-        ctx->span_continues = 1;
-        dss_skip_audio_header(s, 1);
-    }
-    ctx->counter -= read_size;
-
-    ret = avio_read(s->pb, pkt->data + offset + buff_offset,
-                    read_size - offset);
-    if (ret < read_size - offset)
-        goto error_eof;
+    ctx->frames_left--;
 
     dss_sp_byte_swap(ctx, pkt->data);
 
     if (ctx->dss_sp_swap_byte < 0)
         return AVERROR(EAGAIN);
 
-    {
-        int spanned = ctx->span_continues;
-
-        ctx->span_continues = 0;
-
-        pending_new = ctx->pending_block_fc > 0;
-
-        if (pending_new) {
-            if (!ctx->block_frames_left) {
-                ctx->block_frames_left    = ctx->pending_block_fc;
-                ctx->block_start_pos      = ctx->pending_block_start;
-                ctx->compact_fc           = ctx->pending_block_fc;
-                ctx->compact_poff         = ctx->pending_compact_poff;
-                ctx->compact_swap         = ctx->pending_compact_swap;
-                ctx->compact_next_idx     = 0;
-                ctx->compact_stream_off   = 0;
-                ctx->in_compact           = 1;
-            }
-            ctx->pending_block_fc     = 0;
-            ctx->pending_block_start  = 0;
-            ctx->pending_compact_poff = 0;
-            ctx->pending_compact_swap = 0;
-        }
-
-        if (ctx->block_frames_left > 0 && !ctx->in_compact) {
-            if (!(pending_new && spanned))
-                ctx->block_frames_left--;
-            if (ctx->block_frames_left == 0)
-                dss_align_after_compact_block(s, ctx->block_start_pos);
-        }
-    }
-
-    if (spanned_start && pending_new && ctx->in_compact)
-        ctx->counter = 1;
-
     ctx->frames_read++;
 
     return 0;
-
-error_eof:
-    return ret < 0 ? ret : AVERROR_EOF;
 }
 
 static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -803,21 +520,8 @@ static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
     int size, byte, ret, offset;
     int64_t pos = avio_tell(s->pb);
 
-    if (ctx->total_frames > 0 && ctx->frames_read >= ctx->total_frames)
-        return AVERROR_EOF;
-
-    if (ctx->block_frames_left == 0 && ctx->counter > 0) {
-        avio_skip(s->pb, ctx->counter);
-        ctx->counter = 0;
-    }
-
-    while (ctx->counter == 0) {
-        if (avio_feof(s->pb))
-            return AVERROR_EOF;
-        dss_skip_audio_header(s, 0);
-        if (ctx->counter == 0 && avio_feof(s->pb))
-            return AVERROR_EOF;
-    }
+    if (ctx->counter == 0)
+        dss_skip_audio_header(s, pkt);
 
     /* We make one byte-step here. Don't forget to add offset. */
     byte = avio_r8(s->pb);
@@ -850,15 +554,13 @@ static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
         offset += ctx->counter;
         size   -= ctx->counter;
         ctx->counter = 0;
-        dss_skip_audio_header(s, 1);
+        dss_skip_audio_header(s, pkt);
     }
     ctx->counter -= size;
 
     ret = avio_read(s->pb, pkt->data + offset, size);
     if (ret < size)
         return ret < 0 ? ret : AVERROR_EOF;
-
-    ctx->frames_read++;
 
     return 0;
 }
@@ -943,7 +645,15 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
     ret = ffio_read_size(s->pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
     if (ret < 0)
         return ret;
-    ctx->swap = !!(header[0] & 0x80);
+    ctx->swap        = !!(header[0] & 0x80);
+    ctx->frames_left = 0;
+    ctx->block_pos   = seekto - DSS_BLOCK_SIZE;
+    if (ctx->audio_codec == DSS_ACODEC_DSS_SP) {
+        ctx->dss_sp_swap_byte = -1;
+        ctx->frames_read = timestamp / DSS_SP_SAMPLES_PER_FRAME;
+        return 0;
+    }
+
     offset = 2*header[1] + 2*ctx->swap;
     if (offset < DSS_AUDIO_BLOCK_HEADER_SIZE)
         return AVERROR_INVALIDDATA;
@@ -954,21 +664,7 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
         ctx->counter = DSS_BLOCK_SIZE - offset;
         offset = avio_skip(s->pb, offset - DSS_AUDIO_BLOCK_HEADER_SIZE);
     }
-    ctx->dss_sp_swap_byte     = -1;
-    ctx->resync_pending       = 0;
-    ctx->frames_read          = 0;
-    ctx->span_continues       = 0;
-    ctx->block_frames_left    = 0;
-    ctx->compact_fc           = 0;
-    ctx->compact_poff         = 0;
-    ctx->compact_swap         = 0;
-    ctx->compact_next_idx     = 0;
-    ctx->compact_stream_off   = 0;
-    ctx->pending_block_fc     = 0;
-    ctx->pending_compact_poff = 0;
-    ctx->pending_compact_swap = 0;
-    ctx->block_start_pos      = 0;
-    ctx->pending_block_start  = 0;
+    ctx->dss_sp_swap_byte = -1;
     return 0;
 }
 
