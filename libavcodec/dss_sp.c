@@ -312,7 +312,7 @@ static av_cold int dss_sp_decode_init(AVCodecContext *avctx)
 {
     DssSpContext *p = avctx->priv_data;
     avctx->sample_fmt     = AV_SAMPLE_FMT_S16;
-    avctx->sample_rate    = 11025;
+    avctx->sample_rate    = 11000;
     av_channel_layout_uninit(&avctx->ch_layout);
     avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
