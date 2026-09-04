@@ -47,7 +47,10 @@
 #define MSV_HEAD_OFFSET_TAG     0x3c
 #define MSV_HEAD_OFFSET_QUALITY 0x3d
 #define MSV_HEAD_OFFSET_RATE    0x42
+#define MSV_HEAD_OFFSET_BYTERATE 0x46
 #define MSV_HEAD_OFFSET_PERIOD  0x48
+#define MSV_TRC_SAMPLES_PER_FRAME  160
+#define MSV_LCST_SAMPLES_PER_FRAME 2048
 #define MSV_CHUNK_TABLE         0x50
 #define MSV_DATA_BASE           0x200
 enum MSVCodecType {
@@ -62,6 +65,7 @@ typedef struct MSVDemuxContext {
     enum MSVCodecType codec;
     int quality;
     int sample_rate;
+    int byte_rate;
     int channels;
     int64_t data_offset;
     int64_t data_size;
@@ -205,6 +209,8 @@ static int msv_read_metadata_date(AVFormatContext *s, unsigned int offset,
     hour   = avio_r8(pb);
     minute = avio_r8(pb);
 
+    if (year == 0 || year == 0xffff)
+        return 0;
     if (year < 1900 || year > 2100 || month < 1 || month > 12)
         return AVERROR_INVALIDDATA;
 
@@ -532,6 +538,27 @@ static int msv_pick_codec_id(enum MSVCodecType type)
     }
 }
 
+static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt);
+
+static int64_t msv_count_packets(AVFormatContext *s)
+{
+    MSVDemuxContext *ctx = s->priv_data;
+    AVPacket *pkt = av_packet_alloc();
+    int64_t n = 0;
+
+    if (!pkt)
+        return AVERROR(ENOMEM);
+
+    avio_seek(s->pb, ctx->data_offset, SEEK_SET);
+    while (msv_read_raw_packet(s, pkt) >= 0) {
+        n++;
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+
+    return n;
+}
+
 static int msv_read_header(AVFormatContext *s)
 {
     MSVDemuxContext *ctx = s->priv_data;
@@ -598,6 +625,9 @@ static int msv_read_header(AVFormatContext *s)
         if (out_rate > 0)
             ctx->sample_rate = out_rate;
     }
+
+    avio_seek(pb, MSV_HEAD_OFFSET_BYTERATE, SEEK_SET);
+    ctx->byte_rate = avio_rb16(pb);
 
     avio_seek(pb, MSV_HEAD_OFFSET_PERIOD, SEEK_SET);
     ctx->adpcm_frame_size = avio_rb16(pb);
@@ -680,21 +710,38 @@ static int msv_read_header(AVFormatContext *s)
         nb_samples = msv_count_adpcm_samples(s, ctx);
         if (nb_samples < 0)
             return (int)nb_samples;
-        if (nb_samples > 0) {
-            int64_t file_size = avio_size(pb);
+    } else if (ctx->codec == MSV_CODEC_TRC || ctx->codec == MSV_CODEC_LCST) {
+        int64_t nb_packets = msv_count_packets(s);
 
-            st->duration = nb_samples;
-            s->duration  = av_rescale_q(nb_samples,
-                                          (AVRational){1, st->codecpar->sample_rate},
-                                          AV_TIME_BASE_Q);
-            if (file_size > ctx->data_offset && s->duration > 0)
-                s->bit_rate = (file_size - ctx->data_offset) * 8LL * AV_TIME_BASE /
-                              s->duration;
-            else
-                s->bit_rate = 8LL * ctx->adpcm_frame_size * st->codecpar->sample_rate /
-                              MSV_ADPCM_SAMPLES_PER_FRAME;
-            st->codecpar->bit_rate = (int)s->bit_rate;
-        }
+        if (nb_packets < 0)
+            return (int)nb_packets;
+        nb_samples = nb_packets * (ctx->codec == MSV_CODEC_TRC ?
+                                   MSV_TRC_SAMPLES_PER_FRAME :
+                                   MSV_LCST_SAMPLES_PER_FRAME);
+    } else if (ctx->byte_rate > 0) {
+        int64_t sectors = (ctx->data_size + MSV_SECTOR_SIZE - 1) / MSV_SECTOR_SIZE;
+        int64_t net     = ctx->data_size - sectors * MSV_INDEX_SIZE;
+
+        if (net > 0)
+            nb_samples = net * st->codecpar->sample_rate / ctx->byte_rate;
+    }
+
+    if (nb_samples > 0) {
+        int64_t file_size = avio_size(pb);
+
+        st->duration = nb_samples;
+        s->duration  = av_rescale_q(nb_samples,
+                                      (AVRational){1, st->codecpar->sample_rate},
+                                      AV_TIME_BASE_Q);
+        if (file_size > ctx->data_offset && s->duration > 0)
+            s->bit_rate = (file_size - ctx->data_offset) * 8LL * AV_TIME_BASE /
+                          s->duration;
+        else if (ctx->byte_rate > 0)
+            s->bit_rate = 8LL * ctx->byte_rate;
+        st->codecpar->bit_rate = (int)s->bit_rate;
+    } else if (ctx->byte_rate > 0) {
+        s->bit_rate = 8LL * ctx->byte_rate;
+        st->codecpar->bit_rate = (int)s->bit_rate;
     }
 
     avio_seek(pb, ctx->data_offset, SEEK_SET);
@@ -775,7 +822,7 @@ static void msv_lcst_deframe(AVPacket *pkt)
     }
     memmove(p, p + 3, pkt->size - 3);
     pkt->size    -= 3;
-    pkt->duration = 2048;   /* ATRAC3+ emits 2048 samples/channel per frame */
+    pkt->duration = MSV_LCST_SAMPLES_PER_FRAME;
 }
 
 static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
@@ -962,6 +1009,10 @@ static int msv_read_packet(AVFormatContext *s, AVPacket *pkt)
         return ret;
     if (ctx->codec == MSV_CODEC_LCST)
         msv_lcst_deframe(pkt);
+    else if (ctx->codec == MSV_CODEC_TRC)
+        pkt->duration = MSV_TRC_SAMPLES_PER_FRAME;
+    else if (ctx->codec == MSV_CODEC_ADPCM)
+        pkt->duration = msv_adpcm_spf(ctx->adpcm_mode);
     return 0;
 }
 
