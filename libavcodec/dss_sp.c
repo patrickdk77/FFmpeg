@@ -457,7 +457,6 @@ static void dss_sp_unpack_coeffs(DssSpContext *p, const uint8_t *src)
                  * repack_pulse_tbl is sticky across frames. */
                 if (cp > C72_binomials[6] - 1) {
                     cp = C72_binomials[6] - 1;
-                    p->pulse_dec_mode = 0;
                     p->repack_pulse_tbl = 0;
                 }
 
