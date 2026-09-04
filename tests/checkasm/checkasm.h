@@ -54,7 +54,6 @@ void checkasm_check_fdctdsp(void);
 void checkasm_check_fixed_dsp(void);
 void checkasm_check_flacdsp(void);
 void checkasm_check_float_dsp(void);
-void checkasm_check_fmtconvert(void);
 void checkasm_check_g722dsp(void);
 void checkasm_check_h263dsp(void);
 void checkasm_check_h264chroma(void);
@@ -106,6 +105,8 @@ void checkasm_check_sw_yuv2rgb(void);
 void checkasm_check_sw_yuv2yuv(void);
 void checkasm_check_sw_ops(void);
 void checkasm_check_takdsp(void);
+void checkasm_check_ttadsp(void);
+void checkasm_check_ttaencdsp(void);
 void checkasm_check_utvideodsp(void);
 void checkasm_check_v210dec(void);
 void checkasm_check_v210enc(void);
@@ -127,6 +128,9 @@ void checkasm_check_vorbisdsp(void);
 void checkasm_check_vvc_alf(void);
 void checkasm_check_vvc_mc(void);
 void checkasm_check_vvc_sao(void);
+
+void checkasm_uninit_crc(void);
+void checkasm_uninit_tx(void);
 
 #define rnd checkasm_rand_uint32
 #define declare_func_float declare_func

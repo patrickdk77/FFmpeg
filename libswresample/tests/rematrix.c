@@ -28,40 +28,49 @@
 /* swr_build_matrix2() accesses an internal SWR_CH_MAX by SWR_CH_MAX matrix. */
 #define MATRIX_STRIDE 64
 
-static int check_coefficient_with_slev(const AVChannelLayout *in_layout,
-                                       const AVChannelLayout *out_layout,
-                                       enum AVChannel in_channel,
-                                       enum AVChannel out_channel,
-                                       double surround_mix_level,
-                                       double expected)
+static int channel_is_unused(const AVChannelLayout *layout, int index)
+{
+    return av_channel_layout_channel_from_index(layout, index) == AV_CHAN_UNUSED;
+}
+
+static void print_matrix_row(const double *matrix,
+                             const AVChannelLayout *in_layout,
+                             int out, const char *out_name)
+{
+    char in_name[16];
+
+    printf("[%s] = { ", out_name);
+    for (int i = 0; i < 64; i++) {
+        enum AVChannel in_ch = av_channel_layout_channel_from_index(in_layout, i);
+        if (in_ch == AV_CHAN_NONE)
+            continue;
+        av_channel_name(in_name, sizeof(in_name), in_ch);
+        if (in_ch == AV_CHAN_UNUSED)
+            printf(".UNSD%d = %f, ", i,
+                   matrix[out * MATRIX_STRIDE + i]);
+        else
+            printf(".%s = %f, ", in_name, matrix[out * MATRIX_STRIDE + i]);
+    }
+    printf("},\n");
+}
+
+static int print_matrix(const AVChannelLayout *in_layout,
+                        const AVChannelLayout *out_layout)
 {
     double matrix[MATRIX_STRIDE * MATRIX_STRIDE] = { 0 };
-    char in_name[16], out_name[16];
-    int in, out, ret;
+    char out_name[16];
+    int ret;
 
-    av_channel_name(in_name, sizeof(in_name), in_channel);
-    av_channel_name(out_name, sizeof(out_name), out_channel);
-
-    if (in_layout->nb_channels > MATRIX_STRIDE ||
-        out_layout->nb_channels > MATRIX_STRIDE) {
-        fprintf(stderr, "channel layout exceeds matrix capacity\n");
-        return 1;
-    }
-
-    in  = av_channel_layout_index_from_channel(in_layout,  in_channel);
-    out = av_channel_layout_index_from_channel(out_layout, out_channel);
-    if (in < 0) {
-        fprintf(stderr, "input channel %s is not in the input layout\n", in_name);
-        return 1;
-    }
-    if (out < 0) {
-        fprintf(stderr, "output channel %s is not in the output layout\n", out_name);
-        return 1;
-    }
+    /* ensure swr_build_matrix2() overwrites unused columns and rows with zero. */
+    for (int out = 0; out < out_layout->nb_channels; out++)
+        for (int in = 0; in < in_layout->nb_channels; in++)
+            if (channel_is_unused(in_layout, in) ||
+                channel_is_unused(out_layout, out))
+                matrix[out * MATRIX_STRIDE + in] = 1.0;
 
     /* Disable normalization so the raw downmix gains can be checked. */
     ret = swr_build_matrix2(in_layout, out_layout, M_SQRT1_2,
-                            surround_mix_level,
+                            M_SQRT1_2,
                             0.0, INT_MAX, 1.0, matrix, MATRIX_STRIDE,
                             AV_MATRIX_ENCODING_NONE, NULL);
     if (ret < 0) {
@@ -69,102 +78,74 @@ static int check_coefficient_with_slev(const AVChannelLayout *in_layout,
         return 1;
     }
 
-    if (fabs(matrix[out * MATRIX_STRIDE + in] - expected) > 1e-12) {
-        fprintf(stderr, "%s -> %s: expected %.12f, got %.12f\n",
-                in_name, out_name, expected,
-                matrix[out * MATRIX_STRIDE + in]);
-        return 1;
+    for (int out = 0; out < out_layout->nb_channels; out++) {
+        for (int in = 0; in < in_layout->nb_channels; in++) {
+            if ((channel_is_unused(in_layout, in) ||
+                 channel_is_unused(out_layout, out)) &&
+                matrix[out * MATRIX_STRIDE + in] != 0.0) {
+                fprintf(stderr, "unused matrix position %d:%d is non-zero\n",
+                        out, in);
+                return 1;
+            }
+        }
+    }
+
+    for (int i = 0; i < out_layout->nb_channels; i++) {
+        enum AVChannel out_ch = av_channel_layout_channel_from_index(out_layout, i);
+        if (out_ch == AV_CHAN_NONE)
+            continue;
+        if (out_ch == AV_CHAN_UNUSED)
+            snprintf(out_name, sizeof(out_name), "UNSD%d", i);
+        else
+            av_channel_name(out_name, sizeof(out_name), out_ch);
+        print_matrix_row(matrix, in_layout, i, out_name);
     }
 
     return 0;
 }
 
-static int check_coefficient(const AVChannelLayout *in_layout,
-                             const AVChannelLayout *out_layout,
-                             enum AVChannel in_channel,
-                             enum AVChannel out_channel, double expected)
+int main(int argc, char **argv)
 {
-    return check_coefficient_with_slev(in_layout, out_layout, in_channel,
-                                       out_channel, M_SQRT1_2, expected);
-}
-
-int main(void)
-{
-    const AVChannelLayout mono          = AV_CHANNEL_LAYOUT_MONO;
-    const AVChannelLayout stereo        = AV_CHANNEL_LAYOUT_STEREO;
-    const AVChannelLayout surround      = AV_CHANNEL_LAYOUT_5POINT1;
-    const AVChannelLayout surround_back = AV_CHANNEL_LAYOUT_5POINT1_BACK;
-    const AVChannelLayout surround_2    = AV_CHANNEL_LAYOUT_5POINT1POINT2;
-    const AVChannelLayout surround_4    = AV_CHANNEL_LAYOUT_5POINT1POINT4_BACK;
-    const AVChannelLayout surround_tbc  = AV_CHANNEL_LAYOUT_7POINT2POINT3;
+    AVChannelLayout in_layout = { 0 }, out_layout = { 0 };
+    const char *in, *out;
     int ret = 0;
 
-    ret |= check_coefficient(&surround_2, &stereo,
-                             AV_CHAN_TOP_FRONT_LEFT, AV_CHAN_FRONT_LEFT, 1.0);
-    ret |= check_coefficient(&surround_2, &stereo,
-                             AV_CHAN_TOP_FRONT_RIGHT, AV_CHAN_FRONT_RIGHT, 1.0);
-    ret |= check_coefficient(&surround_4, &surround_2,
-                             AV_CHAN_TOP_BACK_LEFT, AV_CHAN_TOP_FRONT_LEFT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_4, &surround_2,
-                             AV_CHAN_TOP_BACK_RIGHT, AV_CHAN_TOP_FRONT_RIGHT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_4, &surround_tbc,
-                             AV_CHAN_TOP_BACK_LEFT, AV_CHAN_TOP_BACK_CENTER,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_4, &surround_tbc,
-                             AV_CHAN_TOP_BACK_RIGHT, AV_CHAN_TOP_BACK_CENTER,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_4, &surround,
-                             AV_CHAN_TOP_BACK_LEFT, AV_CHAN_SIDE_LEFT, 1.0);
-    ret |= check_coefficient(&surround_4, &surround,
-                             AV_CHAN_TOP_BACK_RIGHT, AV_CHAN_SIDE_RIGHT, 1.0);
-    ret |= check_coefficient(&surround_4, &surround_back,
-                             AV_CHAN_TOP_BACK_LEFT, AV_CHAN_BACK_LEFT, 1.0);
-    ret |= check_coefficient(&surround_4, &surround_back,
-                             AV_CHAN_TOP_BACK_RIGHT, AV_CHAN_BACK_RIGHT, 1.0);
-    ret |= check_coefficient(&surround_4, &stereo,
-                             AV_CHAN_TOP_BACK_LEFT, AV_CHAN_FRONT_LEFT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_4, &stereo,
-                             AV_CHAN_TOP_BACK_RIGHT, AV_CHAN_FRONT_RIGHT,
-                             M_SQRT1_2);
-    ret |= check_coefficient_with_slev(&surround_4, &stereo,
-                                       AV_CHAN_TOP_BACK_LEFT,
-                                       AV_CHAN_FRONT_LEFT, 0.5, 0.5);
-    ret |= check_coefficient_with_slev(&surround_4, &stereo,
-                                       AV_CHAN_TOP_BACK_RIGHT,
-                                       AV_CHAN_FRONT_RIGHT, 0.5, 0.5);
-    ret |= check_coefficient(&surround_4, &mono,
-                             AV_CHAN_TOP_BACK_LEFT, AV_CHAN_FRONT_CENTER,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_4, &mono,
-                             AV_CHAN_TOP_BACK_RIGHT, AV_CHAN_FRONT_CENTER,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_tbc, &surround,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_SIDE_LEFT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_tbc, &surround,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_SIDE_RIGHT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_tbc, &surround_4,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_TOP_BACK_LEFT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_tbc, &surround_4,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_TOP_BACK_RIGHT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_tbc, &surround_back,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_BACK_LEFT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_tbc, &surround_back,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_BACK_RIGHT,
-                             M_SQRT1_2);
-    ret |= check_coefficient(&surround_tbc, &stereo,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_FRONT_LEFT, 0.5);
-    ret |= check_coefficient(&surround_tbc, &stereo,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_FRONT_RIGHT, 0.5);
-    ret |= check_coefficient(&surround_tbc, &mono,
-                             AV_CHAN_TOP_BACK_CENTER, AV_CHAN_FRONT_CENTER, 0.5);
+    if (argc != 3) {
+        printf("usage: rematrix input_layout output_layout\n");
+        return 0;
+    }
+
+    in  = argv[1];
+    out = argv[2];
+
+    ret = av_channel_layout_from_string(&in_layout, in);
+    if (ret < 0) {
+        if (ret == AVERROR(EINVAL))
+            fprintf(stderr, "Invalid input layout %s\n", in);
+        ret = 1;
+        goto end;
+    }
+
+    ret = av_channel_layout_from_string(&out_layout, out);
+    if (ret < 0) {
+        if (ret == AVERROR(EINVAL))
+            fprintf(stderr, "Invalid output layout %s\n", out);
+        ret = 1;
+        goto end;
+    }
+
+    if (in_layout.nb_channels > MATRIX_STRIDE ||
+        out_layout.nb_channels > MATRIX_STRIDE) {
+        fprintf(stderr, "channel layout exceeds matrix capacity\n");
+        ret = 1;
+        goto end;
+    }
+
+    ret = print_matrix(&in_layout, &out_layout);
+
+end:
+    av_channel_layout_uninit(&in_layout);
+    av_channel_layout_uninit(&out_layout);
 
     return ret;
 }
