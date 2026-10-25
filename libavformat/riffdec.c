@@ -258,8 +258,12 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
     /* ignore WAVEFORMATEXTENSIBLE layout if different from channel count */
     if (channels != par->ch_layout.nb_channels) {
         av_channel_layout_uninit(&par->ch_layout);
-        par->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
-        par->ch_layout.nb_channels = channels;
+        if (id != 0xFFFE && (channels == 1 || channels == 2)) {
+            av_channel_layout_default(&par->ch_layout, channels);
+        } else {
+            par->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+            par->ch_layout.nb_channels = channels;
+        }
     }
 
     int64_t expected_bitrate = compute_bitrate(par);

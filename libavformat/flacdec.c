@@ -225,6 +225,24 @@ static int flac_read_header(AVFormatContext *s)
     if (ret < 0)
         return ret;
 
+    if ((s->pb->seekable & AVIO_SEEKABLE_NORMAL) && st->duration > 0 &&
+        st->time_base.num > 0) {
+        int64_t pos  = avio_tell(s->pb);
+        int64_t size = avio_size(s->pb);
+        uint8_t tag[3];
+
+        if (size - pos > 128 && avio_seek(s->pb, size - 128, SEEK_SET) >= 0 &&
+            avio_read(s->pb, tag, 3) == 3 && !memcmp(tag, "TAG", 3))
+            size -= 128;
+        if (avio_seek(s->pb, pos, SEEK_SET) < 0)
+            return AVERROR(EIO);
+        if (size > pos)
+            st->codecpar->bit_rate = av_rescale(8 * (size - pos),
+                                                st->time_base.den,
+                                                st->duration *
+                                                st->time_base.num);
+    }
+
     reset_index_position(avio_tell(s->pb), st);
     return 0;
 
