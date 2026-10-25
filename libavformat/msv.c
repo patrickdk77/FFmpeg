@@ -39,8 +39,8 @@
 #define MSV_INDEX_SIZE      10
 #define MSV_TRC_PAGE_SIZE   512
 
-#define MSV_HEAD_OFFSET_AUTHOR  0x10
-#define MSV_AUTHOR_SIZE         16
+#define MSV_HEAD_OFFSET_MAKER   0x10
+#define MSV_MAKER_SIZE          16
 #define MSV_HEAD_OFFSET_ENGINE  0x32
 #define MSV_HEAD_OFFSET_TIME    0x34
 #define MSV_ADPCM_SAMPLES_PER_FRAME 128
@@ -84,6 +84,8 @@ typedef struct MSVDemuxContext {
     uint16_t frame_sizes[4];
     int64_t trc_page_base;  /* TRC page layout: first page */
     int trc_page_hdr;       /* TRC page layout: header bytes per page, 0 if sectors */
+    int64_t lcst_frames;    /* LCST frames recorded (chunk 0x09), 0 if unknown */
+    int64_t lcst_end;       /* file position after the last recorded frame */
 } MSVDemuxContext;
 
 /* MSV ADPCM samples per 48-byte frame, by bits/sample. */
@@ -204,41 +206,84 @@ static int msv_read_metadata_string(AVFormatContext *s, unsigned int offset,
     return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
 }
 
-static int msv_bcd_byte(uint8_t b)
-{
-    return (b >> 4) * 10 + (b & 0xf);
-}
-
+/* Binary local recording time, as Sony's readers take it; a weekday follows. */
 static int msv_read_metadata_date(AVFormatContext *s, unsigned int offset,
                                   const char *key)
 {
     AVIOContext *pb = s->pb;
     char datetime[64];
-    int year, month, day, hour, minute;
-    uint8_t day_bcd;
+    int year, month, day, hour, minute, second;
 
     avio_seek(pb, offset, SEEK_SET);
     year   = avio_rb16(pb);
     month  = avio_r8(pb);
-    day_bcd = avio_r8(pb);
+    day    = avio_r8(pb);
     hour   = avio_r8(pb);
     minute = avio_r8(pb);
+    second = avio_r8(pb);
 
     if (year == 0 || year == 0xffff)
         return 0;
-    if (year < 1900 || year > 2100 || month < 1 || month > 12)
+    if (year < 1900 || year > 2100 || month < 1 || month > 12 ||
+        day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59)
         return AVERROR_INVALIDDATA;
 
-    day = msv_bcd_byte(day_bcd);
-    if (day < 1 || day > 31)
-        return AVERROR_INVALIDDATA;
-
-    snprintf(datetime, sizeof(datetime), "%.4d-%.2d-%.2dT%.2d:%.2d:00",
-             year, month, day, hour, minute);
+    snprintf(datetime, sizeof(datetime), "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d",
+             year, month, day, hour, minute, second);
     return av_dict_set(&s->metadata, key, datetime, 0);
 }
 
-static int64_t msv_count_adpcm_samples(AVFormatContext *s, MSVDemuxContext *ctx)
+/* Trim an 8-bit header string and store it, taking the bytes as Latin-1. */
+static int msv_set_latin1(AVFormatContext *s, const char *key, char *str,
+                          int size)
+{
+    char value[2 * 256 + 1], *q = value;
+    int i;
+
+    msv_trim_string(str, size);
+    for (i = 0; i < FFMIN(size, 256) && str[i]; i++) {
+        uint8_t tmp;
+
+        PUT_UTF8((uint8_t)str[i], tmp, *q++ = tmp;)
+    }
+    *q = 0;
+    if (!value[0])
+        return 0;
+    return av_dict_set(&s->metadata, key, value, 0);
+}
+
+/*
+ * Chunk text: a BE16 character set code, then the string. 0x8400 is
+ * UTF-16LE; Sony's readers hand every other code to the ANSI code page,
+ * which the file does not name, so those bytes are taken as Latin-1.
+ */
+static int msv_read_chunk_string(AVFormatContext *s, int64_t offset,
+                                 int size, const char *key)
+{
+    AVIOContext *pb = s->pb;
+    char buf[256], value[3 * 128 + 1];
+    int len;
+
+    if (size <= 2)
+        return 0;
+    size = FFMIN(size, sizeof(buf));
+    if (avio_seek(pb, offset, SEEK_SET) < 0 || avio_read(pb, buf, size) < size)
+        return AVERROR_EOF;
+
+    if (AV_RB16(buf) != 0x8400)
+        return msv_set_latin1(s, key, buf + 2, size - 2);
+
+    avio_seek(pb, offset + 2, SEEK_SET);
+    len = avio_get_str16le(pb, size - 2, value, sizeof(value));
+    if (len < 0)
+        return len;
+    if (!value[0])
+        return 0;
+    return av_dict_set(&s->metadata, key, value, 0);
+}
+
+static int64_t msv_count_adpcm_samples(AVFormatContext *s, MSVDemuxContext *ctx,
+                                       int64_t *nb_packets)
 {
     AVIOContext *pb = s->pb;
     int64_t end = ctx->data_offset + ctx->data_size;
@@ -268,6 +313,7 @@ static int64_t msv_count_adpcm_samples(AVFormatContext *s, MSVDemuxContext *ctx)
     tail = ctx->adpcm_mode == 2 ? (end - avio_tell(pb)) / 16 * 16 : 0;
     if (tail < 0)
         tail = 0;
+    *nb_packets = frames + (tail > 0);
     return frames * msv_adpcm_spf(ctx->adpcm_mode) + tail * 8 / ctx->adpcm_mode;
 }
 
@@ -413,6 +459,21 @@ static int msv_chunk_data_offset(AVIOContext *pb, int64_t *offset)
 }
 
 /*
+ * Number of chunk table entries: chunk 0x02 is the table itself, so its
+ * size bounds it (10 entries in plain files, 12 in security files, whose
+ * title text follows the table directly).
+ */
+static int msv_chunk_table_size(AVIOContext *pb, int max)
+{
+    uint8_t ent[8];
+
+    avio_seek(pb, MSV_CHUNK_TABLE + 8, SEEK_SET);
+    if (avio_read(pb, ent, 8) < 8 || ent[0] != 2)
+        return max;
+    return FFMIN(AV_RB32(ent + 4) / 8, max);
+}
+
+/*
  * Chunk table at 0x50: 8-byte entries (type byte, ..., BE32 size) laid out
  * back to back from file offset 0. Type 4 chunks (0x400, 0x403) hold audio.
  * Returns the number of audio chunks; the table is kept only if there is one.
@@ -422,9 +483,10 @@ static int msv_parse_chunks(AVIOContext *pb, MSVDemuxContext *ctx)
     uint8_t ent[8];
     int64_t off = 0;
     int i, audio = 0;
+    int n = msv_chunk_table_size(pb, FF_ARRAY_ELEMS(ctx->chunks));
 
     ctx->nb_chunks = 0;
-    for (i = 0; i < FF_ARRAY_ELEMS(ctx->chunks); i++) {
+    for (i = 0; i < n; i++) {
         avio_seek(pb, MSV_CHUNK_TABLE + 8 * i, SEEK_SET);
         if (avio_read(pb, ent, 8) < 8 || !ent[0] || ent[0] == 0x90)
             break;
@@ -438,6 +500,101 @@ static int msv_parse_chunks(AVIOContext *pb, MSVDemuxContext *ctx)
     if (!audio)
         ctx->nb_chunks = 0;
     return audio;
+}
+
+/*
+ * First BE32 of a chunk, or -1 if the table has no such chunk. Chunk 0x09
+ * is the recorded data size, the sum of the codec frames without their
+ * MSV frame headers.
+ */
+static int64_t msv_chunk_rb32(AVIOContext *pb, int type)
+{
+    uint8_t ent[8];
+    int64_t off = 0;
+    int i, n = msv_chunk_table_size(pb, 16);
+
+    for (i = 0; i < n; i++) {
+        avio_seek(pb, MSV_CHUNK_TABLE + 8 * i, SEEK_SET);
+        if (avio_read(pb, ent, 8) < 8 || !ent[0] || ent[0] == 0x90)
+            break;
+        if (ent[0] == type && AV_RB32(ent + 4) >= 4) {
+            if (avio_seek(pb, off, SEEK_SET) < 0)
+                return -1;
+            return avio_rb32(pb);
+        }
+        off += AV_RB32(ent + 4);
+    }
+    return -1;
+}
+
+/*
+ * Message chunks, named as Sony's DirectShow splitter shows them: 0x05
+ * Title, 0x07 Author (DVE: "User/Artist Name"), 0x0a Bookmark (payload
+ * bytes, -1 if unset), 0x0b Priority (0 to 3 stars), 0x0e Usage Frame.
+ * The usage frame is IcdYsys security data: byte 2 is the security level
+ * minus one and the user name it binds the file to follows at byte 12.
+ */
+static int msv_read_chunk_metadata(AVFormatContext *s, int bit_rate)
+{
+    AVIOContext *pb = s->pb;
+    uint8_t ent[8];
+    char usage[0x24];
+    int64_t off = 0;
+    int i, ret = 0, n = msv_chunk_table_size(pb, 16);
+
+    for (i = 0; i < n && ret != AVERROR(ENOMEM); i++) {
+        int64_t size;
+        uint32_t v;
+        char *end;
+
+        avio_seek(pb, MSV_CHUNK_TABLE + 8 * i, SEEK_SET);
+        if (avio_read(pb, ent, 8) < 8 || !ent[0] || ent[0] == 0x90)
+            break;
+        size = AV_RB32(ent + 4);
+
+        switch (ent[0]) {
+        case 0x05:
+            ret = msv_read_chunk_string(s, off, FFMIN(size, 0x100), "title");
+            break;
+        case 0x07:
+            ret = msv_read_chunk_string(s, off, FFMIN(size, 2 + 0x14),
+                                        "artist");
+            break;
+        case 0x0a:
+            if (size < 4 || bit_rate <= 0 || avio_seek(pb, off, SEEK_SET) < 0)
+                break;
+            v = avio_rb32(pb);
+            if (v != 0xffffffff && !avio_feof(pb) &&
+                !avpriv_new_chapter(s, 0, (AVRational){ 1, 1000 },
+                                    v * 8000LL / bit_rate, AV_NOPTS_VALUE,
+                                    "Bookmark"))
+                ret = AVERROR(ENOMEM);
+            break;
+        case 0x0b:
+            if (size < 1 || avio_seek(pb, off, SEEK_SET) < 0)
+                break;
+            v = avio_r8(pb);
+            if (v && !avio_feof(pb))
+                ret = av_dict_set_int(&s->metadata, "priority", v, 0);
+            break;
+        case 0x0e:
+            if (size < sizeof(usage) || avio_seek(pb, off, SEEK_SET) < 0 ||
+                avio_read(pb, usage, sizeof(usage)) < sizeof(usage))
+                break;
+            ret = av_dict_set_int(&s->metadata, "security_level",
+                                  (uint8_t)usage[2] + 1, 0);
+            if (ret < 0)
+                break;
+            /* unused bytes of the frame are 0xff */
+            end = memchr(usage + 12, 0xff, sizeof(usage) - 12);
+            if (end)
+                *end = 0;
+            ret = msv_set_latin1(s, "owner", usage + 12, sizeof(usage) - 12);
+            break;
+        }
+        off += size;
+    }
+    return ret == AVERROR(ENOMEM) ? ret : 0;
 }
 
 /* LPEC frame size by the top two bits of the lead byte */
@@ -596,6 +753,32 @@ static int msv_lcst_frame_size(int quality)
     }
 }
 
+/* Codec bit rate by quality, from the parameter table in Sony's readers. */
+static int msv_codec_bit_rate(int quality)
+{
+    switch (quality) {
+    case 0x05: return 33075;
+    case 0x09: return 16000;
+    case 0x15:
+    case 0x2a:
+    case 0x4a: return 16000;
+    case 0x19:
+    case 0x2c:
+    case 0x4c: return 6000;
+    case 0x1e: return 256331;
+    case 0x20: return 128165;
+    case 0x21: return 96468;
+    case 0x22: return 64771;
+    case 0x24: return 48234;
+    case 0x28: return 24806;
+    case 0x29: return 16537;
+    case 0x30: return 19200;
+    case 0x35: return 7200;
+    case 0x37: return 4400;
+    default:   return 0;
+    }
+}
+
 /*
  * True end of sector-based audio (LPEC/LCST/TRC). Each 0x400 sector starts
  * with a 10-byte index whose BE16 field at +4 is the offset (within the
@@ -742,6 +925,11 @@ static int64_t msv_count_packets(AVFormatContext *s)
         }
         n++;
         av_packet_unref(pkt);
+        /* Sony's reader stops after the recorded frames */
+        if (n == ctx->lcst_frames) {
+            ctx->lcst_end = pos;
+            break;
+        }
         /* every packet moves the read position forward */
         if (pos <= last) {
             av_log(s, AV_LOG_WARNING, "Packet walk did not advance, stopping\n");
@@ -762,7 +950,7 @@ static int msv_read_header(AVFormatContext *s)
     char spi[MSV_SPI_SIZE + 1] = { 0 };
     uint8_t magic[8];
     int ret;
-    int64_t pos, nb_samples = 0;
+    int64_t pos, nb_samples = 0, nb_packets = 0;
 
     avio_seek(pb, 0, SEEK_SET);
     ret = avio_read(pb, magic, sizeof(magic));
@@ -771,10 +959,10 @@ static int msv_read_header(AVFormatContext *s)
     if (memcmp(magic, "MS_VOICE", 8))
         return AVERROR_INVALIDDATA;
 
-    ret = msv_read_metadata_string(s, MSV_HEAD_OFFSET_AUTHOR,
-                                 MSV_AUTHOR_SIZE, "author");
+    ret = msv_read_metadata_string(s, MSV_HEAD_OFFSET_MAKER,
+                                   MSV_MAKER_SIZE, "maker");
     if (ret < 0)
-        av_log(s, AV_LOG_WARNING, "Failed to read author metadata\n");
+        av_log(s, AV_LOG_WARNING, "Failed to read maker metadata\n");
 
     ret = msv_read_metadata_date(s, MSV_HEAD_OFFSET_TIME, "date");
     if (ret < 0)
@@ -938,20 +1126,24 @@ static int msv_read_header(AVFormatContext *s)
     st->start_time = 0;
 
     if (ctx->codec == MSV_CODEC_ADPCM) {
-        nb_samples = msv_count_adpcm_samples(s, ctx);
+        nb_samples = msv_count_adpcm_samples(s, ctx, &nb_packets);
         if (nb_samples < 0)
             return (int)nb_samples;
     } else if (ctx->codec == MSV_CODEC_TRC || ctx->codec == MSV_CODEC_LCST) {
-        int64_t nb_packets = msv_count_packets(s);
+        if (ctx->codec == MSV_CODEC_LCST) {
+            int64_t size = msv_chunk_rb32(pb, 0x09);
 
+            if (size > 0)
+                ctx->lcst_frames = size / (ctx->frame_sizes[0] - 3);
+        }
+        nb_packets = msv_count_packets(s);
         if (nb_packets < 0)
             return (int)nb_packets;
         nb_samples = nb_packets * (ctx->codec == MSV_CODEC_TRC ?
                                    MSV_TRC_SAMPLES_PER_FRAME :
                                    MSV_LCST_SAMPLES_PER_FRAME);
     } else if (ctx->nb_chunks) {
-        int64_t nb_packets = msv_count_packets(s);
-
+        nb_packets = msv_count_packets(s);
         if (nb_packets < 0)
             return (int)nb_packets;
         ctx->lpec_pos = ctx->data_offset;
@@ -981,6 +1173,14 @@ static int msv_read_header(AVFormatContext *s)
         s->bit_rate = 8LL * ctx->byte_rate;
         st->codecpar->bit_rate = (int)s->bit_rate;
     }
+    if (msv_codec_bit_rate(ctx->quality) > 0)
+        st->codecpar->bit_rate = msv_codec_bit_rate(ctx->quality);
+    if (nb_packets > 0)
+        st->nb_frames = nb_packets;
+
+    ret = msv_read_chunk_metadata(s, msv_codec_bit_rate(ctx->quality));
+    if (ret < 0)
+        return ret;
 
     avio_seek(pb, ctx->data_offset, SEEK_SET);
     return 0;
@@ -1316,8 +1516,11 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
 static int msv_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MSVDemuxContext *ctx = s->priv_data;
-    int ret = msv_read_raw_packet(s, pkt);
+    int ret;
 
+    if (ctx->lcst_end && avio_tell(s->pb) >= ctx->lcst_end)
+        return AVERROR_EOF;
+    ret = msv_read_raw_packet(s, pkt);
     if (ret < 0)
         return ret;
     if (ctx->codec == MSV_CODEC_LCST && msv_lcst_is_padding(pkt)) {

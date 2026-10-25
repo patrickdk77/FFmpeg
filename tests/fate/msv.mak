@@ -118,10 +118,17 @@ FATE_MSV_ADPCM-$(call FRAMECRC, MSV, MSV_ADPCM) += $(FATE_MSV_ADPCM)
 
 FATE_MSV_FFPROBE-$(call DEMDEC, MSV, ATRAC3P LPEC TRC MSV_ADPCM) += fate-msv-probe
 fate-msv-probe: CMD = \
-    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,nb_frames -of compact $(TARGET_SAMPLES)/msv/lcst-sthq.msv; \
-    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,nb_frames -of compact $(TARGET_SAMPLES)/msv/lpec-hac-lp.msv; \
-    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,nb_frames -of compact $(TARGET_SAMPLES)/msv/trc-page-lp.msv; \
-    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,nb_frames -of compact $(TARGET_SAMPLES)/msv/adpcm-lp.msv
+    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,bit_rate,nb_frames -of compact $(TARGET_SAMPLES)/msv/lcst-sthq.msv; \
+    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,bit_rate,nb_frames -of compact $(TARGET_SAMPLES)/msv/lpec-hac-lp.msv; \
+    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,bit_rate,nb_frames -of compact $(TARGET_SAMPLES)/msv/trc-page-lp.msv; \
+    probe -show_entries format=duration:stream=codec_name,sample_rate,channels,duration,bit_rate,nb_frames -of compact $(TARGET_SAMPLES)/msv/adpcm-lp.msv
+
+FATE_MSV_FFPROBE-$(call DEMDEC, MSV, LPEC TRC) += fate-msv-metadata
+fate-msv-metadata: CMD = \
+    probe -show_entries format_tags:chapter -of compact $(TARGET_SAMPLES)/msv/icd-px7-trc-sp.dvf; \
+    probe -show_entries format_tags:chapter -of compact $(TARGET_SAMPLES)/msv/pvoice-trc-hq.dvf; \
+    probe -show_entries format_tags:chapter -of compact $(TARGET_SAMPLES)/msv/taxis-trc-hq.dvf; \
+    probe -show_entries format_tags:chapter -of compact $(TARGET_SAMPLES)/msv/icd-bm1-lpec-sp.msv
 
 FATE_MSV_FFMPEG = $(FATE_MSV_LCST-yes) $(FATE_MSV_LPEC-yes) $(FATE_MSV_TRC-yes) $(FATE_MSV_ADPCM-yes)
 FATE_SAMPLES_FFMPEG += $(FATE_MSV_FFMPEG)
