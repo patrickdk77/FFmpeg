@@ -57,12 +57,8 @@ typedef struct TRCFrameParams {
 } TRCFrameParams;
 
 /* Decode RATE from the first packet byte. */
-int trc_decode_rate(uint8_t byte0);
-
 /* Packet byte count for a RATE code. */
-int trc_packet_bytes(int rate);
-
 /* Parse one TRC frame packet. Returns consumed bytes or AVERROR. */
-int trc_unpack_frame(const uint8_t *buf, int buf_size, TRCFrameParams *fp);
+int ff_trc_unpack_frame(const uint8_t *buf, int buf_size, TRCFrameParams *fp);
 
 #endif /* AVCODEC_TRC_UNPACK_H */

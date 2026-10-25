@@ -57,7 +57,7 @@ static const int16_t *trc_weight_for_rate(int rate)
 }
 
 /* 1/A(z) synthesis on the excitation (in place). */
-void trc_lpc_synth(int16_t *exc, const int16_t lpc[TRC_ORDER], int len)
+void ff_trc_lpc_synth(int16_t *exc, const int16_t lpc[TRC_ORDER], int len)
 {
     int n, k;
 
@@ -90,29 +90,6 @@ static inline int16_t trc_agc_smooth(int16_t agc, int16_t g_tgt)
     else if (acc < 0)
         acc = 0;
     return (int16_t)(acc >> 16);
-}
-
-/*
- * 15-step binary search for the largest r such that (int64_t)2*r*r <= x.
- * This is floor(sqrt(x/2)), not floor(sqrt(x)); the sqrt(2) factor cancels
- * in the in/out ratio but the quantization grid does not, so the exact
- * algorithm matters for the AGC target.
- */
-static inline int16_t trc_sqrt_q15(int32_t x)
-{
-    int32_t root = 0;
-    int32_t bit  = 0x4000;
-    int i;
-
-    for (i = 0; i < 15; i++) {
-        int32_t trial = root + bit;
-        int64_t sq = ((int64_t)trial * trial) << 1;
-
-        if (sq <= (int64_t)x)
-            root = trial;
-        bit >>= 1;
-    }
-    return (int16_t)root;
 }
 
 static inline int16_t trc_agc_target(uint64_t in_e, uint64_t out_e)
@@ -347,14 +324,14 @@ static void trc_postfilter_agc_ring(int16_t *ring, int agc_off,
         agc = trc_agc_smooth(*agc_mem, g_tgt);
         *agc_mem = agc;
 
-        /* Apply: round(sample * agc * 2 << 4) >> 16. */
-        acc = trc_l_mult(0, ring[form_off + n], agc);
-        acc = trc_sat32(acc << 4);
-        ring[form_off + n] = trc_round16((int32_t)acc);
+        /* Apply: round(sample * agc * 2 << 4) >> 16, saturating last. */
+        acc = (int64_t)(ring[form_off + n] * agc) * 32;
+        acc = (acc + 0x8000) & ~0xffffLL;
+        ring[form_off + n] = (int16_t)(trc_sat32(acc) >> 16);
     }
 }
 
-void trc_postfilter(int16_t *pcm, int16_t *exc, const int16_t lpc[TRC_ORDER],
+void ff_trc_postfilter(int16_t *pcm, int16_t *exc, const int16_t lpc[TRC_ORDER],
                     int16_t *formant_hist, int16_t *agc_mem, int rate, int len)
 {
     int16_t ring[TRC_PF_RING_SAMPLES];
@@ -376,29 +353,38 @@ void trc_postfilter(int16_t *pcm, int16_t *exc, const int16_t lpc[TRC_ORDER],
                TRC_ORDER * sizeof(int16_t));
 }
 
-static uint32_t trc_noise_step(uint32_t *state)
+/* Comfort-noise generator: 16-bit LCG kept in a 32-bit word. */
+static int16_t trc_noise_step(uint32_t *state)
 {
-    *state = *state * 1664525u + 1013904223u;
-    return *state;
+    *state = (uint32_t)trc_sat32((int64_t)(int16_t)*state * 521 + 259);
+    return (int16_t)*state;
 }
 
-void trc_noise_fill(int16_t *exc_block, int block_off, int16_t *gain_idx,
+void ff_trc_noise_fill(int16_t *exc_block, int block_off, int16_t *gain_idx,
                     int16_t *gain_val, uint32_t *noise_state)
 {
+    int64_t acc;
     int i;
-    int16_t gain;
 
     if (*gain_idx < 0)
         *gain_idx = 0;
-    if (*gain_idx > 25)
-        *gain_idx = 25;
+    if (*gain_idx > 31)
+        *gain_idx = 31;
 
-    gain = trc_gain_quant[*gain_idx];
-    *gain_val = gain;
+    /* one-pole smoothing: gain += (target - gain) / 8 */
+    acc  = (int64_t)*gain_val * 65536 - (int64_t)*gain_val * 8192;
+    acc += (int64_t)trc_gain_quant[*gain_idx] * 8192 + 0x8000;
+    *gain_val = (int16_t)(trc_sat32(acc & ~0xffffLL) >> 16);
 
     for (i = 0; i < 40; i++) {
-        int32_t n = (int32_t)(int16_t)(trc_noise_step(noise_state) >> 16);
-        int32_t acc = n * gain;
-        exc_block[block_off + i] = trc_clip_int16(acc >> 14);
+        int64_t x = (int64_t)trc_noise_step(noise_state) * 65536;
+        int16_t n;
+
+        /* 3/4 of the raw value, rounded */
+        x = (x - (x >> 2) + 0x8000) & ~0xffffLL;
+        n = (int16_t)(trc_sat32(x) >> 16);
+
+        x = (((int64_t)(n * *gain_val) + 0x4000) * 2) & ~0xffffLL;
+        exc_block[block_off + i] = (int16_t)(trc_sat32(x) >> 16);
     }
 }

@@ -27,10 +27,10 @@
 
 #include <stdint.h>
 
-void trc_lsf_decode(const int16_t idx[3], const int16_t prev_lsf[10],
+void ff_trc_lsf_decode(const int16_t idx[3], const int16_t prev_lsf[10],
                     int16_t lsf_out[10]);
-void trc_lsf_interpolate(int16_t lsp_out[10], const int16_t cur[10],
+void ff_trc_lsf_interpolate(int16_t lsp_out[10], const int16_t cur[10],
                          const int16_t prev[10], int nsub, int sub_idx);
-void trc_lsf_to_lpc(int16_t lsp[10]);
+void ff_trc_lsf_to_lpc(int16_t lsp[10]);
 
 #endif /* AVCODEC_TRC_LSP_H */

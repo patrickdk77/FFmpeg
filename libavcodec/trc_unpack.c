@@ -30,7 +30,7 @@
 #include "libavutil/error.h"
 #include "get_bits.h"
 
-int trc_decode_rate(uint8_t byte0)
+static int trc_decode_rate(uint8_t byte0)
 {
     int top2 = byte0 >> 6;
 
@@ -39,7 +39,7 @@ int trc_decode_rate(uint8_t byte0)
     return (byte0 & 0x20) ? 4 : 3;
 }
 
-int trc_packet_bytes(int rate)
+static int trc_packet_bytes(int rate)
 {
     if (rate < 0 || rate > 5)
         return 0;
@@ -93,7 +93,7 @@ static void trc_decode_lags(GetBitContext *gb, TRCFrameParams *fp, int rate)
     }
 }
 
-int trc_unpack_frame(const uint8_t *buf, int buf_size, TRCFrameParams *fp)
+int ff_trc_unpack_frame(const uint8_t *buf, int buf_size, TRCFrameParams *fp)
 {
     GetBitContext gb;
     int rate, pbytes, ret;

@@ -29,10 +29,10 @@
 
 #include "trc_unpack.h"
 
-void trc_adaptive_excit(int16_t *exc, const TRCSubParams *sf,
+void ff_trc_adaptive_excit(int16_t *exc, const TRCSubParams *sf,
                         int16_t *exc_hist, int len);
-void trc_fixed_excit(int16_t *exc, const TRCSubParams *sf, int rate, int len,
+void ff_trc_fixed_excit(int16_t *exc, const TRCSubParams *sf, int rate, int len,
                      int16_t *gain_state);
-void trc_lt_pitch_filter(int16_t *buf, const TRCFrameParams *fp);
+void ff_trc_lt_pitch_filter(int16_t *buf, const TRCFrameParams *fp);
 
 #endif /* AVCODEC_TRC_EXCIT_H */

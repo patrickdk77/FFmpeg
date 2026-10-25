@@ -29,10 +29,10 @@
 
 #include "trc_unpack.h"
 
-void trc_lpc_synth(int16_t *exc, const int16_t lpc[10], int len);
-void trc_postfilter(int16_t *pcm, int16_t *exc, const int16_t lpc[10],
+void ff_trc_lpc_synth(int16_t *exc, const int16_t lpc[10], int len);
+void ff_trc_postfilter(int16_t *pcm, int16_t *exc, const int16_t lpc[10],
                     int16_t *formant_hist, int16_t *agc_mem, int rate, int len);
-void trc_noise_fill(int16_t *exc_block, int block_off, int16_t *gain_idx,
+void ff_trc_noise_fill(int16_t *exc_block, int block_off, int16_t *gain_idx,
                     int16_t *gain_val, uint32_t *noise_state);
 
 #endif /* AVCODEC_TRC_SYNTH_H */

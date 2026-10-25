@@ -102,7 +102,7 @@ static void trc_fill_noise_excitation(TRCContext *s)
     int k;
 
     for (k = 0; k < TRC_FRAME_SAMPLES / 40; k++)
-        trc_noise_fill(cur, k * 40, &s->noise_gain_idx, &s->noise_gain_val,
+        ff_trc_noise_fill(cur, k * 40, &s->noise_gain_idx, &s->noise_gain_val,
                        &s->noise_state);
 
     memset(s->exc_hist, 0, sizeof(s->exc_hist));
@@ -121,11 +121,11 @@ static void trc_build_excitation(TRCContext *s, const TRCFrameParams *fp)
         return;
     }
 
-    trc_lsf_decode(fp->lsf_idx, s->lsf_hist, s->lsf_cur);
+    ff_trc_lsf_decode(fp->lsf_idx, s->lsf_hist, s->lsf_cur);
 
     if (fp->type == 2) {
+        s->noise_gain_idx = fp->aux_gain;
         if (s->prev_type == 1) {
-            s->noise_gain_idx = fp->aux_gain;
             s->noise_state    = 0x5ba0;
             s->noise_gain_val = trc_gain_quant[fp->aux_gain];
         }
@@ -135,8 +135,8 @@ static void trc_build_excitation(TRCContext *s, const TRCFrameParams *fp)
 
     /* TYPE 1: voiced CELP, adaptive + fixed codebook per subframe */
     for (k = 0; k < fp->nsub; k++) {
-        trc_adaptive_excit(cur + off, &fp->sf[k], s->exc_buf, fp->sublen);
-        trc_fixed_excit(cur + off, &fp->sf[k], fp->rate, fp->sublen,
+        ff_trc_adaptive_excit(cur + off, &fp->sf[k], s->exc_buf, fp->sublen);
+        ff_trc_fixed_excit(cur + off, &fp->sf[k], fp->rate, fp->sublen,
                         &s->gain_state);
         off += fp->sublen;
     }
@@ -148,7 +148,7 @@ static void trc_build_excitation(TRCContext *s, const TRCFrameParams *fp)
      * synthesis, AFTER the adaptive-codebook history has been saved (the
      * saved history stays pre-filter, matching the reference decoder).
      */
-    trc_lt_pitch_filter(s->exc_buf, fp);
+    ff_trc_lt_pitch_filter(s->exc_buf, fp);
 }
 
 /* LPC-synthesise the built excitation and post-filter to PCM. */
@@ -165,11 +165,11 @@ static void trc_synthesize_frame(TRCContext *s, const TRCFrameParams *fp, int16_
         int off = k * fp->sublen;
         int16_t *sub = syn + TRC_ORDER + off;
 
-        trc_lsf_interpolate(lpc, s->lsf_cur, s->lsf_hist, fp->nsub, k);
-        trc_lsf_to_lpc(lpc);
+        ff_trc_lsf_interpolate(lpc, s->lsf_cur, s->lsf_hist, fp->nsub, k);
+        ff_trc_lsf_to_lpc(lpc);
         memcpy(sub, exc + off, fp->sublen * sizeof(int16_t));
-        trc_lpc_synth(sub, lpc, fp->sublen);
-        trc_postfilter(out + off, sub, lpc, s->formant_hist,
+        ff_trc_lpc_synth(sub, lpc, fp->sublen);
+        ff_trc_postfilter(out + off, sub, lpc, s->formant_hist,
                        &s->agc_mem, fp->rate, fp->sublen);
     }
 
@@ -186,7 +186,7 @@ static int trc_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     int16_t *dst;
     int i, ret, consumed;
 
-    consumed = trc_unpack_frame(avpkt->data, avpkt->size, &s->cur);
+    consumed = ff_trc_unpack_frame(avpkt->data, avpkt->size, &s->cur);
     if (consumed < 0)
         return consumed;
 

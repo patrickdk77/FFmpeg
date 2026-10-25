@@ -331,11 +331,17 @@ static const int16_t trc_coef_table[288] = {
     -4112, 1171, -9883, -516, -42, 4517, -1286, 294,
 };
 
-/* trc_gain_quant: 26 x int16_t */
-static const int16_t trc_gain_quant[26] = {
+/* trc_gain_quant: 32 x int16_t */
+/*
+ * Indices 26..31 are reachable from the 5-bit noise-gain field; the
+ * reference decoder reads past its 26-entry table there, and these are the
+ * values it finds.
+ */
+static const int16_t trc_gain_quant[32] = {
     1, 2, 3, 4, 6, 8, 11, 16, 23, 32,
     45, 64, 91, 128, 181, 256, 362, 512, 724, 1024,
     1448, 2048, 2896, 4096, 5793, 8192,
+    969, 816, 680, 560, 455, 364,
 };
 
 #endif /* AVCODEC_TRCDATA_H */

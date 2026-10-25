@@ -161,7 +161,7 @@ static void trc_place_track(int16_t *exc, int len, int16_t pos_code,
     }
 }
 
-void trc_adaptive_excit(int16_t *exc, const TRCSubParams *sf,
+void ff_trc_adaptive_excit(int16_t *exc, const TRCSubParams *sf,
                         int16_t *exc_hist, int len)
 {
     int lag = sf->lag;
@@ -194,7 +194,7 @@ void trc_adaptive_excit(int16_t *exc, const TRCSubParams *sf,
 }
 
 /* Fixed algebraic codebook excitation, added onto the adaptive contribution. */
-void trc_fixed_excit(int16_t *exc, const TRCSubParams *sf, int rate, int len,
+void ff_trc_fixed_excit(int16_t *exc, const TRCSubParams *sf, int rate, int len,
                      int16_t *gain_state)
 {
     int16_t gain;
@@ -337,9 +337,9 @@ static int trc_refine_lag_fwd(const int16_t *work, int pos, int center)
 
 /*
  * Backward lag search (forward-in-time direction): best SIGNED
- * corr(x[n], x[n+lag]).  The whole search is skipped when the highest
- * candidate window would read past the 304-sample buffer (all-or-nothing
- * bound on hi, not per candidate).
+ * corr(x[n], x[n+lag]).  The whole search is skipped unless the highest
+ * candidate window ends strictly before the end of the 304-sample buffer
+ * (all-or-nothing bound on hi, not per candidate).
  */
 static int trc_refine_lag_bwd(const int16_t *work, int pos, int center)
 {
@@ -353,7 +353,7 @@ static int trc_refine_lag_bwd(const int16_t *work, int pos, int center)
         lo = 0x8b;
     }
 
-    if (pos + hi + TRC_LT_WIN > TRC_LT_TOTAL)
+    if (pos + hi + TRC_LT_WIN >= TRC_LT_TOTAL)
         return 0;
 
     for (lag = lo; lag <= hi; lag++) {
@@ -449,7 +449,7 @@ static int16_t trc_lt_norm_scalar(int32_t e, int exp)
         v >>= -exp;
     else if (exp > 0)
         v <<= exp;
-    return (int16_t)(trc_sat32((v + 0x8000) >> 16));
+    return (int16_t)(trc_sat32(v) >> 16);
 }
 
 /* Enhance only when (norm_in * norm_enh >> 1) < norm_cross^2. */
@@ -531,28 +531,22 @@ static int16_t trc_lt_den(int16_t norm_in, int16_t norm_enh,
 static int16_t trc_lt_gain(int16_t norm_in, int16_t norm_enh,
                            int16_t norm_cross)
 {
-    int32_t num, den;
-    uint32_t g_raw, g;
+    int32_t num, den, g_raw;
 
     den = trc_lt_den(norm_in, norm_enh, norm_cross);
-    if (den <= 0)
-        return 0x4000;
+    num = (int32_t)norm_in * 16384;
 
-    num = (int32_t)norm_in << 14;
-    if (num >= (int32_t)den << 16)
+    /* Any division the reference decoder cannot do falls back to the
+     * full-scale ratio; the root itself is not limited. */
+    if (den <= 0 || num < 0 || num >= (int64_t)den * 65536) {
         g_raw = 0x7fff;
-    else
-        g_raw = (uint32_t)(((int64_t)num >> 1) / den);
+    } else {
+        int64_t q = ((int64_t)num >> 1) / den;
 
-    if (g_raw > 0x7fff)
-        g_raw = 0x7fff;
+        g_raw = q > 0x7fff ? 0x7fff : (int32_t)q;
+    }
 
-    g = trc_sqrt_half_q15(g_raw << 16);
-    if (g < 0x2000)
-        g = 0x2000;
-    if (g > 0x7fff)
-        g = 0x7fff;
-    return (int16_t)g;
+    return trc_sqrt_q15(g_raw * 65536);
 }
 
 /* Mix output: round((harm*g + in*g) << 1 >> 16). */
@@ -572,13 +566,12 @@ static int16_t trc_norm_sample(const int16_t *norm, int idx)
 }
 
 /* Harmonic-synthesis rounding: acc<<4, +0x8000, mask, >>16. */
-static int16_t trc_lt_harm_round(int32_t acc)
+static int16_t trc_lt_harm_round(int64_t acc)
 {
-    int64_t v = (int64_t)acc << 4;
-
-    v += 0x8000;
-    v &= ~0xffffLL;
-    return trc_clip_int16((int16_t)(v >> 16));
+    acc *= 16;
+    acc += 0x8000;
+    acc &= ~0xffffLL;
+    return (int16_t)(trc_sat32(acc) >> 16);
 }
 
 /* Harmonic synthesis: 3 taps at center = fpos + 1 + lag + n. */
@@ -589,11 +582,11 @@ static void trc_lt_synth_harm(int16_t *harm, const int16_t *raw, int fpos,
 
     for (n = 0; n < TRC_LT_WIN; n++) {
         int center = fpos + 1 + lag + n;
-        int32_t acc = 0;
+        int64_t acc;
 
-        acc = trc_l_mult(acc, taps[0], trc_norm_sample(raw, center - 2));
-        acc = trc_l_mult(acc, taps[1], trc_norm_sample(raw, center - 1));
-        acc = trc_l_mult(acc, taps[2], trc_norm_sample(raw, center));
+        acc  = (int64_t)(taps[0] * trc_norm_sample(raw, center - 2)) * 2;
+        acc += (int64_t)(taps[1] * trc_norm_sample(raw, center - 1)) * 2;
+        acc += (int64_t)(taps[2] * trc_norm_sample(raw, center)) * 2;
         harm[n] = trc_lt_harm_round(acc);
     }
 }
@@ -773,7 +766,7 @@ static int64_t trc_lt_dir_metric(const int16_t cross[3], const int16_t h[3],
  * stronger predicted energy wins.
  * Pass 2: harmonic synthesis, 3-energy gain, and a harm/input mix per window.
  */
-void trc_lt_pitch_filter(int16_t *buf, const TRCFrameParams *fp)
+void ff_trc_lt_pitch_filter(int16_t *buf, const TRCFrameParams *fp)
 {
     int16_t norm[TRC_LT_TOTAL];
     int16_t work[TRC_LT_TOTAL];

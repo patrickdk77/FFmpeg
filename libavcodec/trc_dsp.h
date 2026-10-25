@@ -55,32 +55,27 @@ static inline int16_t trc_round16(int32_t acc)
     return trc_clip_int16((acc + 0x8000) >> 16);
 }
 
-static inline uint32_t trc_isqrt64(uint64_t x)
+/*
+ * 15-step binary search for the largest r such that (int64_t)2*r*r <= x.
+ * This is floor(sqrt(x/2)), not floor(sqrt(x)); the sqrt(2) factor cancels
+ * in the in/out ratio but the quantization grid does not, so the exact
+ * algorithm matters for the AGC target and the pitch-filter gain.
+ */
+static inline int16_t trc_sqrt_q15(int32_t x)
 {
-    uint64_t r = 0;
-    uint64_t bit = (uint64_t)1 << 62;
+    int32_t root = 0;
+    int32_t bit  = 0x4000;
+    int i;
 
-    if (!x)
-        return 0;
-    while (bit > x)
-        bit >>= 2;
-    for (; bit; bit >>= 2) {
-        if (x >= r + bit) {
-            x -= r + bit;
-            r = (r >> 1) + bit;
-        } else {
-            r >>= 1;
-        }
+    for (i = 0; i < 15; i++) {
+        int32_t trial = root + bit;
+        int64_t sq = ((int64_t)trial * trial) << 1;
+
+        if (sq <= (int64_t)x)
+            root = trial;
+        bit >>= 1;
     }
-    return (uint32_t)r;
-}
-
-/* sqrt(x/2) in Q15: isqrt(x) * sqrt(0.5) (23170 = round(sqrt(0.5)*32768)). */
-static inline uint16_t trc_sqrt_half_q15(uint32_t param)
-{
-    uint32_t g = trc_isqrt64((uint64_t)param);
-
-    return (uint16_t)(((g * 23170) + 0x4000) >> 15);
+    return (int16_t)root;
 }
 
 #endif /* AVCODEC_TRC_DSP_H */
