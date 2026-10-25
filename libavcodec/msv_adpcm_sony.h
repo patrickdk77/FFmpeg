@@ -68,15 +68,17 @@ typedef struct MSVADPCMState {
     uint32_t tap5;
 } MSVADPCMState;
 
-void msv_adpcm_bs_init(MSVADPCMBitstream *bs, const uint8_t *buf, int limit, int mode);
-int  msv_adpcm_bs_next(MSVADPCMBitstream *bs, uint32_t *sym);
+int ff_msv_adpcm_samples_per_frame(int mode);
 
-void msv_adpcm_get_state(MSVADPCMState *st);
-void msv_adpcm_set_state(const MSVADPCMState *st);
-
-int msv_adpcm_samples_per_frame(int mode);
-
-int msv_adpcm_decode_block(const uint8_t *buf, int16_t *out, int mode,
-                           int *need_init, MSVADPCMBitstream *bs);
+/*
+ * size: block bytes; MSV_ADPCM_FRAME_SIZE, or less for the final block of
+ * an LP stream, which ends on a 16-byte unit.
+ * decode_first: initialise the state and then decode the stream's first
+ * symbol (DVE reader); otherwise the first symbol only initialises the
+ * state and yields 0 (plug-in).
+ */
+int ff_msv_adpcm_decode_block(const uint8_t *buf, int size, int16_t *out, int mode,
+                           int *need_init, int decode_first,
+                           MSVADPCMState *st, MSVADPCMBitstream *bs);
 
 #endif /* AVCODEC_MSV_ADPCM_SONY_H */
