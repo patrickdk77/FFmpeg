@@ -37,9 +37,11 @@
 #define MSV_HEADER_MIN      0x100
 #define MSV_SECTOR_SIZE     0x400
 #define MSV_INDEX_SIZE      10
+#define MSV_TRC_PAGE_SIZE   512
 
 #define MSV_HEAD_OFFSET_AUTHOR  0x10
 #define MSV_AUTHOR_SIZE         16
+#define MSV_HEAD_OFFSET_ENGINE  0x32
 #define MSV_HEAD_OFFSET_TIME    0x34
 #define MSV_ADPCM_SAMPLES_PER_FRAME 128
 #define MSV_HEAD_OFFSET_SPI     0x20
@@ -69,9 +71,19 @@ typedef struct MSVDemuxContext {
     int channels;
     int64_t data_offset;
     int64_t data_size;
+    int nb_chunks;          /* LPEC chunk table, 0 if not used */
+    struct {
+        uint8_t type;
+        int64_t offset;
+        int64_t size;
+    } chunks[16];
+    int64_t lpec_pos;
+    int lpec_sec_end;
     int adpcm_frame_size;
-    int adpcm_mode;         /* bits/sample: 2 (LP), 3 (SP), 4 (HQ) */
+    int adpcm_mode;         /* bits/sample: 2 (LP), 3 (SP) */
     uint16_t frame_sizes[4];
+    int64_t trc_page_base;  /* TRC page layout: first page */
+    int trc_page_hdr;       /* TRC page layout: header bytes per page, 0 if sectors */
 } MSVDemuxContext;
 
 /* MSV ADPCM samples per 48-byte frame, by bits/sample. */
@@ -87,8 +99,7 @@ static int msv_adpcm_spf(int mode)
 
 /*
  * Map the quality byte (offset 0x3d) to ADPCM bits/sample.
- * Only LP (2-bit) and SP (3-bit) are supported; a 4-bit (HQ) mode is not
- * implemented yet (no HQ sample available), so unknown qualities use SP.
+ * Sony's writer only has LP (2-bit) and SP (3-bit); unknown qualities use SP.
 */
 static int msv_adpcm_mode_from_quality(int quality)
 {
@@ -110,17 +121,12 @@ static int msv_probe(const AVProbeData *p)
     return AVPROBE_SCORE_MAX;
 }
 
+/*
+ * The quality byte is unique per codec; the SPI name is not reliable (older
+ * DVE versions wrote stereo LCST files with "msvlpecw.spi").
+ */
 static enum MSVCodecType msv_guess_codec(const char *spi, int quality)
 {
-    if (strstr(spi, "apcm"))
-        return MSV_CODEC_ADPCM;
-    if (strstr(spi, "trc"))
-        return MSV_CODEC_TRC;
-    if (strstr(spi, "lcst"))
-        return MSV_CODEC_LCST;
-    if (strstr(spi, "lpec"))
-        return MSV_CODEC_LPEC;
-
     switch (quality) {
     case 0x05:
     case 0x09:
@@ -129,10 +135,11 @@ static enum MSVCodecType msv_guess_codec(const char *spi, int quality)
     case 0x35:
     case 0x37:
         return MSV_CODEC_TRC;
-    case 0x24:
+    case 0x1e:
     case 0x20:
     case 0x21:
     case 0x22:
+    case 0x24:
     case 0x28:
     case 0x29:
         return MSV_CODEC_LCST;
@@ -143,9 +150,17 @@ static enum MSVCodecType msv_guess_codec(const char *spi, int quality)
     case 0x4a:
     case 0x4c:
         return MSV_CODEC_LPEC;
-    default:
-        return MSV_CODEC_UNKNOWN;
     }
+
+    if (strstr(spi, "apcm"))
+        return MSV_CODEC_ADPCM;
+    if (strstr(spi, "trc"))
+        return MSV_CODEC_TRC;
+    if (strstr(spi, "lcst"))
+        return MSV_CODEC_LCST;
+    if (strstr(spi, "lpec"))
+        return MSV_CODEC_LPEC;
+    return MSV_CODEC_UNKNOWN;
 }
 
 static void msv_trim_string(char *s, int size)
@@ -227,7 +242,7 @@ static int64_t msv_count_adpcm_samples(AVFormatContext *s, MSVDemuxContext *ctx)
 {
     AVIOContext *pb = s->pb;
     int64_t end = ctx->data_offset + ctx->data_size;
-    int64_t frames = 0;
+    int64_t frames = 0, tail;
     int fs = ctx->adpcm_frame_size;
     uint8_t *blk;
     int ret;
@@ -250,7 +265,10 @@ static int64_t msv_count_adpcm_samples(AVFormatContext *s, MSVDemuxContext *ctx)
     }
     av_free(blk);
 
-    return frames * msv_adpcm_spf(ctx->adpcm_mode);
+    tail = ctx->adpcm_mode == 2 ? (end - avio_tell(pb)) / 16 * 16 : 0;
+    if (tail < 0)
+        tail = 0;
+    return frames * msv_adpcm_spf(ctx->adpcm_mode) + tail * 8 / ctx->adpcm_mode;
 }
 
 static int msv_payload_density(const uint8_t *buf, int len)
@@ -293,6 +311,7 @@ static int64_t msv_find_data_offset(AVIOContext *pb, enum MSVCodecType codec)
 {
     uint8_t buf[0x800];
     int64_t size, i, run, best_end = 0, pos;
+    int len;
     static const int candidates[] = { 0x400, 0x620 };
 
     size = avio_size(pb);
@@ -300,13 +319,14 @@ static int64_t msv_find_data_offset(AVIOContext *pb, enum MSVCodecType codec)
         return AVERROR_INVALIDDATA;
 
     avio_seek(pb, 0, SEEK_SET);
-    if (avio_read(pb, buf, sizeof(buf)) < MSV_HEADER_MIN)
+    len = avio_read(pb, buf, sizeof(buf));
+    if (len < MSV_HEADER_MIN)
         return AVERROR_INVALIDDATA;
 
     if (codec != MSV_CODEC_ADPCM) {
         for (i = 0; i < FF_ARRAY_ELEMS(candidates); i++) {
             int off = candidates[i];
-            if (off + MSV_INDEX_SIZE <= (int)sizeof(buf) &&
+            if (off + MSV_INDEX_SIZE <= len &&
                 msv_sector_index_valid(buf + off))
                 return off;
         }
@@ -331,7 +351,7 @@ static int64_t msv_find_data_offset(AVIOContext *pb, enum MSVCodecType codec)
     }
 
     run = 0;
-    for (i = 0x100; i < (int)sizeof(buf); i++) {
+    for (i = 0x100; i < len; i++) {
         if (buf[i] == 0xff)
             run++;
         else {
@@ -342,7 +362,7 @@ static int64_t msv_find_data_offset(AVIOContext *pb, enum MSVCodecType codec)
     }
 
     pos = 0;
-    for (i = 0x100; i < (int)sizeof(buf) - 80; i++) {
+    for (i = 0x100; i < len - 80; i++) {
         int nz = msv_payload_density(buf + i, 80);
 
         if (nz >= 24 && nz > msv_payload_density(buf + pos, 80))
@@ -393,6 +413,142 @@ static int msv_chunk_data_offset(AVIOContext *pb, int64_t *offset)
 }
 
 /*
+ * Chunk table at 0x50: 8-byte entries (type byte, ..., BE32 size) laid out
+ * back to back from file offset 0. Type 4 chunks (0x400, 0x403) hold audio.
+ * Returns the number of audio chunks; the table is kept only if there is one.
+ */
+static int msv_parse_chunks(AVIOContext *pb, MSVDemuxContext *ctx)
+{
+    uint8_t ent[8];
+    int64_t off = 0;
+    int i, audio = 0;
+
+    ctx->nb_chunks = 0;
+    for (i = 0; i < FF_ARRAY_ELEMS(ctx->chunks); i++) {
+        avio_seek(pb, MSV_CHUNK_TABLE + 8 * i, SEEK_SET);
+        if (avio_read(pb, ent, 8) < 8 || !ent[0] || ent[0] == 0x90)
+            break;
+        ctx->chunks[i].type   = ent[0];
+        ctx->chunks[i].offset = off;
+        ctx->chunks[i].size   = AV_RB32(ent + 4);
+        off += ctx->chunks[i].size;
+        audio += ent[0] == 4;
+        ctx->nb_chunks++;
+    }
+    if (!audio)
+        ctx->nb_chunks = 0;
+    return audio;
+}
+
+/* LPEC frame size by the top two bits of the lead byte */
+static void msv_lpec_set_frame_sizes(MSVDemuxContext *ctx)
+{
+    static const uint16_t sp[4] = { 128, 96, 160, 128 };
+    static const uint16_t lp[4] = {  48, 36,  60,  48 };
+    int q = ctx->quality;
+
+    memcpy(ctx->frame_sizes, q == 0x19 || q == 0x2c || q == 0x4c ? lp : sp,
+           sizeof(ctx->frame_sizes));
+}
+
+static int msv_lpec_read_index(AVIOContext *pb, int64_t sec, uint8_t *idx)
+{
+    avio_seek(pb, sec, SEEK_SET);
+    if (avio_read(pb, idx, MSV_INDEX_SIZE) < MSV_INDEX_SIZE)
+        return AVERROR_EOF;
+    if (AV_RB16(idx) > MSV_SECTOR_SIZE || AV_RB16(idx + 2) > MSV_SECTOR_SIZE ||
+        AV_RB16(idx + 4) > MSV_SECTOR_SIZE)
+        return AVERROR_INVALIDDATA;
+    return 0;
+}
+
+/*
+ * LPEC frames, walked the way the reference reader does: sectors are 0x400
+ * from the audio chunk start; a sector index gives the first frame offset
+ * (used when a sector is entered fresh), the offset where a straddling
+ * frame continues, and the end of valid payload in that sector.
+ */
+static int msv_read_lpec_packet(AVFormatContext *s, AVPacket *pkt)
+{
+    MSVDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = s->pb;
+    int64_t fsize = avio_size(pb);
+    uint8_t idx[MSV_INDEX_SIZE];
+    int ret;
+
+    for (;;) {
+        int64_t pos = ctx->lpec_pos, sec, start = -1, end = 0, next;
+        int i, off, size, n1;
+
+        if (pos >= fsize)
+            return AVERROR_EOF;
+        for (i = 0; i < ctx->nb_chunks; i++) {
+            if (pos >= ctx->chunks[i].offset &&
+                pos < ctx->chunks[i].offset + ctx->chunks[i].size) {
+                start = ctx->chunks[i].type == 4 ? ctx->chunks[i].offset : -1;
+                end   = ctx->chunks[i].offset + ctx->chunks[i].size;
+                break;
+            }
+        }
+        if (i == ctx->nb_chunks)
+            return AVERROR_EOF;
+        if (start < 0) {
+            ctx->lpec_pos = end;
+            continue;
+        }
+
+        off = (pos - start) % MSV_SECTOR_SIZE;
+        sec = pos - off;
+        if (!off) {
+            if ((ret = msv_lpec_read_index(pb, sec, idx)) < 0)
+                return ret == AVERROR_INVALIDDATA ? AVERROR_EOF : ret;
+            ctx->lpec_sec_end = AV_RB16(idx + 4);
+            ctx->lpec_pos     = sec + AV_RB16(idx);
+            if (ctx->lpec_pos == sec)
+                ctx->lpec_pos = sec + MSV_SECTOR_SIZE;
+            continue;
+        }
+        if (off >= ctx->lpec_sec_end) {
+            ctx->lpec_pos = sec + MSV_SECTOR_SIZE;
+            continue;
+        }
+
+        avio_seek(pb, pos, SEEK_SET);
+        ret = avio_r8(pb);
+        if (avio_feof(pb))
+            return AVERROR_EOF;
+        size = ctx->frame_sizes[ret >> 6];
+        if (pos + size > fsize - (MSV_SECTOR_SIZE - ctx->lpec_sec_end))
+            return AVERROR_EOF;
+        if ((ret = av_new_packet(pkt, size)) < 0)
+            return ret;
+        n1 = FFMIN(size, ctx->lpec_sec_end - off);
+        avio_seek(pb, pos, SEEK_SET);
+        if (avio_read(pb, pkt->data, n1) < n1)
+            goto eof;
+        if (n1 == size) {
+            ctx->lpec_pos = pos + size;
+            break;
+        }
+        next = sec + MSV_SECTOR_SIZE;
+        if (msv_lpec_read_index(pb, next, idx) < 0)
+            goto eof;
+        ctx->lpec_sec_end = AV_RB16(idx + 4);
+        next += AV_RB16(idx + 2);
+        avio_seek(pb, next, SEEK_SET);
+        if (avio_read(pb, pkt->data + n1, size - n1) < size - n1)
+            goto eof;
+        ctx->lpec_pos = next + size - n1;
+        break;
+    }
+    pkt->duration = ctx->sample_rate == 8000 ? 512 : 1024;
+    return 0;
+eof:
+    av_packet_unref(pkt);
+    return AVERROR_EOF;
+}
+
+/*
  * End of sector-based TRC audio: each 0x400 sector starts with a 10-byte
  * index whose BE16 field at +4 is the offset (within the sector) where valid
  * payload ends. Full sectors carry 0x400; the final data sector carries a
@@ -422,6 +578,25 @@ static int64_t msv_sector_data_end(AVIOContext *pb, int64_t data_offset)
 }
 
 /*
+ * LCST/AT-X frame size by quality: [3-byte MSV frame header][ATRAC3+ payload].
+ * The payloads are the standard ATRAC3+ frame sizes for 256/128/96/64/48/24/16
+ * kbps stereo at 44.1 kHz (reference decoder parameter table).
+ */
+static int msv_lcst_frame_size(int quality)
+{
+    switch (quality) {
+    case 0x1e: return 1491;
+    case 0x20: return 747;
+    case 0x21: return 563;
+    case 0x22: return 379;
+    case 0x28: return 147;
+    case 0x29: return 99;
+    case 0x24:
+    default:   return 283;
+    }
+}
+
+/*
  * True end of sector-based audio (LPEC/LCST/TRC). Each 0x400 sector starts
  * with a 10-byte index whose BE16 field at +4 is the offset (within the
  * sector) where valid payload ends. Full sectors carry 0x400; the final data
@@ -438,9 +613,8 @@ static void msv_set_frame_sizes(MSVDemuxContext *ctx)
         fs = 80;
         break;
     case MSV_CODEC_LCST:
-        /* [3-byte MSV frame header][280-byte ATRAC3+ payload] = 283 bytes;
-         * assembled across sector boundaries, then deframed in read_packet. */
-        fs = 283;
+        /* assembled across sector boundaries, then deframed in read_packet */
+        fs = msv_lcst_frame_size(ctx->quality);
         break;
     case MSV_CODEC_ADPCM:
         fs = ctx->adpcm_frame_size > 0 ? ctx->adpcm_frame_size : 48;
@@ -540,19 +714,40 @@ static int msv_pick_codec_id(enum MSVCodecType type)
 
 static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt);
 
+/* The last LCST sector is filled with all-0xFF frames after the audio. */
+static int msv_lcst_is_padding(const AVPacket *pkt)
+{
+    for (int i = 0; i < pkt->size; i++)
+        if (pkt->data[i] != 0xff)
+            return 0;
+    return 1;
+}
+
 static int64_t msv_count_packets(AVFormatContext *s)
 {
     MSVDemuxContext *ctx = s->priv_data;
     AVPacket *pkt = av_packet_alloc();
-    int64_t n = 0;
+    int64_t n = 0, last = -1;
 
     if (!pkt)
         return AVERROR(ENOMEM);
 
     avio_seek(s->pb, ctx->data_offset, SEEK_SET);
     while (msv_read_raw_packet(s, pkt) >= 0) {
+        int64_t pos = avio_tell(s->pb);
+
+        if (ctx->codec == MSV_CODEC_LCST && msv_lcst_is_padding(pkt)) {
+            av_packet_unref(pkt);
+            break;
+        }
         n++;
         av_packet_unref(pkt);
+        /* every packet moves the read position forward */
+        if (pos <= last) {
+            av_log(s, AV_LOG_WARNING, "Packet walk did not advance, stopping\n");
+            break;
+        }
+        last = pos;
     }
     av_packet_free(&pkt);
 
@@ -645,6 +840,18 @@ static int msv_read_header(AVFormatContext *s)
  * padding check in read_packet.*/
         ctx->data_offset = MSV_DATA_BASE;
         ctx->data_size   = avio_size(pb) - MSV_DATA_BASE;
+    } else if (ctx->codec == MSV_CODEC_LPEC && msv_parse_chunks(pb, ctx) > 0) {
+        int i;
+
+        for (i = 0; i < ctx->nb_chunks - 1 && ctx->chunks[i].type != 4; i++)
+            ;
+        ctx->data_offset = ctx->chunks[i].offset;
+        ctx->data_size   = FFMIN(avio_size(pb),
+                                 ctx->chunks[ctx->nb_chunks - 1].offset +
+                                 ctx->chunks[ctx->nb_chunks - 1].size) -
+                           ctx->data_offset;
+        ctx->lpec_pos    = ctx->data_offset;
+        msv_lpec_set_frame_sizes(ctx);
     } else if (ctx->codec == MSV_CODEC_TRC &&
                msv_chunk_data_offset(pb, &pos)) {
         /*
@@ -654,8 +861,24 @@ static int msv_read_header(AVFormatContext *s)
          * the reference decoder. TRC sector geometry is absolute to the file.
          */
         int64_t base = (pos / MSV_SECTOR_SIZE) * MSV_SECTOR_SIZE;
-        ctx->data_offset = base + MSV_INDEX_SIZE;
-        ctx->data_size   = msv_sector_data_end(pb, base) - ctx->data_offset;
+        unsigned plen;
+
+        avio_seek(pb, base, SEEK_SET);
+        plen = avio_rl16(pb);
+        if (plen == MSV_TRC_PAGE_SIZE - 8 || plen == MSV_TRC_PAGE_SIZE - 6) {
+            /*
+             * Page layout: 512-byte pages, each led by its LE16 payload
+             * length and a date stamp (8 bytes in all for HQ/SP, 6 for LP).
+             * Frames run across pages; the last page is partial.
+             */
+            ctx->trc_page_base = base;
+            ctx->trc_page_hdr  = MSV_TRC_PAGE_SIZE - plen;
+            ctx->data_offset   = base + ctx->trc_page_hdr;
+            ctx->data_size     = avio_size(pb) - ctx->data_offset;
+        } else {
+            ctx->data_offset = base + MSV_INDEX_SIZE;
+            ctx->data_size   = msv_sector_data_end(pb, base) - ctx->data_offset;
+        }
     } else {
         pos = msv_find_data_offset(pb, ctx->codec);
         if (pos < 0)
@@ -696,7 +919,15 @@ static int msv_read_header(AVFormatContext *s)
     } else if (ctx->codec == MSV_CODEC_LCST) {
         /* ATRAC3+ decoder derives its layout from block_align (payload bytes
          * per frame, after the 3-byte MSV header is stripped in read_packet). */
-        st->codecpar->block_align = 280;
+        st->codecpar->block_align = ctx->frame_sizes[0] - 3;
+        /* quality code and engine version, which select AT-X HFC */
+        ret = ff_alloc_extradata(st->codecpar, 3);
+        if (ret < 0)
+            return ret;
+        avio_seek(pb, MSV_HEAD_OFFSET_TAG, SEEK_SET);
+        AV_WL16(st->codecpar->extradata, avio_rb16(pb));
+        avio_seek(pb, MSV_HEAD_OFFSET_ENGINE, SEEK_SET);
+        st->codecpar->extradata[2] = avio_r8(pb);
     }
 
     msv_trim_string(spi, MSV_SPI_SIZE);
@@ -718,6 +949,13 @@ static int msv_read_header(AVFormatContext *s)
         nb_samples = nb_packets * (ctx->codec == MSV_CODEC_TRC ?
                                    MSV_TRC_SAMPLES_PER_FRAME :
                                    MSV_LCST_SAMPLES_PER_FRAME);
+    } else if (ctx->nb_chunks) {
+        int64_t nb_packets = msv_count_packets(s);
+
+        if (nb_packets < 0)
+            return (int)nb_packets;
+        ctx->lpec_pos = ctx->data_offset;
+        nb_samples = nb_packets * (ctx->sample_rate == 8000 ? 512 : 1024);
     } else if (ctx->byte_rate > 0) {
         int64_t sectors = (ctx->data_size + MSV_SECTOR_SIZE - 1) / MSV_SECTOR_SIZE;
         int64_t net     = ctx->data_size - sectors * MSV_INDEX_SIZE;
@@ -825,6 +1063,49 @@ static void msv_lcst_deframe(AVPacket *pkt)
     pkt->duration = MSV_LCST_SAMPLES_PER_FRAME;
 }
 
+/* Read len payload bytes of a TRC page-layout file, skipping page headers. */
+static int msv_trc_page_read(AVFormatContext *s, uint8_t *dst, int len)
+{
+    MSVDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = s->pb;
+    int64_t fsize = avio_size(pb);
+    int done = 0;
+
+    /* every seek target below stays inside the file: a failed seek would
+     * leave the position inside a page header and re-read it as payload */
+    while (done < len) {
+        int64_t tell  = avio_tell(pb);
+        int64_t page  = ctx->trc_page_base + (tell - ctx->trc_page_base) /
+                        MSV_TRC_PAGE_SIZE * MSV_TRC_PAGE_SIZE;
+        int64_t start = page + ctx->trc_page_hdr;
+        int64_t avail;
+        unsigned plen;
+        int ret;
+
+        if (start >= fsize || avio_seek(pb, page, SEEK_SET) < 0)
+            return done ? done : AVERROR_EOF;
+        plen = avio_rl16(pb);
+        if (avio_feof(pb) || !plen || plen > MSV_TRC_PAGE_SIZE - ctx->trc_page_hdr)
+            return done ? done : AVERROR_EOF;
+        if (tell < start)
+            tell = start;
+        avail = FFMIN(start + plen, fsize) - tell;
+        if (avail <= 0) {
+            if (page + MSV_TRC_PAGE_SIZE >= fsize ||
+                avio_seek(pb, page + MSV_TRC_PAGE_SIZE, SEEK_SET) < 0)
+                return done ? done : AVERROR_EOF;
+            continue;
+        }
+        if (avio_seek(pb, tell, SEEK_SET) < 0)
+            return done ? done : AVERROR_EOF;
+        ret = avio_read(pb, dst + done, FFMIN(avail, len - done));
+        if (ret <= 0)
+            return done ? done : (ret < 0 ? ret : AVERROR_EOF);
+        done += ret;
+    }
+    return done;
+}
+
 static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MSVDemuxContext *ctx = s->priv_data;
@@ -834,6 +1115,9 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
     int use_sectors = ctx->codec == MSV_CODEC_LPEC ||
                       ctx->codec == MSV_CODEC_LCST ||
                       ctx->codec == MSV_CODEC_TRC;
+
+    if (ctx->codec == MSV_CODEC_LPEC && ctx->nb_chunks)
+        return msv_read_lpec_packet(s, pkt);
 
     fsize = avio_size(pb);
 
@@ -856,8 +1140,13 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
  * decoder, including all-0x00/0xff "quiet" frames, matching the
  * reference decoder's silent output for them.*/
             pos = avio_tell(pb);
-            if (pos + fs > ctx->data_offset + ctx->data_size)
-                return AVERROR_EOF;
+            if (pos + fs > ctx->data_offset + ctx->data_size) {
+                /* Sony's writer ends LP streams on a 16-byte unit */
+                fs = ctx->adpcm_mode == 2 ?
+                     (ctx->data_offset + ctx->data_size - pos) / 16 * 16 : 0;
+                if (fs <= 0)
+                    return AVERROR_EOF;
+            }
             ret = av_new_packet(pkt, fs);
             if (ret < 0)
                 return ret;
@@ -865,6 +1154,25 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
             ret = avio_read(pb, blk, fs);
             if (ret < fs)
                 return ret < 0 ? ret : AVERROR_EOF;
+            return 0;
+        }
+
+        if (ctx->codec == MSV_CODEC_TRC && ctx->trc_page_hdr) {
+            ret = msv_trc_page_read(s, &hdr, 1);
+            if (ret < 1)
+                return ret < 0 ? ret : AVERROR_EOF;
+            size = msv_trc_packet_size(hdr);
+            if (size <= 0)
+                return AVERROR_INVALIDDATA;
+            ret = av_new_packet(pkt, size);
+            if (ret < 0)
+                return ret;
+            pkt->data[0] = hdr;
+            ret = msv_trc_page_read(s, pkt->data + 1, size - 1);
+            if (ret < size - 1) {
+                av_packet_unref(pkt);
+                return ret < 0 ? ret : AVERROR_EOF;
+            }
             return 0;
         }
 
@@ -972,13 +1280,18 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
             next_sec = ctx->data_offset +
                        (pos / MSV_SECTOR_SIZE + 1) * MSV_SECTOR_SIZE +
                        MSV_INDEX_SIZE;
-            if (next_sec + (size - in_sec) > fsize)
-                return AVERROR_EOF;
-            avio_seek(pb, next_sec, SEEK_SET);
-            ret = avio_read(pb, pkt->data + in_sec, size - in_sec);
-            if (ret < size - in_sec) {
-                av_packet_unref(pkt);
-                return ret < 0 ? ret : AVERROR_EOF;
+            /* a frame longer than one sector's payload spans several */
+            while (in_sec < size) {
+                int n = FFMIN(size - in_sec, MSV_SECTOR_SIZE - MSV_INDEX_SIZE);
+
+                if (next_sec + n > fsize ||
+                    avio_seek(pb, next_sec, SEEK_SET) < 0 ||
+                    (ret = avio_read(pb, pkt->data + in_sec, n)) < n) {
+                    av_packet_unref(pkt);
+                    return ret < 0 ? ret : AVERROR_EOF;
+                }
+                in_sec   += n;
+                next_sec += MSV_SECTOR_SIZE;
             }
             return 0;
         }
@@ -1007,12 +1320,18 @@ static int msv_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (ret < 0)
         return ret;
+    if (ctx->codec == MSV_CODEC_LCST && msv_lcst_is_padding(pkt)) {
+        av_packet_unref(pkt);
+        return AVERROR_EOF;
+    }
     if (ctx->codec == MSV_CODEC_LCST)
         msv_lcst_deframe(pkt);
     else if (ctx->codec == MSV_CODEC_TRC)
         pkt->duration = MSV_TRC_SAMPLES_PER_FRAME;
     else if (ctx->codec == MSV_CODEC_ADPCM)
-        pkt->duration = msv_adpcm_spf(ctx->adpcm_mode);
+        pkt->duration = pkt->size < ctx->adpcm_frame_size ?
+                        pkt->size * 8 / ctx->adpcm_mode :
+                        msv_adpcm_spf(ctx->adpcm_mode);
     return 0;
 }
 
