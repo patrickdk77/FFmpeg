@@ -528,6 +528,12 @@ static int atrac3p_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         ch_block++;
     }
 
+    if (ch_block < ctx->num_channel_blocks) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Frame data doesn't match channel configuration!\n");
+        return AVERROR_INVALIDDATA;
+    }
+
     if (ctx->hfc && ch_block > 0)
         output_block(ctx, avctx, ch_block - 1, samples_p);
 
