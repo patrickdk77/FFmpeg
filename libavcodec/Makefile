@@ -136,9 +136,6 @@ OBJS-$(CONFIG_LLVIDDSP)                += lossless_videodsp.o
 OBJS-$(CONFIG_LLVIDENCDSP)             += lossless_videoencdsp.o
 OBJS-$(CONFIG_LPC)                     += lpc.o
 OBJS-$(CONFIG_LPEC_DECODER)            += lpecdec.o lpec_excit.o lpec_excit_route.o lpec_ab80.o
-ifeq ($(ARCH),x86)
-OBJS-$(CONFIG_LPEC_DECODER)            += x86/lpec_pre01590_x87.o
-endif
 OBJS-$(CONFIG_LSP)                     += lsp.o
 OBJS-$(CONFIG_LZF)                     += lzf.o
 OBJS-$(CONFIG_ME_CMP)                  += me_cmp.o

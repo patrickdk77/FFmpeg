@@ -71,7 +71,7 @@ static void lpec_stabilize_lsf_i16(int16_t *lsf, int order)
     lsf[0] = 0;
 }
 
-void lpec_lsf_indices_to_i16(int num_bands, int order, int num_cb,
+void ff_lpec_lsf_indices_to_i16(int num_bands, int order, int num_cb,
                              const int *idx, int16_t *lsf_out)
 {
     const int16_t *q1, *q2, *q3, *q4;
@@ -203,13 +203,6 @@ static int lpec_autocorr_scale_c450(int *out_m, uint32_t *out_l,
     return shift;
 }
 
-int lpec_autocorr_scale_c450_test(int *out_m, uint32_t *out_l,
-                                  int16_t *acf_out, const int16_t *lsf,
-                                  int order)
-{
-    return lpec_autocorr_scale_c450(out_m, out_l, acf_out, lsf, order);
-}
-
 #if defined(__GNUC__)
 #pragma GCC push_options
 #pragma GCC optimize("O0")
@@ -220,7 +213,6 @@ static int lpec_rt_idx_from_i5(int i5)
     int32_t eax = i5;
     int32_t esi = eax + 0x200;
 
-    /* sar 0xa; shr 0x15; and 0xfffff800; neg; lea esi,[esi+eax+0x200] */
     esi >>= 10;
     esi = (uint32_t) esi >> 21;
     esi = esi + eax + 0x200;
@@ -294,7 +286,7 @@ static void lpec_a110_phase1_stack(uint8_t *stk, const int16_t *lsf_in, int orde
 #endif
 
 /* single 0x1a4-byte stack frame; AS/lattice/path arrays overlap like the reference decoder. */
-int lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
+int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
 {
     uint8_t stk[0x1a4];
     uint32_t *local_1b4 = (uint32_t *) stk;
@@ -417,8 +409,8 @@ int lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
 #pragma GCC pop_options
 #endif
 
-/* the reference decoder 0b8d0 (same algorithm, different route tables). */
-int lpec_c680_route_tables(const int16_t *a110_out, int pitch_win, double pitch_e,
+/* the reference decoder (same algorithm, different route tables). */
+static int lpec_c680_route_tables(const int16_t *a110_out, int pitch_win, double pitch_e,
                            int32_t *route_out, int pitch_len, int order,
                            const int16_t *rt_a, const int16_t *rt_b)
 {
@@ -492,7 +484,7 @@ int lpec_c680_route_tables(const int16_t *a110_out, int pitch_win, double pitch_
     return 0;
 }
 
-int lpec_c680_route(const int16_t *a110_out, int pitch_win, double pitch_e,
+int ff_lpec_c680_route(const int16_t *a110_out, int pitch_win, double pitch_e,
                     int32_t *route_out, int pitch_len, int order)
 {
     return lpec_c680_route_tables(a110_out, pitch_win, pitch_e, route_out,

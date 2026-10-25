@@ -37,19 +37,18 @@
  * Mode 2: one shared LSF + two halves of pitch + excitation
  * Mode 3: one frame, all silent / comfort noise
  *
- * LSF: 3 VQ codebooks, 6 bits each (with esi+0xac=6, esi+0xb0=3)
+ * LSF: 3 VQ codebooks, 6 bits each
  *
- * Mode 0 pitch: (1) and (2) first,
+ * Mode 0 pitch: both pitch windows first,
  * then per half-frame: 1 bit + optional 7-bit pitch CB,
  * then excitation (7+6+6).
- * Pitch (mode 1/2/3 via ):
- * 1 bit voiced flag; if voiced: 6-bit lag offset from base lag
+ * Pitch (modes 1-3): 1 bit voiced flag; if voiced: 6-bit lag offset from base lag
  * Excitation: 7-bit gain idx + 6-bit cb1 idx + 6-bit cb2 idx
  *
- * LPC order: 10 for 8 kHz, 16 for >=16 kHz (from esi+0xa4).
- * Synthesis: interpolated LPC: param_2+1 passes (8->9 @ 16 kHz),
- * first/last pass length frame/(2*param_2), middle passes frame/param_2.
-*/
+ * LPC order: 10 for 8 kHz, 16 for >=16 kHz.
+ * Synthesis: interpolated LPC in n+1 passes (9 at 16 kHz); the first and
+ * last pass are frame/(2n) long, the middle ones frame/n.
+ */
 
 #include "avcodec.h"
 #include "codec_internal.h"
@@ -61,43 +60,27 @@
 #include "libavutil/mem.h"
 #include "libavutil/macros.h"
 #include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "lpecdata.h"
 #include "lpec_excit.h"
 #include "lpec_excit_route.h"
 #include "lpec_ab80.h"
-/* Mode-1 half2 LPC helpers (defined at end of file). */
-void lpec_mode1_half2_synthesis(const double *prev_lsf, const double *curr_lsf,
-                                const double *excit, double *synth_buf,
-                                double *output, const double *frame_out,
-                                int order, int frame_size, int subfr_size,
-                                int num_seg);
-void lpec_interpolated_lpc_inplace(const double *prev_lsf, const double *curr_lsf,
-                                   const double *excit, double *synth_buf,
-                                   double *output, int order, int frame_size,
-                                   int num_seg);
-void lpec_mode1_half2_isolated(const double *prev_lsf, const double *curr_lsf,
-                               const double *excit, double *synth_buf,
-                               double *output, int order, int frame_size,
-                               int subfr_size, int num_seg);
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 /* - Constants ---- */
-#define LPEC_LPC_ORDER_MAX  16      /* 10 @ 8kHz, 16 @ 16kHz (the reference decoder +0xa4) */
+#define LPEC_LPC_ORDER_MAX  16      /* 10 @ 8kHz, 16 @ 16kHz */
 #define LPEC_LSF_MAX        (LPEC_LPC_ORDER_MAX + 1) /* lsf[0]=0, lsf[1..order] */
 #define LPEC_NUM_LSF_CB_MAX 4       /* 3 @ 8kHz, 4 @ 16kHz (the reference decoder +0xb0) */
-#define LPEC_LSF_BITS       6       /* esi+0xac = 6 */
+#define LPEC_LSF_BITS       6
 /*
- * Frame size from the reference decoder (ctx+8) / InitDecoder:
- * 8 kHz: 512 samples per; 16 kHz: 1024 (two 512-sample halves).
- * Bit budgets at ctx+0x1c..0x28 match ctx+8, not fixed 128/432.
-*/
+ * Frame size as the reference decoder sets it up: 512 samples at 8 kHz,
+ * 1024 (two 512-sample halves) at 16 kHz. The bit budgets follow the frame
+ * size, not fixed 128/432.
+ */
 #define LPEC_FRAME_8K     512
 #define LPEC_FRAME_16K    1024
 #define LPEC_SUBFR_8K     256
@@ -105,10 +88,10 @@ void lpec_mode1_half2_isolated(const double *prev_lsf, const double *curr_lsf,
 #define LPEC_NUM_BANDS_MAX  10      /* 8 @ 8kHz, 10 @ 16kHz (the reference decoder +0x2c) */
 #define LPEC_NUM_SEGMENTS 4         /* LPC interpolation segments per frame */
 #define LPEC_MAX_FRAME    1024
-#define LPEC_EXCIT_SRC_MAX (LPEC_MAX_FRAME * 2) /* ctx+0x37c: ctx+4 @ 16 kHz */
+#define LPEC_EXCIT_SRC_MAX (LPEC_MAX_FRAME * 2)
 #define LPEC_MAX_FRAMES_PKT 32
 #define LPEC_SCRATCH_SAMPLES (LPEC_MAX_FRAME * LPEC_MAX_FRAMES_PKT)
-#define LPEC_WORK_SLACK   256         /* ctx+0x388 + 0x800 bytes */
+#define LPEC_WORK_SLACK   256
 #define LPEC_F640_SHAPE_M3 (2 * LPEC_MAX_FRAME) /* 2*frame_size */
 #define LPEC_QUIET_EXCIT_RMS 10.0     /* mode-3 half2 below this uses tail hist */
 
@@ -130,7 +113,7 @@ void lpec_mode1_half2_isolated(const double *prev_lsf, const double *curr_lsf,
 
 typedef struct LPECContext {
     AVCodecContext *avctx;
-    int            codec_rate_in;     /* the reference decoder d430; 6000 for LP 8 kHz */
+    int            codec_rate_in;
     int            frame_size;        /* 104 or 208 depending on sample_rate */
     int            subfr_size;        /* frame_size / 2 */
     int            lpc_order;         /* 10 or 16 */
@@ -139,24 +122,24 @@ typedef struct LPECContext {
     double prev_lsf[LPEC_LSF_MAX];
     double lsf1[LPEC_LSF_MAX];  /* LSF-A from last decoded frame */
     double lsf2[LPEC_LSF_MAX];  /* LSF-B from last decoded frame */
-    double synth_buf[LPEC_LPC_ORDER_MAX + LPEC_MAX_FRAME]; /* ctx+900/380 */
+    double synth_buf[LPEC_LPC_ORDER_MAX + LPEC_MAX_FRAME];
     LPECExcitState excit;
-    int    half_lsf_cb0[2];             /* [0]=ctx+0x144, [1]=ctx+0x148 */
+    int    half_lsf_cb0[2];
     int    half_lsf_idx[3][LPEC_NUM_LSF_CB_MAX];
-    int16_t half_lsf_i16[3][LPEC_LSF_MAX]; /* @ ctx+0x2e8+param*0x22 */
+    int16_t half_lsf_i16[3][LPEC_LSF_MAX];
     int    noise_pos;                   /* legacy noise walk (unused by excit chain) */
     int    prev_pitch_lag;
-    int    pitch_voiced_bits;         /* ctx+0xa0 (7 @ 8k, 8 @ 16k) */
-    int    frame_out_size;            /* ctx+0x10: frame_size / 4 */
-    int    pitch_win_prev;            /* ctx+300: rolled from prior half-2 */
-    int    pitch_win_half1;           /* ctx+0x130: (1) */
-    int    pitch_win_half2;           /* ctx+0x134: (2) */
+    int    pitch_voiced_bits;
+    int    frame_out_size;
+    int    pitch_win_prev;            /* rolled from prior half-2 */
+    int    pitch_win_half1;
+    int    pitch_win_half2;
     int    pitch_lag_off_half1;       /* 6-bit lag table index when voiced */
     int    pitch_lag_off_half2;
     int    pitch_lag_off_prev;        /* rolled lag index (debug) */
-    const double *pitch_tbl_prev;     /* ctx+0x368: f430 seg0, rolled from half2 */
-    const double *pitch_tbl_half1;    /* ctx+0x36c: f430 seg1 */
-    const double *pitch_tbl_half2;    /* ctx+0x370: f430 seg2 */
+    const double *pitch_tbl_prev;     /* f430 seg0, rolled from half2 */
+    const double *pitch_tbl_half1;    /* f430 seg1 */
+    const double *pitch_tbl_half2;    /* f430 seg2 */
     int    frame_count;
     int    lpec_frame_idx;              /* decoded LPEC frames (not AVPackets) */
     int    pending_frame_start;       /* bit pos at start of current frame decode */
@@ -170,26 +153,26 @@ typedef struct LPECContext {
     int    stream_len;
     int    stream_bit_off;            /* 0..7 bits already consumed in stream_buf[0] */
     uint16_t chunk_sz[4];             /* lead 0x00/0x40/0x80/0xC0 */
-    int    frame_bit_target[4];         /* padding (ctx+0x1c..0x28) */
-    int    synth_half_flag;             /* ctx+0x128: mode-0 LSF flag, persists */
-    double excit_src[LPEC_EXCIT_SRC_MAX]; /* ctx+0x37c: excitation work (2048 @ 16 kHz) */
-    double frame_excit[LPEC_MAX_FRAME]; /* ctx+0x38c: f640 output / saved excitation */
-    double excit_work[LPEC_WORK_SLACK + LPEC_MAX_FRAME]; /* ctx+0x388 + slack */
-    double excit_ola_hist[LPEC_MAX_FRAME]; /* ctx+0x390 */
+    int    frame_bit_target[4];
+    int    synth_half_flag;             /* mode-0 LSF flag, persists */
+    double excit_src[LPEC_EXCIT_SRC_MAX]; /* excitation work (2048 @ 16 kHz) */
+    double frame_excit[LPEC_MAX_FRAME]; /* f640 output / saved excitation */
+    double excit_work[LPEC_WORK_SLACK + LPEC_MAX_FRAME];
+    double excit_ola_hist[LPEC_MAX_FRAME];
     double frame_out[LPEC_MAX_FRAME];   /* retain untouched half for modes 1-3 */
     double scratch[LPEC_SCRATCH_SAMPLES];
     double pitch_shape[LPEC_MAX_FRAME];
     double pitch_weight[LPEC_MAX_FRAME];
-    double f640_shape_m3[LPEC_F640_SHAPE_M3]; /* ctx+0x8c: */
-    double pitch_cb_aux[LPEC_SUBFR_16K]; /* the reference decoder ctx+0x38c: dc80/03e30 OLA hist */
+    double f640_shape_m3[LPEC_F640_SHAPE_M3];
+    double pitch_cb_aux[LPEC_SUBFR_16K]; /* the reference decoder: dc80/03e30 OLA hist */
     double mode0_shaped_tail[LPEC_SUBFR_16K]; /* cross-frame carry */
     LPECQmfState qmf;
     int    prev_half2_pitch_cb;         /* 0x138: prior frame half-2 CB flag */
     int    prev_half2_pitch_cb_idx;     /* prior frame half-2 CB index */
-    int    pitch_cb_flag_h1;            /* ctx+0x13c: mode-0 half-1 pitch CB bit */
-    int    pitch_cb_flag_h2;            /* ctx+0x140: mode-0 half-2 pitch CB bit */
-    int    pitch_cb_half2_idx;          /* ctx+0x364: current frame half-2 CB idx */
-    int    pitch_cb_tbl_prev_idx;       /* ctx+0x35c: rolled from prior half-2 tbl */
+    int    pitch_cb_flag_h1;            /* mode-0 half-1 pitch CB bit */
+    int    pitch_cb_flag_h2;            /* mode-0 half-2 pitch CB bit */
+    int    pitch_cb_half2_idx;          /* current frame half-2 CB idx */
+    int    pitch_cb_tbl_prev_idx;       /* rolled from prior half-2 tbl */
     int    prev_lsf_cb_half2;           /* rolled LSF CB for half 1 */
     int    mode0_excit_rem;             /* rem after pitch, before pitch CB */
     int    prev_decode_mode;            /* prior frame mode for cross-mode hist */
@@ -197,7 +180,7 @@ typedef struct LPECContext {
     int    eof_flush_done;              /* one-shot trailing frame at EOF */
     int    eof_draining;                /* avpkt flush: relax padding lookahead */
     int    is_xaudio_lp;                /* codec_tag == 0x19 (the reference decoder) */
-    int    qmf_seg_m2_h1;               /* ctx+0xc; mode-2 h1 ab80 len */
+    int    qmf_seg_m2_h1;               /* mode-2 h1 ab80 len */
 } LPECContext;
 
 static const double lpec_pitch_cb_stub[8] = {
@@ -215,7 +198,6 @@ static const double *lpec_pitch_cb_ptr(LPECContext *s, int idx)
     return lpec_8k_pitch_cb + (idx & 127) * 8;
 }
 
-/* coef table @ ctx+0xc4: 16 kHz ->, 8 kHz ->. */
 static const double lpec_16k_f430_coef[192] = {
     0.028729972606089303, 0.15328675419214269, 0.017482854866846635,
     0.10878427834873362, 0.36091455724888222, 0.15450039144327535,
@@ -282,42 +264,111 @@ static const double lpec_16k_f430_coef[192] = {
     0.056998823685529158, 0.26997752802043051, 0.224761970892077,
     0.11156547038317294, 0.11686665850784031, 0.10520788955080092,
 };
+/* 8 kHz Xaudio OLA pitch taps (64 triples); the Q15 copy is lpec_xa_8k_pitch_i16. */
+static const double lpec_xa_8k_f430_coef[192] = {
+    0.012849134604929847, 0.2936397061490345, 0.05226251984983754,
+    0.021634311713913713, 0.5125102893474466, 0.1753466613476382,
+    0.10868714167009581, 0.3734859472594949, 0.1300017608103456,
+    0.17864899261710207, 0.4422362343852147, -0.043843130365079065,
+    0.1542959492696115, 0.23945285061421362, 0.07268538016146706,
+    -0.02645029651552375, 0.25290458075956374, -0.06808385278115968,
+    -0.05631650118361484, 0.15037086220433588, -0.013559613363369138,
+    0.05319960541800167, 0.1941579154564574, 0.0012934081188733422,
+    -0.15951485049689892, 0.733946755327893, -0.043819288709140015,
+    0.1026648661827326, 0.2055227316919547, -0.14039252021880924,
+    -0.04672604660322771, 0.19949441547662217, 0.10349866685279485,
+    0.199383638944563, 0.26014022111460194, 0.24515929093603833,
+    -0.13333207842600747, 0.2810982118767152, 0.006862525478344219,
+    -0.025645057443645966, 0.052531438465579866, 0.026466244837743375,
+    -0.2421710666602211, 0.30483309559427574, 0.1587550120710201,
+    -0.19986497972373893, 0.08221332007762415, -0.06139467238400686,
+    0.1327195131846583, 0.31141237787884957, -0.07300911108795653,
+    0.023710465225727707, 0.8668220145702392, 0.05088385849270226,
+    0.3007417610515482, 0.7112752630353707, -0.08108720612005287,
+    0.021417579867405574, 0.4128479636186849, 0.36139178522235127,
+    0.48573029089215064, 0.6225900704773198, -0.1314577324007631,
+    -0.12085265842915606, 0.867061816735899, 0.186476375108422,
+    -0.0452360538837309, 0.5669651063130805, 0.3844399267333616,
+    -0.03308857950728417, 0.06885143270276857, -0.13503935472498227,
+    -0.09856286540006168, 0.3932807270060328, 0.1043244774310357,
+    0.0038208118462102494, 0.5414900404163976, -0.05617554208119145,
+    -0.01169093568272416, 0.28891495345553037, 0.2203276364845544,
+    0.1442308501552162, 0.6866140054395565, 0.05724725434799798,
+    0.08780632045355012, 0.09742640673356191, -0.03121088992202535,
+    -0.03870122595854788, 0.39110521487260175, -0.07177760098898939,
+    0.1386384520225713, 0.6068862765947846, 0.24377029741946243,
+    0.09885429843796603, 0.44642928699133844, -0.24753798388403278,
+    -0.15936907152610857, 0.19011437281925717, -0.0787132433046521,
+    0.2203021563953184, 0.2966176105470478, -0.2744811649876181,
+    -0.27258949945073485, 0.633933126837319, 0.19672622190641856,
+    -0.158232408030972, 0.7700796928186721, 0.3750956089744355,
+    -0.10487487192556295, 0.49826887342185483, -0.2901398857987164,
+    -0.03665277950987278, 0.175377218974723, -0.13899486197785352,
+    0.23268113079524919, 0.4092590237027595, 0.2846120996362095,
+    -0.19444791472823747, 0.1693272051417208, 0.07011598146008566,
+    -0.2659437165434435, 0.5739187357014366, -0.14152102541685954,
+    -0.14552404023964052, 0.26192196829875636, -0.15977296838876948,
+    -0.021902854190489065, 0.7040280921285846, 0.21530318699083273,
+    -0.15056469471222178, 0.5330497978689965, 0.05236105751216449,
+    -0.226055519509001, 0.44731458242393946, 0.300092822025013,
+    0.33145118341790053, 0.5768698805809149, 0.000897460257969684,
+    0.35180331026769357, 0.17765569786485919, 0.08728523569646277,
+    0.24996983420890354, 0.5024843402225971, 0.1444138046820252,
+    0.29499948699759265, 0.34354328782498633, 0.08184329190069496,
+    -0.1887387914187385, 0.6208096220169363, 0.5205665417449463,
+    0.4211850692021124, 0.4320581055217141, -0.028914508944127934,
+    0.09334915880974594, 0.14222481660032615, 0.1267077034540649,
+    0.1841485862610346, 0.8501518573465071, -0.0738651169932576,
+    -0.23580961078655666, 0.3997611178621487, -0.09522902558626624,
+    -0.055160296362212966, 0.8769981727225309, -0.06513241479788316,
+    0.34066897978955607, 0.809169803474421, -0.18276038123521743,
+    0.053223782596285726, 0.6629139311009441, -0.21727282909613413,
+    -0.34388875910329647, 0.2476391841027002, -0.05743813029901223,
+    -0.35931188485547244, 0.4570159905424926, 0.0742004895867988,
+    -0.17599095222822558, 0.12674240933628428, -0.22662697572143808,
+    0.32801342916777687, 0.5101205594713221, -0.2739073765422465,
+    -0.24848664737303336, 0.30472486801756216, -0.33869819569007953,
+    0.010914914161181824, 0.16015352361693252, -0.3009847500874043,
+    -0.020601825539139074, 0.3128706073779449, -0.22705755925843252,
+};
 
-/*raised-cosine windows for /.
- * reference decoder uses float10 fcos; param_1=shape (sqrt w), param_2=weight @ ctx+0x84/0x88.*/
+
+/*
+ * The reference raised-cosine: 2*pi is the 12-digit constant 6.28318530718,
+ * the cosine is taken in extended precision and 1 - cos is rounded to double.
+ */
+static double lpec_raised_cos(int i, int n)
+{
+    double phase = (((double) i + 0.5) * 6.28318530718) * (1.0 / (double) n);
+
+    return (double) (1.0L - cosl(phase)) * 0.5;
+}
+
 static void lpec_init_pitch_windows(LPECContext *s)
 {
     int n = s->frame_size;
     int i;
-    double scale = 2.0 * M_PI / (double) n;
 
     for (i = 0; i < n; i++) {
-        float phase = (float)(((double) i + 0.5) * scale);
-        float w     = (1.0f - cosf(phase)) * 0.5f;
+        double w = lpec_raised_cos(i, n);
 
         s->pitch_weight[i] = w;
-        s->pitch_shape[i]  = sqrtf(w);
+        s->pitch_shape[i]  = sqrt(w);
     }
 }
 
-/* sqrt raised-cosine for modes 1/3 (ctx+0x8c). */
+/* sqrt raised-cosine for modes 1/3. */
 static void lpec_init_f640_shape_m3(LPECContext *s)
 {
-    /* the reference decoder b380: sqrt raised-cosine over overlap=frame_size needs phase 0..pi,
+    /* the reference decoder: sqrt raised-cosine over overlap=frame_size needs phase 0..pi,
  * so table period n = 2*frame_size (2048 @ 16 kHz, 1024 @ 8 kHz).*/
     int n = 2 * s->frame_size;
-    double scale = 2.0 * M_PI / (double) n;
 
-    /* InitCodec: b380 count=0x800, step=(i+0.5)*2*pi/n. */
-    for (int i = 0; i < n; i++) {
-        float phase = (float)(((double) i + 0.5) * scale);
-        float w     = (1.0f - cosf(phase)) * 0.5f;
-
-        s->f640_shape_m3[i] = sqrtf(w);
-    }
+    for (int i = 0; i < n; i++)
+        s->f640_shape_m3[i] = sqrt(lpec_raised_cos(i, n));
 }
 
-/* mode 2 uses ctx+0x84 (b400 shape); modes 1/3 use ctx+0x8c (b380). */
+/* mode 2 uses the b400 shape; modes 1/3 use b380. */
 static const double *lpec_f640_window(const LPECContext *s, int mode)
 {
     if (mode == 1 || mode == 3)
@@ -325,26 +376,24 @@ static const double *lpec_f640_window(const LPECContext *s, int mode)
     return s->pitch_shape;
 }
 
-/* local_1c -> ctx+0x1c/0x28 (mode 0 excit budget base). */
 static int lpec_frame_bit_base(const LPECContext *s)
 {
     int l1c = s->frame_size;
     int rate_out = s->avctx->sample_rate;
     int rate_in  = s->codec_rate_in;
 
-    /* Dual-rate LP (InitCodec 8000/6000): local_1c scales with rate_in/rate_out. */
+    /* Dual-rate LP (InitCodec 8000/6000): scales with rate_in/rate_out. */
     if (rate_in > 0 && rate_in < 0x1771 && rate_out > 0 && rate_in != rate_out)
         l1c = (l1c * rate_in + rate_out / 2) / rate_out;
     return l1c;
 }
 
-/* Per-mode bit budgets (skips to ctx+0x1c+mode*4). */
+/* Per-mode bit budgets. */
 static void lpec_set_frame_bit_targets(LPECContext *s)
 {
     int l1c = lpec_frame_bit_base(s);
     int l30 = l1c * 3;
 
-    /* ctx+0x1c/0x20/0x24/0x28 from local_1c and local_30. */
     s->frame_bit_target[0] = l1c;
     s->frame_bit_target[3] = l1c;
     s->frame_bit_target[2] = (l1c * 5 + (unsigned) (l1c * 5 >> 1 >> 30)) >> 2;
@@ -367,9 +416,6 @@ static void lpec_skip_to_frame_boundary(GetBitContext *gb, int mode,
             skip_bits_long(gb, skip);
     }
 
-    if (getenv("LPEC_BITPOS"))
-        fprintf(stderr, "LPEC_BITPOS mode=%d start=%d end=%d target=%d\n",
-                mode, frame_start, get_bits_count(gb), limit);
 }
 
 /* True when the full mode bit budget is present (padding). */
@@ -498,16 +544,16 @@ static void lpec_stabilize_lsf(double *lsf, int order)
     lsf[0] = 0.0;
 }
 
-/* refresh ctx+0x2e8 + param*0x22 (Sony param 1 -> slot1, 2 -> slot2). */
+/* refresh (Sony param 1 -> slot1, 2 -> slot2). */
 static void lpec_refresh_half_lsf_i16(LPECContext *s, int sony_half)
 {
     if ((unsigned) sony_half < 1 || sony_half > 2)
         return;
     if (s->is_xaudio_lp)
-        lpec_xa_lsf_indices_to_i16(s->lpc_order, s->num_lsf_cb,
+        ff_lpec_xa_lsf_indices_to_i16(s->lpc_order, s->num_lsf_cb,
                                    s->half_lsf_idx[sony_half], s->half_lsf_i16[sony_half]);
     else
-        lpec_lsf_indices_to_i16(s->num_bands, s->lpc_order, s->num_lsf_cb,
+        ff_lpec_lsf_indices_to_i16(s->num_bands, s->lpc_order, s->num_lsf_cb,
                                 s->half_lsf_idx[sony_half], s->half_lsf_i16[sony_half]);
 }
 
@@ -527,9 +573,6 @@ static void lpec_avg_half_lsf_i16(LPECContext *s)
 /* --------------------------------------------------------------- */
 /* LSF decode */
 /* --------------------------------------------------------------- */
-
-static int lpec_decode_lsf_dump_seq;
-static int lpec_dump_wants_frame(const LPECContext *s);
 
 static void decode_lsf(LPECContext *s, const int *idx, double *lsf)
 {
@@ -567,20 +610,6 @@ static void decode_lsf(LPECContext *s, const int *idx, double *lsf)
         }
     }
 
-    if (lpec_dump_wants_frame(s)) {
-        char path[256];
-        FILE *df;
-
-        snprintf(path, sizeof(path), "/tmp/lpec_f%d_lsf_idx_%d.bin",
-                 s->lpec_frame_idx, lpec_decode_lsf_dump_seq);
-        df = fopen(path, "wb");
-        if (df) {
-            fwrite(idx, sizeof(int), cb, df);
-            fwrite(lsf, sizeof(double), order + 1, df);
-            fclose(df);
-        }
-        lpec_decode_lsf_dump_seq++;
-    }
 
     if (s->is_xaudio_lp)
         lpec_xa_stabilize_lsf(lsf, order);
@@ -605,9 +634,10 @@ static void lsf_to_lpc(const double *lsf, double *lpc, int order)
         P[k] = 0.0;
         Q[k] = 0.0;
     }
-    /* cos on lsf[1..order] (param_1 skips sentinel at lsf[0]). */
+    /* cos on lsf[1..order]; the reference uses pi = 3.14159265359 and an
+     * extended-precision cosine rounded to double. */
     for (k = 1; k <= order; k++)
-        cosv[k + 1] = cos(lsf[k] * 2.0 * M_PI);
+        cosv[k + 1] = (double) cosl(lsf[k] * 3.14159265359 * 2.0);
 
     Q[0] = -1.0;
     P[0] = -1.0;
@@ -658,17 +688,13 @@ finish:
 /* Interpolated LPC synthesis */
 /* --------------------------------------------------------------- */
 
-static void lpec_dump_lpc_coef(int pass, int seg,
-                               const double *lsf, const double *lpc, int order);
-
-static int lpec_dump_lpc_frame = -1;
 
 /**
  * Interpolated LPC synthesis.
  *
- * Sony layout: out_base = synth_buf+order (ctx+0x380); hist in out_base[-k].
- * Tail roll via lpec_roll_lpc_hist after each frame.
-*/
+ * out_base = synth_buf + order; the history is in out_base[-k].
+ * lpec_roll_lpc_hist rolls the tail after each frame.
+ */
 static void interpolated_lpc_synthesis(const double *prev_lsf,
                                        const double *curr_lsf,
                                        const double *excitation,
@@ -694,19 +720,11 @@ static void interpolated_lpc_synthesis(const double *prev_lsf,
 
         lsf_to_lpc(interp_lsf, lpc, order);
 
-        if (getenv("LPEC_LPC_SKIP"))
-            memset(lpc, 0, sizeof(lpc));
-
-        if (lpec_dump_lpc_frame >= 0 && seg == 0 && out_off == 0 && out_pos == 0) {
-            lpec_dump_lpc_coef(0, 0, interp_lsf, lpc, order);
-            lpec_dump_lpc_frame = -1;
-        }
-
         for (int n = 0; n < seg_len; n++) {
             int pos = out_off + out_pos + n;
             double s = excitation[out_pos + n];
 
-            /* LPC taps via out[pos-k]; hist in out_base[-k] (ctx+0x380). */
+            /* LPC taps via out[pos-k]; hist in out_base[-k]. */
             for (int k = 1; k <= order; k++)
                 s -= lpc[k] * out_base[pos - k];
 
@@ -731,53 +749,9 @@ static void lpec_roll_lpc_hist(LPECContext *s)
 }
 
 /* --------------------------------------------------------------- */
-/* Pitch gain (+ ) */
-/* --------------------------------------------------------------- */
 
-static void lpec_get_pitch_weights(const LPECContext *s, int pitch_idx,
-                                   double w[3])
-{
-    if (pitch_idx < 0)
-        pitch_idx = 0;
-    if (pitch_idx > 63)
-        pitch_idx = 63;
 
-    if (s->num_bands == 10) {
-        int off = pitch_idx * 9;
-        w[0] = lpec_16k_pitch_gain[off + 0] * (1.0 / 32768.0);
-        w[1] = lpec_16k_pitch_gain[off + 1] * (1.0 / 32768.0);
-        w[2] = lpec_16k_pitch_gain[off + 2] * (1.0 / 32768.0);
-    } else if (s->is_xaudio_lp) {
-        w[0] = lpec_xa_8k_pitch_gain[pitch_idx * 3 + 0] * (1.0 / 32768.0);
-        w[1] = lpec_xa_8k_pitch_gain[pitch_idx * 3 + 1] * (1.0 / 32768.0);
-        w[2] = lpec_xa_8k_pitch_gain[pitch_idx * 3 + 2] * (1.0 / 32768.0);
-    } else {
-        w[0] = lpec_8k_pitch_gain[pitch_idx * 3 + 0] * (1.0 / 32768.0);
-        w[1] = lpec_8k_pitch_gain[pitch_idx * 3 + 1] * (1.0 / 32768.0);
-        w[2] = lpec_8k_pitch_gain[pitch_idx * 3 + 2] * (1.0 / 32768.0);
-    }
-}
-
-static double lpec_pitch_energy_sum(const double w[3])
-{
-    double s = w[0] + w[1] + w[2];
-
-    return s > 1.0 ? 1.0 : s;
-}
-
-static double lpec_buf_rms(const double *buf, int len);
-
-static av_unused double lpec_excit_pitch_energy(LPECContext *s, int pitch_idx, int use_pitch)
-{
-    double pw[3];
-
-    if (!use_pitch)
-        return 0.0;
-    lpec_get_pitch_weights(s, pitch_idx, pw);
-    return lpec_pitch_energy_sum(pw);
-}
-
-/* param_2: always 8 per half, 16 full frame. */
+/* always 8 per half, 16 full frame. */
 static int lpec_lpc_segments_half(const LPECContext *s)
 {
     (void) s;
@@ -792,7 +766,7 @@ static int lpec_lpc_segments_full(const LPECContext *s)
 
 static void lpec_roll_excit_work(LPECContext *s);
 
-/* the reference decoder ctx+0x38c (not LPEC ctx+0x390) holds excit OLA / 03e30 aux. */
+/* the reference decoder (not LPEC) holds excit OLA / 03e30 aux. */
 static double *lpec_ola_hist(LPECContext *s)
 {
     return s->is_xaudio_lp ? s->pitch_cb_aux : s->excit_ola_hist;
@@ -800,7 +774,6 @@ static double *lpec_ola_hist(LPECContext *s)
 
 static void lpec_roll_pitch_win(LPECContext *s)
 {
-    /* ctx+300 <- 0x134, ctx+0x368 <- 0x370 */
     s->pitch_win_prev     = s->pitch_win_half2;
     s->pitch_lag_off_prev = s->pitch_lag_off_half2;
     s->pitch_tbl_prev     = s->pitch_tbl_half2;
@@ -816,7 +789,6 @@ static void lpec_roll_half_lsf(LPECContext *s)
     memcpy(s->half_lsf_i16[0], s->half_lsf_i16[2],
            sizeof(s->half_lsf_i16[0]));
     lpec_roll_pitch_win(s);
-    /* ctx+0x35c <- 0x364; ctx+0x138 <- 0x140 (flag, not idx). */
     s->pitch_cb_tbl_prev_idx   = s->pitch_cb_half2_idx;
     s->prev_half2_pitch_cb     = s->pitch_cb_flag_h2;
     s->prev_half2_pitch_cb_idx = s->pitch_cb_half2_idx;
@@ -834,11 +806,7 @@ static void lpec_end_frame(LPECContext *s)
     lpec_roll_half_lsf(s);
 }
 
-static void lpec_dump_half_buf(const LPECContext *s, const char *tag, int half_idx,
-                               const double *buf);
-static void lpec_dump_f430_seg(const LPECContext *s, int seg, const double *buf, int len);
 
-/* Mode-2 ab80 @ 16 kHz: h1 ctx+0x74 desc1024 seg ctx+0xc; h2 ctx+0x7c desc1536 seg ctx+0x8. */
 static const LPECQmfDesc *lpec_qmf_mode2_desc(const LPECContext *s, int half_idx)
 {
     if (s->frame_size >= LPEC_FRAME_16K) {
@@ -864,27 +832,14 @@ static void lpec_qmf_mode2_process(LPECContext *s, double *buf, int off,
     /* In-place when buf spans desc->len (the reference path). Scratch tmp is only
  * LPEC_QMF_MAX; desc1536+seg1024 needs 1536 samples -- must not scratch.*/
     if (off + desc->len <= LPEC_EXCIT_SRC_MAX)
-        lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
+        ff_lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
     else if (desc->len > seg_len)
-        lpec_qmf_process_scratch(&s->qmf, buf + off, seg_len, desc);
+        ff_lpec_qmf_process_scratch(&s->qmf, buf + off, seg_len, desc);
     else
-        lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
+        ff_lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
 }
 
-static void lpec_qmf_mode2_h2_a080(LPECContext *s, double *buf, int off,
-                                    int seg_len)
-{
-    const LPECQmfDesc *desc = lpec_qmf_mode2_desc(s, 2);
-
-    if (seg_len < desc->len && off + desc->len <= LPEC_EXCIT_SRC_MAX)
-        memset(buf + off + seg_len, 0, (desc->len - seg_len) * sizeof(double));
-    if (off + desc->len <= LPEC_EXCIT_SRC_MAX)
-        lpec_qmf_a080_process_desc(&s->qmf, buf + off, seg_len, desc);
-    else
-        lpec_qmf_mode2_process(s, buf, off, seg_len, 2);
-}
-
-/* Mode-1/3 ab80 @ 16 kHz: mode 1 ctx+0x78 desc1536; mode 3 ctx+0x80 desc2048. */
+/* Mode-1/3 ab80 @ 16 kHz: mode 1 desc1536; mode 3 desc2048. */
 static const LPECQmfDesc *lpec_qmf_mode13_desc(const LPECContext *s, int mode)
 {
     if (s->frame_size >= LPEC_FRAME_16K)
@@ -904,11 +859,11 @@ static void lpec_qmf_mode13_process(LPECContext *s, int mode, double *buf, int o
     /* In-place when excit_src spans desc->len (the reference path); scratch tmp is only
  * LPEC_QMF_MAX wide, so prefer in-place for the large 2048-tap descriptor.*/
     if (off + desc->len <= LPEC_EXCIT_SRC_MAX)
-        lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
+        ff_lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
     else if (desc->len > seg_len)
-        lpec_qmf_process_scratch(&s->qmf, buf + off, seg_len, desc);
+        ff_lpec_qmf_process_scratch(&s->qmf, buf + off, seg_len, desc);
     else
-        lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
+        ff_lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
 }
 
 /* overlap-add excitation segment into frame buffer. */
@@ -916,72 +871,16 @@ static void lpec_excit_window_f640(LPECContext *s, int half_idx, double *dst,
                                    const double *src, double *hist,
                                    const double *window, int overlap, int copy_len)
 {
-    if (s && getenv("LPEC_DUMP_F640")) {
-        int df = atoi(getenv("LPEC_DUMP_F640"));
-
-        if (df >= 0 && s->lpec_frame_idx != df)
-            goto f640_done;
-    } else if (!getenv("LPEC_DUMP_CTX") || !lpec_dump_wants_frame(s)) {
-        goto f640_done;
-    }
-    {
-        char path[256];
-        FILE *df;
-
-        snprintf(path, sizeof(path), "/tmp/lpec_f%d_f640_h%d_hist.bin",
-                 s->lpec_frame_idx, half_idx);
-        df = fopen(path, "wb");
-        if (df) {
-            fwrite(hist, sizeof(double), overlap, df);
-            fclose(df);
-        }
-        snprintf(path, sizeof(path), "/tmp/lpec_f%d_f640_h%d_src.bin",
-                 s->lpec_frame_idx, half_idx);
-        df = fopen(path, "wb");
-        if (df) {
-            int n = overlap + copy_len;
-
-            if (n > LPEC_EXCIT_SRC_MAX)
-                n = LPEC_EXCIT_SRC_MAX;
-            fwrite(src, sizeof(double), n, df);
-            fclose(df);
-        }
-        fprintf(stderr, "LPEC_F640 f%d h%d overlap=%d copy_len=%d dst_off=%td src0=%.3f hist0=%.3f\n",
-                s->lpec_frame_idx, half_idx, overlap, copy_len,
-                dst - s->frame_excit, src[0], hist[0]);
-    }
-
-f640_done:
     for (int i = 0; i < overlap; i++)
         dst[i] = src[i] * window[i] + hist[i] * window[overlap - 1 - i];
     memcpy(hist, src + overlap, copy_len * sizeof(double));
-    if (s && getenv("LPEC_DUMP_F640")) {
-        int df = atoi(getenv("LPEC_DUMP_F640"));
-
-        if (df < 0 || s->lpec_frame_idx == df) {
-            char path[256];
-            FILE *dfp;
-
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_f640_h%d_src_tail.bin",
-                     s->lpec_frame_idx, half_idx);
-            dfp = fopen(path, "wb");
-            if (dfp) {
-                fwrite(src + overlap, sizeof(double), overlap + copy_len, dfp);
-                fclose(dfp);
-            }
-        }
-    }
-    if (s)
-        lpec_dump_half_buf(s, "postf640", half_idx, dst);
 }
 
-/* ctx+0xc4 pitch triple table: 16 kHz ->, 8 kHz ->. */
 static const double *lpec_f430_pitch_table(const LPECContext *s)
 {
     if (s->num_bands == 10)
         return lpec_16k_f430_coef;
-    /* the reference decoder 8 kHz: ctx+0xc4 = PTR -> pitch_cb,
- * not the LPEC 8 kHz pitch_gain.*/
+    /* at 8 kHz the reference decoder uses pitch_cb here, not the LPEC 8 kHz pitch_gain */
     if (s->is_xaudio_lp)
         return lpec_xa_8k_pitch_cb;
     return lpec_8k_pitch_gain;
@@ -1003,17 +902,17 @@ static const double *lpec_pitch_f430_tbl(LPECContext *s, int lag_off, int voiced
     return lpec_f430_pitch_table(s) + lag_off * 3;
 }
 
-/* round to nearest integer (saturating for huge values). */
-static double lpec_f8e0_round(double x)
+/* the reference decoder's f8e0 is floor() */
+static double lpec_f8e0_floor(double x)
 {
     if (!isfinite(x))
         return x;
-    return llrint(x);
+    return floor(x);
 }
 
 static double lpec_e330_quant(double x)
 {
-    return lpec_f8e0_round(x * 4096.0) / 32768.0;
+    return lpec_f8e0_floor(x * 4096.0) / 32768.0;
 }
 
 /* Levinson-style coefficient refinement. */
@@ -1037,7 +936,7 @@ static int lpec_e330(int n, const double *diag, double *mat, double *tmp, double
         mat[n] = mn;
 
         for (k = 0; k < n; k++)
-            upd[k] = lpec_e330_quant(((tmp[k] - tmp[n] * tmp[n - k] * 8.0) /
+            upd[k] = lpec_f8e0_floor(((tmp[k] - tmp[n] * tmp[n - k] * 8.0) /
                                       (1.0 - mn * mn)) * 32768.0) / 32768.0;
 
         for (k = 0; k < n; k++)
@@ -1078,12 +977,12 @@ static void lpec_e4a0_coefs(const double *tbl, int pitch_win, double out[3])
     tmp = mat + sz;
     upd = tmp + sz;
 
+    /* 1 - c0 z^-(pw-1) - c1 z^-pw - c2 z^-(pw+1), the taps the OLA applies */
     memset(diag, 0, sz * sizeof(double));
-    if (pw + 2 < sz) {
-        diag[pw]     = -tbl[0];
-        diag[pw + 1] = -tbl[1];
-        diag[pw + 2] = -tbl[2];
-    }
+    diag[0]      = 1.0;
+    diag[pw - 1] = -tbl[0];
+    diag[pw]     = -tbl[1];
+    diag[pw + 1] = -tbl[2];
 
     if (lpec_e330(n, diag, mat, tmp, upd) < 0) {
         out[0] = 0.0;
@@ -1097,9 +996,11 @@ static void lpec_e4a0_coefs(const double *tbl, int pitch_win, double out[3])
     av_free(diag);
 }
 
-/*copy or voiced OLA-filter into synthesis work buffer.
- * param_4 (pitch_win) is lookback distance into work (field).
- * When lookback exceeds len, only tap from work_base (slack) for early samples.*/
+/*
+ * Copy or voiced OLA-filter into the synthesis work buffer. pitch_win is the
+ * lookback distance into work; when it exceeds len, early samples tap only
+ * from work_base (the slack area).
+ */
 static void lpec_excit_ola_f430(LPECContext *s, int seg, double *work, const double *src,
                                 int len, int pitch_win, const double *lag_tbl)
 {
@@ -1108,64 +1009,26 @@ static void lpec_excit_ola_f430(LPECContext *s, int seg, double *work, const dou
     double xa_tbl[3];
     int w;
 
-    if (getenv("LPEC_F430_OFF"))
-        pitch_win = 0;
-    if (getenv("LPEC_F430_SEG0_OFF") && seg == 0)
-        pitch_win = 0;
-    if (getenv("LPEC_F430_H2ZERO") && work >= s->excit_work + LPEC_WORK_SLACK + s->subfr_size)
-        pitch_win = 0;
 
     /* the reference decoder voiced 3-tap OLA: identical recurrence to the LPEC path
  * below; the lag coefs come from xa_pitch_f430 (i16/32768). Off-switch for A/B.*/
-    if (s->is_xaudio_lp && getenv("LPEC_F430_XA_OFF")) {
-        memcpy(work, src, len * sizeof(double));
-        lpec_dump_f430_seg(s, seg, work, len);
-        return;
-    }
 
-    if (getenv("LPEC_TRACE_F430") &&
-        (!getenv("LPEC_TRACE_F430_FRAME") ||
-         s->lpec_frame_idx == atoi(getenv("LPEC_TRACE_F430_FRAME")))) {
-        if (seg == 0)
-            fprintf(stderr, "LPEC_TRACE_F430 f%d seg%d len=%d win=%d tbl=%p slack_rms=%.1f src0=%.3f\n",
-                    s->lpec_frame_idx, seg, len, pitch_win, (void *)lag_tbl,
-                    lpec_buf_rms(s->excit_work, LPEC_WORK_SLACK), src[0]);
-        if (pitch_win > 0 && lag_tbl)
-            fprintf(stderr, "LPEC_TRACE_F430 f%d seg%d win=%d tbl=%.6f,%.6f,%.6f\n",
-                    s->lpec_frame_idx, seg, pitch_win,
-                    lag_tbl[0], lag_tbl[1], lag_tbl[2]);
-    }
 
-    if (seg == 0 && lpec_dump_wants_frame(s)) {
-        char path[256];
-        FILE *df;
-
-        snprintf(path, sizeof(path), "/tmp/lpec_f%d_f430_slack.bin",
-                 s->lpec_frame_idx);
-        df = fopen(path, "wb");
-        if (df) {
-            fwrite(s->excit_work, sizeof(double), LPEC_WORK_SLACK, df);
-            fclose(df);
-        }
-    }
 
     if (pitch_win == 0) {
         memcpy(work, src, len * sizeof(double));
-        lpec_dump_f430_seg(s, seg, work, len);
         return;
     }
 
     if (!lag_tbl)
         lag_tbl = lpec_f430_unvoiced_tbl;
 
-    /* the reference decoder keeps the f430 lag table as int16 triples (ctx+0x360); the excit
- * generator (lpec_pitch_energy_excit) re-casts the same pointer to int16,
- * so convert here for the OLA coefs instead of changing the stored type.*/
+    /* The stored Xaudio pointer is the Q15 triple used by the excitation
+     * generator; the OLA taps come from the matching double table. */
     if (s->is_xaudio_lp && lag_tbl != lpec_f430_unvoiced_tbl) {
-        const int16_t *i16 = (const int16_t *)lag_tbl;
-        xa_tbl[0] = i16[0] * (1.0 / 32768.0);
-        xa_tbl[1] = i16[1] * (1.0 / 32768.0);
-        xa_tbl[2] = i16[2] * (1.0 / 32768.0);
+        int idx = (const int16_t *)lag_tbl - lpec_xa_8k_pitch_i16;
+
+        memcpy(xa_tbl, lpec_xa_8k_f430_coef + idx, sizeof(xa_tbl));
         lag_tbl = xa_tbl;
     }
 
@@ -1178,130 +1041,24 @@ static void lpec_excit_ola_f430(LPECContext *s, int seg, double *work, const dou
     for (int i = 0; i < len; i++) {
         double v = src[i];
 
-        if (work + i - (w - 1) >= work_base)
-            v += work[i - (w - 1)] * c[0];
-        if (work + i - w >= work_base)
-            v += work[i - w] * c[1];
         if (work + i - (w + 1) >= work_base)
-            v += work[i - (w + 1)] * c[2];
+            v = work[i - (w + 1)] * c[2] + v;
+        if (work + i - w >= work_base)
+            v = v + c[1] * work[i - w];
+        if (work + i - (w - 1) >= work_base)
+            v = v + work[i - (w - 1)] * c[0];
 
         work[i] = v;
     }
 
-    lpec_dump_f430_seg(s, seg, work, len);
-}
-
-/**
- *: f640 (modes 1-3) + f430, then synthesis from excit_work+slack.
- * Mode 0 has no f640 in the reference decoder. src (ctx+0x37c) and dst (ctx+0x38c) are separate.
-*/
-static av_unused void lpec_refresh_mode1_upper_hist(LPECContext *s, const double *src, int fs, int sf)
-{
-    double blend = 0.0;
-    int i;
-
-    if (getenv("LPEC_MODE1_UPPER"))
-        blend = atof(getenv("LPEC_MODE1_UPPER"));
-    if (blend <= 0.0) {
-        if (fs + sf + sf <= LPEC_EXCIT_SRC_MAX)
-            memcpy(lpec_ola_hist(s) + sf, src + fs + sf, sf * sizeof(double));
-        return;
-    }
-    if (blend > 1.0)
-        blend = 1.0;
-    for (i = 0; i < sf; i++) {
-        double tail = (fs + sf + sf <= LPEC_EXCIT_SRC_MAX) ? src[fs + sf + i] : 0.0;
-        lpec_ola_hist(s)[sf + i] = tail * (1.0 - blend) + src[sf + i] * blend;
-    }
-}
-
-static av_unused void lpec_stage_quiet_hist(LPECContext *s, const double *src, int fs, int sf,
-                                            double scale_lo, double scale_hi)
-{
-    int i;
-
-    if (fs + sf > LPEC_EXCIT_SRC_MAX)
-        return;
-    for (i = 0; i < sf; i++)
-        lpec_ola_hist(s)[i] = src[fs + i] * scale_lo;
-    if (scale_hi > 0.0) {
-        /* Rolled tail at src+fs holds prior voiced energy for both OLA halves. */
-        for (i = 0; i < sf; i++)
-            lpec_ola_hist(s)[sf + i] = src[fs + i] * scale_hi;
-    }
-}
-
-/* zero synthesis work areas before f430 (not excit_ola_hist). */
-static double lpec_buf_rms(const double *buf, int len)
-{
-    double e = 0;
-    int i;
-
-    if (len <= 0)
-        return 0.0;
-    for (i = 0; i < len; i++)
-        e += buf[i] * buf[i];
-    return sqrt(e / len);
-}
-
-static int lpec_load_doubles(const char *path, double *buf, int n)
-{
-    FILE *f = fopen(path, "rb");
-    size_t got;
-
-    if (!f)
-        return AVERROR(EIO);
-    got = fread(buf, sizeof(double), n, f);
-    fclose(f);
-    return got == (size_t) n ? 0 : AVERROR(EINVAL);
 }
 
 static void lpec_maybe_inject_frame_excit(LPECContext *s)
 {
-    const char *path = getenv("LPEC_INJECT_FRAME_EXCIT");
-    const char *fj   = getenv("LPEC_INJECT_FRAME");
 
-    if (path && fj && s->lpec_frame_idx == atoi(fj))
-        lpec_load_doubles(path, s->frame_excit, s->frame_size);
 }
 
-static void lpec_dump_lpc_coef(int pass, int seg,
-                               const double *lsf, const double *lpc, int order)
-{
-    char path[256];
-    FILE *df;
-
-    if (lpec_dump_lpc_frame < 0 || pass != 0 || seg != 0)
-        return;
-
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_lpc_lsf_p%d_s%d.bin",
-             lpec_dump_lpc_frame, pass, seg);
-    df = fopen(path, "wb");
-    if (df) {
-        fwrite(lsf, sizeof(double), order + 1, df);
-        fclose(df);
-    }
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_lpc_coef_p%d_s%d.bin",
-             lpec_dump_lpc_frame, pass, seg);
-    df = fopen(path, "wb");
-    if (df) {
-        fwrite(lpc, sizeof(double), order + 1, df);
-        fclose(df);
-    }
-}
-
-static int lpec_dump_wants_frame(const LPECContext *s)
-{
-    const char *env = getenv("LPEC_DUMP_CTX");
-
-    if (!env)
-        return 0;
-    if (!*env)
-        return 1;
-    return atoi(env) < 0 || s->lpec_frame_idx == atoi(env);
-}
-
-/* the reference decoder mode-1: a080 seg = ctx+0x8 (subfr_size=256 @ 8 kHz). */
+/* mode 1: the segment is subfr_size (256 @ 8 kHz). */
 static int lpec_mode1_ab80_len(const LPECContext *s)
 {
     if (s->is_xaudio_lp && s->frame_size < LPEC_FRAME_16K)
@@ -1309,135 +1066,7 @@ static int lpec_mode1_ab80_len(const LPECContext *s)
     return s->qmf_seg_m2_h1;
 }
 
-static void lpec_dump_half_buf(const LPECContext *s, const char *tag, int half_idx,
-                               const double *buf)
-{
-    char path[256];
-    FILE *f;
-    int n = s->subfr_size;
-
-    if (getenv("LPEC_DUMP_F640")) {
-        int df = atoi(getenv("LPEC_DUMP_F640"));
-
-        if (df >= 0 && s->lpec_frame_idx != df)
-            return;
-    } else if (!lpec_dump_wants_frame(s)) {
-        return;
-    }
-
-    if (!strcmp(tag, "postf640") && s->avctx->sample_rate < 8001)
-        n = s->qmf_seg_m2_h1; /* mode-2: OLA writes overlap samples at dst */
-
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_%s_h%d.bin",
-             s->lpec_frame_idx, tag, half_idx);
-    f = fopen(path, "wb");
-    if (f) {
-        fwrite(buf, sizeof(double), n, f);
-        fclose(f);
-    }
-}
-
-static void lpec_dump_f430_seg(const LPECContext *s, int seg, const double *buf, int len)
-{
-    char path[256];
-    FILE *f;
-
-    if (!lpec_dump_wants_frame(s) || len <= 0)
-        return;
-
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_postf430_s%d.bin",
-             s->lpec_frame_idx, seg);
-    f = fopen(path, "wb");
-    if (f) {
-        fwrite(buf, sizeof(double), len, f);
-        fclose(f);
-    }
-}
-
-static void lpec_dump_f1c0_pass(const LPECContext *s, int pass,
-                               const double *out, int out_off, int len)
-{
-    char path[256];
-    FILE *f;
-
-    if (!lpec_dump_wants_frame(s) || len <= 0)
-        return;
-
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_postf1c0_p%d.bin",
-             s->lpec_frame_idx, pass);
-    f = fopen(path, "wb");
-    if (f) {
-        fwrite(out + out_off, sizeof(double), len, f);
-        fclose(f);
-    }
-}
-
-static void lpec_dump_ctx_bufs(const LPECContext *s, const char *tag)
-{
-    char path[256];
-    FILE *f;
-
-    if (!lpec_dump_wants_frame(s))
-        return;
-
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_%s.bin", s->lpec_frame_idx, tag);
-    f = fopen(path, "wb");
-    if (!f)
-        return;
-    if (!strcmp(tag, "excit_src"))
-        fwrite(s->excit_src, sizeof(double), s->frame_size * 2, f);
-    else if (!strcmp(tag, "frame_excit"))
-        fwrite(s->frame_excit, sizeof(double), s->frame_size, f);
-    else if (!strcmp(tag, "synth_work"))
-        fwrite(s->excit_work + LPEC_WORK_SLACK, sizeof(double), s->frame_size, f);
-    else if (!strcmp(tag, "excit_ola"))
-        fwrite(lpec_ola_hist((LPECContext *)s), sizeof(double), s->frame_size, f);
-    fclose(f);
-}
-
-static void lpec_trace_stage(const LPECContext *s, int mode, const char *tag,
-                             const double *buf, int off, int len)
-{
-    const char *env = getenv("LPEC_STAGE");
-    int want_frame = 7;
-    int want_mode  = 1;
-    const char *mf, *mm;
-
-    if (!env)
-        return;
-    mf = getenv("LPEC_STAGE_FRAME");
-    mm = getenv("LPEC_STAGE_MODE");
-    if (mf)
-        want_frame = atoi(mf);
-    if (mm)
-        want_mode = atoi(mm);
-    if (s->lpec_frame_idx != want_frame || mode != want_mode)
-        return;
-    fprintf(stderr, "LPEC_STAGE f%d mode%d %s rms=%.1f off=%d len=%d",
-            want_frame, want_mode, tag, lpec_buf_rms(buf + off, len), off, len);
-    if (len >= 4) {
-        fprintf(stderr, " first4=%.1f,%.1f,%.1f,%.1f",
-                buf[off], buf[off + 1], buf[off + 2], buf[off + 3]);
-    }
-    fputc('\n', stderr);
-}
-static void lpec_begin_synth_frame(LPECContext *s)
-{
-    const char *inj = getenv("LPEC_INJECT_LPC_HIST");
-    const char *ijf = getenv("LPEC_INJECT_FRAME");
-    int order = s->lpc_order;
-    int inj_frame = ijf ? atoi(ijf) : -1;
-
-    /* clears synth_buf only at init/flush, not each frame.
- * Cross-frame LPC history lives in synth_buf[0..order-1] (tail copy).*/
-    if (inj && order > 0 &&
-        (inj_frame < 0 || s->lpec_frame_idx == inj_frame))
-        lpec_load_doubles(inj, s->synth_buf, order);
-}
-
-/* the reference decoder /: dc80 dst and f430 src = ctx+0x388
- * (= excit_work + 0x800 slack). the reference decoder uses ctx+0x38c (frame_excit).
- * pitch_cb_aux is dc80 OLA hist only (lpec_ola_hist for xaudio).*/
+/* pitch_cb_aux is the dc80 OLA history only (lpec_ola_hist for xaudio). */
 static double *lpec_shaped_excit_dst(LPECContext *s, int mode, double *dst)
 {
     if (s->is_xaudio_lp && s->frame_size < LPEC_FRAME_16K && (mode == 1 || mode == 3))
@@ -1454,34 +1083,18 @@ static const double *lpec_prepare_synth_excit(LPECContext *s, int mode,
     double *work = s->excit_work + LPEC_WORK_SLACK;
     double *shaped = lpec_shaped_excit_dst(s, mode, dst);
 
-    lpec_begin_synth_frame(s);
 
     if (mode == 1) {
-        /* the reference mode 1: f640 uses ctx+0x390 unchanged (no excit_src->ola copy). */
-        if (getenv("LPEC_MODE1_M0HIST") &&
-            s->prev_decode_mode == 0 && fs + sf + sf <= LPEC_EXCIT_SRC_MAX) {
-            memcpy(lpec_ola_hist(s), src + fs, sf * sizeof(double));
-            memcpy(lpec_ola_hist(s) + sf, src + fs + sf,
-                   sf * sizeof(double));
-        }
-        /* mode 1: f640 overlap=ctx+0x8, copy=ctx+0xc. */
+        /* mode 1: f640 uses excit_ola_hist unchanged (no excit_src->ola copy). */
         lpec_excit_window_f640(s, 1, shaped, src, lpec_ola_hist(s),
                                lpec_f640_window(s, mode), fs,
                                lpec_mode1_ab80_len(s));
-        lpec_trace_stage(s, mode, "src_h2", src, sf, sf);
-        lpec_trace_stage(s, mode, "src_h1", src, 0, sf);
-        lpec_trace_stage(s, mode, "dst_h2_post_f640", shaped, sf, sf);
-        lpec_trace_stage(s, mode, "dst_h1_post_f640", shaped, 0, sf);
-        /* the reference mode 1: single f640 then f430 -- no excit_src->ola refresh.
- * lpec_refresh_mode1_upper_hist copied src[fs+sf:fs+2*sf] but 8 kHz desc768
- * only spans 768 samples, so hist[sf:fs] was zeroed and broke mode-3 f640
- * after long mode-0 runs (e.g. f185->f201 on 0x2c).*/
+        /* mode 1: a single f640, then f430; no excit_src->ola refresh */
     } else if (mode == 3) {
         lpec_excit_window_f640(s, 2, shaped, src, lpec_ola_hist(s),
                                lpec_f640_window(s, mode), fs, fs);
     }
     if (mode == 3 || mode == 1) {
-        /* the reference decoder: f430 src = ctx+0x388; the reference decoder uses frame_excit. */
         int seg = s->qmf_seg_m2_h1;
 
         lpec_excit_ola_f430(s, 0, work, shaped, seg, s->pitch_win_prev, s->pitch_tbl_prev);
@@ -1490,9 +1103,10 @@ static const double *lpec_prepare_synth_excit(LPECContext *s, int mode,
         return work;
     }
     if (mode == 2) {
-        /* the reference decoder: modes 0 and 2 share da70 lens ctx+0xc, ctx+0x8,
- * ctx+0xc (fo/sf/fo = 128/256/128 @ 8 kHz). Mode 1/3 use
- * ctx+0x8 twice. the reference decoder mode 2 uses ctx+0x10/0xc/0x10.*/
+        /*
+         * Modes 0 and 2 share the 128/256/128 segment lengths (8 kHz); modes 1 and 3
+         * use the subframe length twice.
+         */
         if (s->is_xaudio_lp) {
             lpec_excit_ola_f430(s, 0, work, src, fo, s->pitch_win_prev,
                                 s->pitch_tbl_prev);
@@ -1501,7 +1115,6 @@ static const double *lpec_prepare_synth_excit(LPECContext *s, int mode,
             lpec_excit_ola_f430(s, 2, work + fo + sf, src + fo + sf, fo,
                                 s->pitch_win_half2, s->pitch_tbl_half2);
         } else {
-            /* mode 2: f430 lens ctx+0x10, ctx+0xc, ctx+0x10. */
             const int qmf_seg = s->qmf_seg_m2_h1;
 
             lpec_excit_ola_f430(s, 0, work, src, fo, s->pitch_win_prev,
@@ -1517,20 +1130,15 @@ static const double *lpec_prepare_synth_excit(LPECContext *s, int mode,
     /* Mode 0: pitch-CB output in src; three f430 segments (no f640 in reference decoder).
  * fo/sf/fo layout (128/256/128 @ 8 kHz) for the reference decoder and the reference decoder.*/
     lpec_excit_ola_f430(s, 0, work, src, fo, s->pitch_win_prev, s->pitch_tbl_prev);
-    lpec_trace_stage(s, mode, "work_h1_post_f430", work, 0, sf);
     lpec_excit_ola_f430(s, 1, work + fo, src + fo, sf, s->pitch_win_half1,
                         s->pitch_tbl_half1);
-    lpec_trace_stage(s, mode, "work_h2_post_f430", work, sf, sf);
     lpec_excit_ola_f430(s, 2, work + fo + sf, src + fo + sf, fo,
                         s->pitch_win_half2, s->pitch_tbl_half2);
-    lpec_trace_stage(s, mode, "work_tail_post_f430", work, fo + sf, sf);
     return work;
 }
 
 static void lpec_roll_excit_work(LPECContext *s)
 {
-    /*memmove(ctx+0x388, ctx+0x388 + ctx+8*8, 0x800).
- * Roll is always 0x800 bytes (= 2 * frame_out_size doubles) for 8 and 16 kHz.*/
     const int roll_bytes = 0x800;
     double *base = s->excit_work;
     int fs = s->frame_size;
@@ -1540,109 +1148,25 @@ static void lpec_roll_excit_work(LPECContext *s)
         memmove(base, base + fs, roll_bytes);
 }
 
-static void lpec_dump_excit_carry(const LPECContext *s, const char *tag)
-{
-    char path[256];
-    FILE *f;
-    int sf = s->subfr_size;
-
-    if (!getenv("LPEC_DUMP_CARRY"))
-        return;
-    if (atoi(getenv("LPEC_DUMP_CARRY")) >= 0 &&
-        s->lpec_frame_idx != atoi(getenv("LPEC_DUMP_CARRY")))
-        return;
-
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_%s_excit_src_lo.bin",
-             s->lpec_frame_idx, tag);
-    f = fopen(path, "wb");
-    if (f) {
-        fwrite(s->excit_src, sizeof(double), sf * 2, f);
-        fclose(f);
-    }
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_%s_excit_src_hi.bin",
-             s->lpec_frame_idx, tag);
-    f = fopen(path, "wb");
-    if (f) {
-        fwrite(s->excit_src + sf, sizeof(double), sf * 2, f);
-        fclose(f);
-    }
-    snprintf(path, sizeof(path), "/tmp/lpec_f%d_%s_frame_excit_hi.bin",
-             s->lpec_frame_idx, tag);
-    f = fopen(path, "wb");
-    if (f) {
-        fwrite(s->frame_excit + sf, sizeof(double), sf * 2, f);
-        fclose(f);
-    }
-}
-
 static void lpec_save_frame(LPECContext *s, const double *out,
                             const double *excit, int frame_size, int mode)
 {
     int sf = s->subfr_size;
 
-    lpec_dump_excit_carry(s, "pre_save");
 
     memcpy(s->mode0_shaped_tail, s->frame_excit + sf, sf * sizeof(double));
     memcpy(s->frame_out,   out,   frame_size * sizeof(double));
     memcpy(s->frame_excit, excit, frame_size * sizeof(double));
-    /* reference decoder keeps ctx+0x37c and ctx+0x38c separate; ab80 (desc768/1024) updates
- * excit_src[seg:flen) in place -- no memmove at end of frame.*/
+    /* excit_src and frame_excit stay separate; ab80 (desc768/1024) updates
+     * excit_src[seg:flen) in place, so there is no memmove at the end of a frame. */
 
-    lpec_dump_excit_carry(s, "post_save");
-}
-
-static av_unused void lpec_tame_pitch_aux_buf(double *aux, int len, double target)
-{
-    double e = 0;
-    int i;
-
-    for (i = 0; i < len; i++)
-        e += aux[i] * aux[i];
-    if (e / len < 150.0 * 150.0)
-        return;
-
-    if (getenv("LPEC_HIST_SCALE_MO")) {
-        double sc = atof(getenv("LPEC_HIST_SCALE_MO"));
-
-        for (i = 0; i < len; i++)
-            aux[i] *= sc;
-        return;
-    }
-
-    {
-        double rms = sqrt(e / len);
-        double sc  = target / rms;
-
-        if (sc > 1.0)
-            sc = 1.0;
-        for (i = 0; i < len; i++)
-            aux[i] *= sc;
-    }
-}
-
-static av_unused int lpec_tail_loud_enough(const double *tail, const double *hist, int len)
-{
-    double te = 0, he = 0;
-    int i;
-
-    for (i = 0; i < len; i++) {
-        te += tail[i] * tail[i];
-        he += hist[i] * hist[i];
-    }
-    te /= len;
-    he /= len;
-    if (he <= 150.0 * 150.0)
-        return 1;
-    return te >= he * 0.01;
 }
 
 /**
- * Mode-0 pitch codebook shaping.
- * param_4 aux copy is always ctx+0x37c+half (excit_src[512:1024] for 16 kHz).
- * Half2 05d50/04960: reference decoder uses ctx+0x37c only -- half2 overwrites lower slot,
- * QMF filters [0:subfr), 04960 src is always lower post-QMF.
- * param_5 aux is ctx+0x390 (LPEC) or ctx+0x38c (the reference decoder pitch_cb_aux).
-*/
+ * Mode-0 pitch codebook shaping. The aux copy is always the upper half of
+ * excit_src (excit_src[512:1024] at 16 kHz); half 2 overwrites the lower
+ * slot, and the QMF filters [0:subfr).
+ */
 static void lpec_apply_pitch_cb_mode0(LPECContext *s, double *dst_half,
                                       const double *src_lo,
                                       const double *aux_copy_src,
@@ -1665,13 +1189,6 @@ static void lpec_apply_pitch_cb_mode0(LPECContext *s, double *dst_half,
         const double *tbl0 = lpec_pitch_cb_ptr(s, cb_a ? idx_a : -1);
         const double *tbl1 = lpec_pitch_cb_ptr(s, cb_b ? idx_b : -1);
 
-        if (getenv("LPEC_DUMP_04960") &&
-            (!getenv("LPEC_DUMP_04960_FRAME") ||
-             s->lpec_frame_idx == atoi(getenv("LPEC_DUMP_04960_FRAME")))) {
-            fprintf(stderr, "LPEC_DUMP_04960 f%d h%d cb=%d/%d idx=%d/%d tbl1[0..3]=%.6f,%.6f,%.6f,%.6f\n",
-                    s->lpec_frame_idx, half_idx, cb_a, cb_b, idx_a, idx_b,
-                    tbl1[0], tbl1[1], tbl1[2], tbl1[3]);
-        }
 
         for (int seg = 0; seg < 4; seg++) {
             int start = (seg * frame_len) >> 3;
@@ -1695,19 +1212,10 @@ static void lpec_apply_pitch_cb_mode0(LPECContext *s, double *dst_half,
         }
     }
 
-    if (getenv("LPEC_STAGE") && getenv("LPEC_STAGE_FRAME")) {
-        int wf = atoi(getenv("LPEC_STAGE_FRAME"));
-        if (s->lpec_frame_idx == wf) {
-            fprintf(stderr, "LPEC_STAGE f%d 04960 h%d dst_rms=%.1f aux_rms=%.1f src_rms=%.1f cb=%d/%d idx=%d/%d\n",
-                    wf, half_idx, lpec_buf_rms(dst_half, half), lpec_buf_rms(aux, half),
-                    lpec_buf_rms(src_lo, half), cb_a, cb_b, idx_a, idx_b);
-        }
-    }
 
     if (update_aux)
         memcpy(aux_store, aux_copy_src + half, half * sizeof(double));
 
-    lpec_dump_half_buf(s, "post04960", half_idx, dst_half);
 }
 
 /* --------------------------------------------------------------- */
@@ -1722,7 +1230,7 @@ static void lpec_apply_pitch_cb_mode0(LPECContext *s, double *dst_half,
 /* pitch table idx = *(ctx + half*4 + 0x140); if <0 use +0x144. */
 static int lpec_pitch_route_arg(LPECContext *s, int mode, int half)
 {
-    int route = lpec_excit_route_idx(mode, half);
+    int route = ff_lpec_excit_route_idx(mode, half);
     int idx = route - 1;
     int v;
 
@@ -1748,7 +1256,7 @@ static int read_pitch_cb_half(GetBitContext *gb)
     return get_bits(gb, 7);
 }
 
-/* store lag table pointer at ctx+0x368/0x36c/0x370 per half. */
+/* store the lag table pointer per half. */
 static void lpec_bind_pitch_tbl(LPECContext *s, int *lag_off_out, int voiced, int lag_off)
 {
     const double *tbl = lpec_pitch_f430_tbl(s, lag_off, voiced);
@@ -1790,7 +1298,6 @@ static int read_pitch(LPECContext *s, GetBitContext *gb, int *voiced_out,
     return LPEC_PITCH_LAG_BASE + off;
 }
 
-/* mode 2 half1 must not read past ctx+0x1c (only half2 uses 0x24). */
 static int lpec_excit_bits_limit(const LPECContext *s, int mode, int half,
                                  int frame_start)
 {
@@ -1803,7 +1310,7 @@ static int lpec_excit_bits_limit(const LPECContext *s, int mode, int half,
                             pitch_tbl, frame_start, mode, frame_size, order,  \
                             pitch_cb, lsf_i16_override)                       \
     ((s)->excit.dump_frame = (s)->lpec_frame_idx,                             \
-     lpec_generate_excitation(&(s)->excit, gb, dst, (s)->subfr_size, half, lag,  \
+     ff_lpec_generate_excitation(&(s)->excit, gb, dst, (s)->subfr_size, half, lag,  \
                              lag_off, win, voiced, pitch_tbl,                   \
                              lpec_excit_bit_budget(s, gb, frame_start, mode,    \
                                                   pitch_cb,                     \
@@ -1822,14 +1329,14 @@ static int lpec_excit_bit_budget(LPECContext *s, GetBitContext *gb,
     int avail = get_bits_left(gb);
 
     if (mode == 2 && half == 1) {
-        /* mode 2 half1: (ctx+0x1c - bitpos) / 2, no pitch CB. */
+        /* mode 2 half1: half of the remaining bits, no pitch CB. */
         rem = s->frame_bit_target[0] - used;
         budget = (rem >> 1) - cb_overhead;
     } else if (mode == 2 && half == 2) {
         rem = s->frame_bit_target[2] - used;
         budget = rem - cb_overhead;
     } else if (per_half && mode == 0) {
-        /* mode 0: uVar4 after pitch, before pitch CB; same for both halves. */
+        /* mode 0: after pitch, before pitch CB; same for both halves. */
         budget = (s->mode0_excit_rem >> 1) - cb_overhead;
     } else if (per_half) {
         rem = s->frame_bit_target[mode & 3] - used;
@@ -1850,100 +1357,7 @@ static int lpec_excit_bit_budget(LPECContext *s, GetBitContext *gb,
 static void lpec_postprocess_excit(LPECContext *s, int mode, double *buf, int off,
                                    int len, int half_idx)
 {
-    static int qmf_mode = -1;
-
-    if (qmf_mode < 0) {
-        const char *env = getenv("LPEC_QMF");
-
-        if (env) {
-            if (!strcmp(env, "0"))
-                qmf_mode = 0;
-            else if (!strcmp(env, "m1"))
-                qmf_mode = 1; /* mode 1 only */
-            else if (!strcmp(env, "13"))
-                qmf_mode = 2; /* modes 1 and 3 */
-            else if (!strcmp(env, "1"))
-                qmf_mode = 3; /* all modes */
-            else if (!strcmp(env, "m0"))
-                qmf_mode = 4; /* mode 0 only */
-            else
-                qmf_mode = 2;
-        } else {
-            qmf_mode = 3; /* calls for every half incl. mode 0/2 */
-        }
-    }
-
-    if (!qmf_mode)
-        return;
-    if (qmf_mode == 1 && mode != 1)
-        return;
-    if (qmf_mode == 2 && mode != 1 && mode != 3)
-        return;
-    if (qmf_mode == 4 && mode != 0)
-        return;
-
-    if (s->is_xaudio_lp && mode == 2 && half_idx == 2 &&
-        getenv("LPEC_XA_M2H2_NO_QMF"))
-        return;
-
-    {
-        const char *from = getenv("LPEC_QMF_FROM");
-
-        if (from && s->lpec_frame_idx < atoi(from))
-            return;
-    }
-
-    if (getenv("LPEC_DUMP_QMF")) {
-        int want = atoi(getenv("LPEC_DUMP_QMF"));
-        if (want < 0 || s->lpec_frame_idx == want) {
-            char path[128];
-            FILE *df;
-
-            snprintf(path, sizeof(path), "/tmp/qmf_in_f%d_h%d.bin",
-                     s->lpec_frame_idx, half_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(buf + off, sizeof(double), len, df);
-                fclose(df);
-            }
-        }
-    }
-
     /* QMF on excit_src; seg len/desc vary by mode (the reference decoder). */
-    lpec_qmf_frame_idx = s->lpec_frame_idx;
-    lpec_qmf_chain_late = 0;
-    if (!getenv("LPEC_PRE01590_NO_CHAIN_LATE")) {
-        const char *force = getenv("LPEC_PRE01590_CHAIN_LATE");
-        int chain_m1 = getenv("LPEC_PRE01590_CHAIN_M1") != NULL;
-        int chain_m2 = !getenv("LPEC_PRE01590_NO_CHAIN_M2H2");
-
-        if (force && force[0] && strcmp(force, "0"))
-            lpec_qmf_chain_late = 1;
-        else if (chain_m1 && mode == 1 && s->prev_decode_mode == 2)
-            lpec_qmf_chain_late = 1;
-        else if (chain_m2 && mode == 2 && half_idx == 2 &&
-                 s->next_frame_mode_peek == 1 &&
-                 !lpec_pre01590_chain_skip_frame(s->lpec_frame_idx))
-            lpec_qmf_chain_late = 2;
-        else if (chain_m2 && mode == 2 && half_idx == 2 &&
-                 s->next_frame_mode_peek == 3 &&
-                 !lpec_pre01590_chain_skip_frame(s->lpec_frame_idx))
-            lpec_qmf_chain_late = 3;
-    }
-    {
-        const char *ab80_frame = getenv("LPEC_DUMP_AB80_FRAME");
-        int saved_wanted = lpec_ab80_dump_wanted;
-        int saved_frame  = lpec_ab80_dump_frame;
-        int saved_half   = lpec_ab80_dump_half;
-
-        lpec_ab80_dump_wanted = !ab80_frame || s->lpec_frame_idx == atoi(ab80_frame);
-        if (lpec_ab80_dump_wanted) {
-            lpec_ab80_dump_frame = s->lpec_frame_idx;
-            lpec_ab80_dump_half  = half_idx;
-        } else {
-            lpec_ab80_dump_frame = -1;
-        }
-
     if (mode == 0 || mode == 2) {
         int qmf_len;
         int desc_idx = 0;
@@ -1968,76 +1382,27 @@ static void lpec_postprocess_excit(LPECContext *s, int mode, double *buf, int of
                 /* the reference leaves excit_src[len:flen) zero before h2 ab80. */
                 if (ext > 0 && off + qmf_len + ext <= LPEC_EXCIT_SRC_MAX)
                     memset(buf + off + qmf_len, 0, ext * sizeof(double));
-                if (getenv("LPEC_DUMP_CTX") && lpec_dump_wants_frame(s) &&
-                    desc->len <= LPEC_EXCIT_SRC_MAX) {
-                    char path[256];
-                    FILE *df;
-
-                    snprintf(path, sizeof(path), "/tmp/lpec_f%d_preqmf_h2_768.bin",
-                             s->lpec_frame_idx);
-                    df = fopen(path, "wb");
-                    if (df) {
-                        fwrite(buf + off, sizeof(double), desc->len, df);
-                        fclose(df);
-                    }
-                }
             }
             if (mode == 2 && (half_idx == 1 || half_idx == 2)) {
-                /* Mode-2 h2: exact-iDFT a080 (8 kHz desc768, 16 kHz desc1536).
- * ab80 radix-3 caps h2 corr ~0.984 and poisons persistent tail /
- * f430 s2 on the same frame. LPEC_M2H2_A080_OFF restores ab80.*/
-                if (half_idx == 2 && !getenv("LPEC_M2H2_A080_OFF"))
-                    lpec_qmf_mode2_h2_a080(s, buf, off, qmf_len);
-                else
-                    lpec_qmf_mode2_process(s, buf, off, qmf_len, half_idx);
+                lpec_qmf_mode2_process(s, buf, off, qmf_len, half_idx);
             } else if (mode == 0 && s->frame_size >= LPEC_FRAME_16K) {
                 const LPECQmfDesc *desc = s->qmf.active ? s->qmf.active : &s->qmf.desc1024;
 
-                /* 16 kHz mode-0 follows local_c=2/4 descriptor selection (1024 taps). */
+                /* 16 kHz mode-0 follows the descriptor selection (1024 taps). */
                 if (desc->len > qmf_len)
-                    lpec_qmf_process_scratch(&s->qmf, buf + off, qmf_len, desc);
+                    ff_lpec_qmf_process_scratch(&s->qmf, buf + off, qmf_len, desc);
                 else
-                    lpec_qmf_process_seg(&s->qmf, buf + off, qmf_len, desc);
+                    ff_lpec_qmf_process_seg(&s->qmf, buf + off, qmf_len, desc);
             } else
-                lpec_qmf_process_slot(&s->qmf, buf + off, qmf_len, desc_idx);
-            if (getenv("LPEC_DUMP_QMF")) {
-                int want = atoi(getenv("LPEC_DUMP_QMF"));
-
-                if (want < 0 || s->lpec_frame_idx == want) {
-                    char path[128];
-                    FILE *df;
-                    int dump_len = qmf_len;
-                    const LPECQmfDesc *qdesc = NULL;
-
-                    if (mode == 2 && (half_idx == 1 || half_idx == 2))
-                        qdesc = lpec_qmf_mode2_desc(s, half_idx);
-
-                    snprintf(path, sizeof(path), "/tmp/qmf_out_f%d_h%d.bin",
-                             s->lpec_frame_idx, half_idx);
-                    df = fopen(path, "wb");
-                    if (df) {
-                        fwrite(buf + off, sizeof(double), dump_len, df);
-                        fclose(df);
-                    }
-                    if (qdesc && qdesc->len > dump_len) {
-                        snprintf(path, sizeof(path), "/tmp/qmf_post_f%d_h%d.bin",
-                                 s->lpec_frame_idx, half_idx);
-                        df = fopen(path, "wb");
-                        if (df) {
-                            fwrite(buf + off, sizeof(double), qdesc->len, df);
-                            fclose(df);
-                        }
-                    }
-                }
-            }
+                ff_lpec_qmf_process_slot(&s->qmf, buf + off, qmf_len, desc_idx);
         }
     } else if (mode == 3) {
         if (s->frame_size >= LPEC_FRAME_16K) {
-            /* 16 kHz: local_c remaps mode-3 to 1024 family descriptor. */
+            /* 16 kHz: mode 3 uses the 1024-tap descriptor family. */
             lpec_qmf_mode13_process(s, mode, buf, off, len);
         } else {
-            /* 8 kHz keeps slot path (ctx+0x80) with persistent tail state. */
-            lpec_qmf_process_slot(&s->qmf, buf + off, len, 2);
+            /* 8 kHz keeps slot path with persistent tail state. */
+            ff_lpec_qmf_process_slot(&s->qmf, buf + off, len, 2);
         }
     } else if (mode == 1) {
         int qmf_len = lpec_mode1_ab80_len(s);
@@ -2045,22 +1410,9 @@ static void lpec_postprocess_excit(LPECContext *s, int mode, double *buf, int of
             ? lpec_qmf_mode13_desc(s, mode)
             : &s->qmf.desc768;
 
-        /*
- * Mode-1 ab80/a080 in-place on excit_src; do not zero excit_src[seg:flen)
- * (mode13_process memset breaks pass-2: fills buf[seg:flen/2)
- * before ab80 @ 16 kHz desc1536). lpec_qmf_a080_process_desc uses an exact
- * inverse DFT instead of lpec_ab80.c's radix-3 FFT emulation.
-*/
-        if (!getenv("LPEC_QMF_A080_8K_OFF")) {
-            lpec_qmf_a080_process_desc(&s->qmf, buf + off, qmf_len, desc);
-        } else {
-            lpec_qmf_process_seg(&s->qmf, buf + off, qmf_len, desc);
-        }
-    }
-
-        lpec_ab80_dump_wanted = saved_wanted;
-        lpec_ab80_dump_frame  = saved_frame;
-        lpec_ab80_dump_half   = saved_half;
+        /* Mode-1 transform in place on excit_src; excit_src[seg:flen) is not
+         * zeroed first. */
+        ff_lpec_qmf_process_seg(&s->qmf, buf + off, qmf_len, desc);
     }
 }
 
@@ -2228,18 +1580,16 @@ static av_cold int lpec_decode_init(AVCodecContext *avctx)
         s->frame_size = LPEC_FRAME_16K;
         s->subfr_size = LPEC_SUBFR_16K;
         s->frame_out_size = LPEC_FRAME_16K / 4;
-        /* ctx+0xc = ctx+4 >> 2 (512 @ 16 kHz). */
         s->qmf_seg_m2_h1 = cap >> 2;
         s->lpc_order  = 16;
         s->num_lsf_cb = 4;
         s->num_bands  = 10;
     } else {
-        int cap = 1024; /* ctx+4 for rate < 11026 */
+        int cap = 1024;
 
         s->frame_size = LPEC_FRAME_8K;
         s->subfr_size = LPEC_SUBFR_8K;
         s->frame_out_size = LPEC_FRAME_8K / 4;
-        /* ctx+0xc = ctx+4 >> 2 (256 @ 8 kHz). */
         s->qmf_seg_m2_h1 = cap >> 2;
         s->lpc_order  = 10;
         s->num_lsf_cb = 3;
@@ -2256,8 +1606,6 @@ static av_cold int lpec_decode_init(AVCodecContext *avctx)
         s->chunk_sz[2] = 60;
     }
 
-    /* the reference decoder: pitch lag uses ctx+0x9c (same bumps as LPEC ctx+0xa0); ctx+0xa0
- * is LPC order (10 @ 8 kHz), not voiced-bit count.*/
     s->pitch_voiced_bits = 7;
     {
         int t = (avctx->sample_rate / 8000) * 0x78;
@@ -2268,18 +1616,20 @@ static av_cold int lpec_decode_init(AVCodecContext *avctx)
             s->pitch_voiced_bits++;
     }
 
-    /* Default LSFs: lsf[0]=0, lines at lsf[1..order] (layout) */
-    for (int i = 0; i < s->lpc_order; i++) {
-        double v = (double)(i + 1) / (s->lpc_order + 1) * 0.5;
-        s->prev_lsf[i + 1] = v;
-        s->lsf1[i + 1]     = v;
-        s->lsf2[i + 1]     = v;
+    /* Default LSFs i * 0.48 / (order + 1); the Q16 copy seeds slot 0. */
+    {
+        double step = 0.48 / (double)(s->lpc_order + 1);
+
+        for (int i = 0; i <= s->lpc_order; i++) {
+            double v = (double) i * step;
+
+            s->prev_lsf[i] = s->lsf1[i] = s->lsf2[i] = v;
+        }
     }
-    s->prev_lsf[0] = s->lsf1[0] = s->lsf2[0] = 0.0;
 
     memset(s->synth_buf, 0, sizeof(s->synth_buf));
     memset(&s->excit, 0, sizeof(s->excit));
-    lpec_excit_init(&s->excit, avctx->sample_rate, s->codec_rate_in,
+    ff_lpec_excit_init(&s->excit, avctx->sample_rate, s->codec_rate_in,
                     s->num_bands, s->frame_size, s->subfr_size,
                     s->is_xaudio_lp);
     memset(s->frame_excit, 0, sizeof(s->frame_excit));
@@ -2291,6 +1641,8 @@ static av_cold int lpec_decode_init(AVCodecContext *avctx)
     s->half_lsf_cb0[0] = s->half_lsf_cb0[1] = 0;
     memset(s->half_lsf_idx, 0, sizeof(s->half_lsf_idx));
     memset(s->half_lsf_i16, 0, sizeof(s->half_lsf_i16));
+    for (int i = 0; i <= s->lpc_order; i++)
+        s->half_lsf_i16[0][i] = (int16_t) floor(s->prev_lsf[i] * 65536.0);
     s->prev_pitch_lag = LPEC_PITCH_LAG_BASE;
     s->frame_count    = 0;
     s->lpec_frame_idx = 0;
@@ -2329,18 +1681,14 @@ static av_cold int lpec_decode_init(AVCodecContext *avctx)
     s->pitch_tbl_prev          = lpec_f430_unvoiced_tbl;
     s->pitch_tbl_half1         = lpec_f430_unvoiced_tbl;
     s->pitch_tbl_half2         = lpec_f430_unvoiced_tbl;
-    lpec_qmf_init(&s->qmf);
-    lpec_qmf_configure(&s->qmf, avctx->sample_rate, s->codec_rate_in);
+    ff_lpec_qmf_init(&s->qmf);
+    ff_lpec_qmf_configure(&s->qmf, avctx->sample_rate, s->codec_rate_in);
     return 0;
 }
 
 static av_cold int lpec_decode_close(AVCodecContext *avctx)
 {
-    LPECContext *s = avctx->priv_data;
 
-    if (getenv("LPEC_DEBUG"))
-        fprintf(stderr, "LPEC_DEBUG close idx=%d chunk_carry=%d pad=%d\n",
-                s->lpec_frame_idx, s->chunk_carry_len, s->pad_pending_start);
     return 0;
 }
 
@@ -2348,33 +1696,32 @@ static av_cold int lpec_decode_close(AVCodecContext *avctx)
 /* Main decode function */
 /* --------------------------------------------------------------- */
 
-/* the reference decoder 6000->8000:..db20 resampler gain after d800 synth (~8000/5376). */
 static double lpec_xa_output_gain(const LPECContext *s)
 {
     int rate_in  = s->codec_rate_in;
     int rate_out = s->avctx->sample_rate;
 
-    if (!s->is_xaudio_lp || rate_in <= 0 || rate_in >= rate_out)
+    if (!s->is_xaudio_lp || rate_in != 6000 || rate_in >= rate_out)
         return 1.0;
-    /* 5376 = rate_in * 0.896 @ 6 kHz (the reference decoder measured hook/decode RMS ratio). */
-    return (double) rate_out / ((double) rate_in * 5376.0 / 6000.0);
+    /* the reference output gain when the codec runs at 6000 Hz */
+    return 1.487732;
 }
 
 static void clamp_and_copy(int16_t *dst, const double *src, int len, double scale)
 {
-    /* sample + 0.5, then int16 limiter */
+    /* floor(sample + 0.5), then int16 limiter */
     for (int i = 0; i < len; i++) {
         double v = src[i];
 
         if (!isfinite(v))
             v = 0.0;
-        v = v * scale + 0.5;
+        v = floor(v * scale + 0.5);
         if (v > 32767.0)
             dst[i] = 32767;
         else if (v < -32768.0)
             dst[i] = -32768;
         else
-            dst[i] = (int16_t)lrint(v);
+            dst[i] = (int16_t)v;
     }
 }
 
@@ -2396,7 +1743,6 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
     double *pcm = s->synth_buf + order;
 
     cur_lsf1[0] = cur_lsf2[0] = 0.0;
-    lpec_decode_lsf_dump_seq = 0;
     if (get_bits_left(gb) < 2)
         return AVERROR(EAGAIN);
 
@@ -2415,7 +1761,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
 
     int mode = get_bits(gb, 2);
     s->pending_frame_mode = mode;
-    s->synth_half_flag = 0; /* clears ctx+0x128 each frame */
+    s->synth_half_flag = 0; /* clears each frame */
     {
         int bits_in_frame = s->frame_bit_target[mode];
         GetBitContext pk;
@@ -2428,18 +1774,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         }
     }
 
-    if (getenv("LPEC_BITLOG") &&
-        (!getenv("LPEC_BITLOG_FRAME") ||
-         s->lpec_frame_idx == atoi(getenv("LPEC_BITLOG_FRAME")))) {
-        fprintf(stderr, "LPEC_BITLOG enter f%d mode=%d bitpos=%d\n",
-                s->lpec_frame_idx, mode, get_bits_count(gb) - 2);
-    }
 
-    if (getenv("LPEC_TRACE")) {
-        static int fm;
-        fprintf(stderr, "LPEC_TRACE frame=%d mode=%d bitpos=%d\n",
-                fm++, mode, frame_start);
-    }
 
     memset(pcm, 0, frame_size * sizeof(double));
     memset(output, 0, frame_size * sizeof(double));
@@ -2453,31 +1788,18 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         int lsf_bits = s->num_lsf_cb * LPEC_LSF_BITS;
 
         if (flag == 0) {
-            /* ctx+0x128==0 -> only (2); LSF-A stays prev */
             if (get_bits_left(gb) < lsf_bits)
                 return AVERROR(EAGAIN);
             for (int i = 0; i < s->num_lsf_cb; i++)
                 lsf_idx[i] = get_bits(gb, LPEC_LSF_BITS);
             decode_lsf(s, lsf_idx, cur_lsf2);
-            s->half_lsf_cb0[0] = -1; /* ctx+0x144 = -1 when flag==0 */
+            s->half_lsf_cb0[0] = -1;
             s->half_lsf_cb0[1] = lsf_idx[0];
             memcpy(s->half_lsf_idx[2], lsf_idx, s->num_lsf_cb * sizeof(int));
             lpec_refresh_half_lsf_i16(s, 2);
             for (int i = 0; i <= order; i++)
                 cur_lsf1[i] = (s->lsf1[i] + cur_lsf2[i]) * 0.5;
             lpec_avg_half_lsf_i16(s);
-            if (getenv("LPEC_TRACE")) {
-                static int lsf_tr;
-                if (lsf_tr++ < 5) {
-                    int ti;
-                    fprintf(stderr, "LPEC_TRACE lsf frame=%d idx=%d,%d,%d\n",
-                            lsf_tr - 1, lsf_idx[0], lsf_idx[1],
-                            s->num_lsf_cb > 2 ? lsf_idx[2] : -1);
-                    for (ti = 1; ti <= order; ti++)
-                        fprintf(stderr, " lsf2[%d]=%.6f", ti, cur_lsf2[ti]);
-                    fprintf(stderr, "\n");
-                }
-            }
         } else {
             if (get_bits_left(gb) < 2 * lsf_bits)
                 return AVERROR(EAGAIN);
@@ -2487,12 +1809,6 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
             s->half_lsf_cb0[0] = lsf_idx[0];
             memcpy(s->half_lsf_idx[1], lsf_idx, s->num_lsf_cb * sizeof(int));
             lpec_refresh_half_lsf_i16(s, 1);
-            if (getenv("LPEC_BITLOG") && s->lpec_frame_idx == 0) {
-                fprintf(stderr, "LPEC_BITLOG f%d lsf_h1 idx=%d,%d,%d,%d\n",
-                        s->lpec_frame_idx, s->half_lsf_idx[1][0],
-                        s->half_lsf_idx[1][1], s->half_lsf_idx[1][2],
-                        s->half_lsf_idx[1][3]);
-            }
 
             for (int i = 0; i < s->num_lsf_cb; i++)
                 lsf_idx[i] = get_bits(gb, LPEC_LSF_BITS);
@@ -2515,7 +1831,6 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         if (!voiced2)
             pitch2_lag = s->prev_pitch_lag;
 
-        /* uVar4 = ctx+0x28 - bitpos after pitch, before pitch CB. */
         s->mode0_excit_rem = s->frame_bit_target[0] - (get_bits_count(gb) - frame_start);
 
         int pitch1_cb = read_pitch_cb_half(gb);
@@ -2529,22 +1844,6 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         s->pitch_cb_flag_h1   = pitch1_cb >= 0;
         s->pitch_cb_flag_h2   = pitch2_cb >= 0;
 
-        if (getenv("LPEC_STAGE") && getenv("LPEC_STAGE_FRAME")) {
-            int wf = atoi(getenv("LPEC_STAGE_FRAME"));
-            if (s->lpec_frame_idx == wf) {
-                fprintf(stderr, "LPEC_STAGE f%d pitch_cb h1=%d h2=%d prev=%d prev_idx=%d\n",
-                        wf, pitch1_cb, pitch2_cb, s->prev_half2_pitch_cb,
-                        s->pitch_cb_tbl_prev_idx);
-            }
-        }
-        if (getenv("LPEC_BITLOG")) {
-            fprintf(stderr,
-                    "LPEC_BITLOG f%d mode0 flag=%d after_pitch_cb bitpos=%d rem=%d "
-                    "p1=%d/%d p2=%d/%d cb=%d/%d\n",
-                    s->lpec_frame_idx, flag, get_bits_count(gb),
-                    s->mode0_excit_rem, pitch1_lag, s->pitch_win_half1,
-                    pitch2_lag, s->pitch_win_half2, pitch1_cb, pitch2_cb);
-        }
 
         {
             if (LPEC_GEN_EXCIT_HALF(s, gb, s->excit_src, 1, pitch1_lag,
@@ -2553,69 +1852,9 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
                                     frame_size, order, pitch1_cb >= 0 ? 8 : 1,
                                     s->half_lsf_i16[1]) < 0)
                 return AVERROR(EAGAIN);
-            lpec_trace_stage(s, mode, "excit_h1_pre_qmf", s->excit_src, 0, subfr_size);
-            if (getenv("LPEC_DUMP_CTX")) {
-                char path[256];
-                FILE *df;
-                int qmf_dump = mode == 0 || mode == 2 ? s->qmf.desc512.len : subfr_size;
-
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_preqmf_h1.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->excit_src, sizeof(double), qmf_dump, df);
-                    fclose(df);
-                }
-            }
             lpec_postprocess_excit(s, mode, s->excit_src, 0, subfr_size, 1);
-            lpec_trace_stage(s, mode, "excit_h1_post_qmf", s->excit_src, 0, subfr_size);
-            if (getenv("LPEC_DUMP_CTX")) {
-                char path[256];
-                FILE *df;
-                int qmf_dump = mode == 0 || mode == 2 ? s->qmf.desc512.len : subfr_size;
-
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_postqmf_h1.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->excit_src, sizeof(double), qmf_dump, df);
-                    fclose(df);
-                }
-            }
             {
-                const char *inj = getenv("LPEC_INJECT_OLA");
-                int inj_frame = -1;
-                const char *ijf = getenv("LPEC_INJECT_FRAME");
 
-                if (ijf)
-                    inj_frame = atoi(ijf);
-                if (inj && (inj_frame < 0 || s->lpec_frame_idx == inj_frame))
-                    lpec_load_doubles(inj, lpec_ola_hist(s), subfr_size);
-                if (getenv("LPEC_DUMP_CTX")) {
-                    char path[256];
-                    FILE *df;
-                    snprintf(path, sizeof(path), "/tmp/lpec_f%d_pre04960_h1_ola.bin",
-                             s->lpec_frame_idx);
-                    df = fopen(path, "wb");
-                    if (df) {
-                        fwrite(lpec_ola_hist(s), sizeof(double), subfr_size, df);
-                        fclose(df);
-                    }
-                    snprintf(path, sizeof(path), "/tmp/lpec_f%d_pre04960_h1_src.bin",
-                             s->lpec_frame_idx);
-                    df = fopen(path, "wb");
-                    if (df) {
-                        fwrite(s->excit_src, sizeof(double), subfr_size, df);
-                        fclose(df);
-                    }
-                    snprintf(path, sizeof(path), "/tmp/lpec_f%d_mode0_tail.bin",
-                             s->lpec_frame_idx);
-                    df = fopen(path, "wb");
-                    if (df) {
-                        fwrite(s->mode0_shaped_tail, sizeof(double), subfr_size, df);
-                        fclose(df);
-                    }
-                }
             }
             /* half 0: flags /0x13c, tbl /0x360 */
             lpec_apply_pitch_cb_mode0(s, s->frame_excit, s->excit_src, s->excit_src,
@@ -2628,56 +1867,12 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
                                     frame_size, order, pitch2_cb >= 0 ? 8 : 1,
                                     s->half_lsf_i16[2]) < 0)
                 return AVERROR(EAGAIN);
-            lpec_trace_stage(s, mode, "excit_h2_pre_qmf", s->excit_src, 0, subfr_size);
-            if (getenv("LPEC_DUMP_CTX")) {
-                char path[256];
-                FILE *df;
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_preqmf_h2.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->excit_src, sizeof(double), subfr_size, df);
-                    fclose(df);
-                }
-            }
             lpec_postprocess_excit(s, mode, s->excit_src, 0, subfr_size, 2);
-            lpec_trace_stage(s, mode, "excit_h2_post_qmf", s->excit_src, 0, subfr_size);
-            if (getenv("LPEC_DUMP_CTX")) {
-                char path[256];
-                FILE *df;
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_postqmf_h2.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->excit_src, sizeof(double), subfr_size, df);
-                    fclose(df);
-                }
-            }
-            if (getenv("LPEC_DUMP_CTX")) {
-                char path[256];
-                FILE *df;
-
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_pre04960_h2_ola.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(lpec_ola_hist(s), sizeof(double), subfr_size, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_pre04960_h2_src.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->excit_src, sizeof(double), subfr_size, df);
-                    fclose(df);
-                }
-            }
             lpec_apply_pitch_cb_mode0(s, s->frame_excit + subfr_size,
                                       s->excit_src, s->excit_src,
                                       subfr_size, NULL, s->pitch_cb_flag_h1,
                                       s->pitch_cb_flag_h2, pitch1_cb, pitch2_cb,
                                       1, 2);
-            lpec_trace_stage(s, mode, "frame_excit", s->frame_excit, 0, frame_size);
         }
 
         s->prev_pitch_lag = pitch2_lag;
@@ -2686,65 +1881,13 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         const double *synth_excit = lpec_prepare_synth_excit(s, mode, s->frame_excit,
                                                              s->frame_excit);
 
-        if (lpec_dump_wants_frame(s))
-            lpec_dump_lpc_frame = s->lpec_frame_idx;
 
-        lpec_trace_stage(s, mode, "synth_excit", synth_excit, 0, frame_size);
-        if (lpec_dump_wants_frame(s)) {
-            char path[256];
-            FILE *df;
 
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_lpc_hist.bin", s->lpec_frame_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(s->synth_buf, sizeof(double), order, df);
-                fclose(df);
-            }
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_lsf1.bin", s->lpec_frame_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(s->lsf1, sizeof(double), order + 1, df);
-                fclose(df);
-            }
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_cur_lsf1.bin", s->lpec_frame_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(cur_lsf1, sizeof(double), order + 1, df);
-                fclose(df);
-            }
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_cur_lsf2.bin", s->lpec_frame_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(cur_lsf2, sizeof(double), order + 1, df);
-                fclose(df);
-            }
-        }
-        lpec_dump_ctx_bufs(s, "excit_src");
-        lpec_dump_ctx_bufs(s, "frame_excit");
-        lpec_dump_ctx_bufs(s, "synth_work");
-        lpec_dump_ctx_bufs(s, "excit_ola");
-
-        if (getenv("LPEC_TRACE")) {
-            static int n;
-            if (n++ < 5) {
-                double mx = 0, rms = 0;
-                int ti;
-
-                for (ti = 0; ti < frame_size; ti++) {
-                    mx = fmax(mx, fabs(synth_excit[ti]));
-                    rms += synth_excit[ti] * synth_excit[ti];
-                }
-                fprintf(stderr, "LPEC_TRACE synth_excit frame=%d max=%.6f rms=%.6f mode=%d flag=%d\n",
-                        n - 1, mx, sqrt(rms / frame_size), mode, flag);
-            }
-        }
 
         if (s->synth_half_flag == 0) {
-            /* (..., 0x10,...): lsf1 @ ctx+0x150, lsf2 @ ctx+0x260 */
             interpolated_lpc_synthesis(s->lsf1, cur_lsf2,
                                        synth_excit, pcm, 0, s->lpc_order,
                                        frame_size, lpec_lpc_segments_full(s));
-            lpec_dump_f1c0_pass(s, 0, pcm, 0, frame_size);
         } else {
             int nseg = lpec_lpc_segments_half(s);
 
@@ -2752,52 +1895,26 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
             interpolated_lpc_synthesis(s->lsf1, cur_lsf1,
                                        synth_excit, pcm, 0, s->lpc_order,
                                        subfr_size, nseg);
-            lpec_dump_f1c0_pass(s, 0, pcm, 0, subfr_size);
-            if (!getenv("LPEC_SKIP_HALF2")) {
-                interpolated_lpc_synthesis(cur_lsf1, cur_lsf2,
-                                           synth_excit + subfr_size, pcm,
-                                           subfr_size, s->lpc_order, subfr_size,
-                                           nseg);
-                lpec_dump_f1c0_pass(s, 1, pcm, subfr_size, subfr_size);
-            }
+            interpolated_lpc_synthesis(cur_lsf1, cur_lsf2,
+                                       synth_excit + subfr_size, pcm,
+                                       subfr_size, s->lpc_order, subfr_size,
+                                       nseg);
         }
 
         memcpy(output, pcm, frame_size * sizeof(double));
-        lpec_trace_stage(s, mode, "pcm", output, 0, frame_size);
-        lpec_dump_f1c0_pass(s, 9, pcm, 0, frame_size);
 
         memcpy(s->prev_lsf, cur_lsf2, (order + 1) * sizeof(double));
         memcpy(s->lsf2, cur_lsf2, (order + 1) * sizeof(double));
         lpec_end_frame(s);
-        if (getenv("LPEC_TRACE_LSF") && s->lpec_frame_idx == 6) {
-            int ti;
-            fprintf(stderr, "LPEC_TRACE_LSF f6 end lsf2 rolled lsf1[1]=%.6f\n", s->lsf1[1]);
-            for (ti = 1; ti <= order; ti++)
-                fprintf(stderr, " lsf2[%d]=%.6f\n", ti, cur_lsf2[ti]);
-        }
         lpec_save_frame(s, output, s->frame_excit, frame_size, mode);
-        if (getenv("LPEC_TRACE")) {
-            static int tr;
-            if (tr++ < 5) {
-                double mx = 0, rms = 0;
-                int ti;
-
-                for (ti = 0; ti < frame_size; ti++) {
-                    mx = fmax(mx, fabs(output[ti]));
-                    rms += output[ti] * output[ti];
-                }
-                fprintf(stderr, "LPEC_TRACE pcm frame=%d max=%.6f rms=%.6f first=%.6f\n",
-                        tr - 1, mx, sqrt(rms / frame_size), output[0]);
-            }
-        }
         return lpec_finish_frame(s, gb, mode, frame_start, frame_size);
 
     } else if (mode == 2) {
         /*
- * Mode 2: (2), pitchx2, avg LSF, 05d50+ab80+f640x2.
- * No flag bit, no pitch CB; f640 uses ctx+0x84 shape.
- *: clears ctx+0x13c/0x140 pitch CB flags before ab80.
-*/
+         * Mode 2: both pitch windows, two pitch halves, averaged LSF, then
+         * 05d50, ab80 and f640 twice. No flag bit and no pitch CB; f640 uses
+         * the mode-2 shape. The pitch CB flags are cleared before ab80.
+         */
         int lsf_bits = s->num_lsf_cb * LPEC_LSF_BITS;
 
         s->pitch_cb_flag_h1 = 0;
@@ -2835,7 +1952,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
                                 frame_size, order, 0, s->half_lsf_i16[1]) < 0)
             return AVERROR(EAGAIN);
         lpec_postprocess_excit(s, mode, s->excit_src, 0, s->qmf_seg_m2_h1, 1);
-        /* mode-2 h1: f640 overlap/copy = ctx+0xc (384 @ 8 kHz). */
+        /* mode-2 h1: f640 overlap and copy are qmf_seg_m2_h1 (384 @ 8 kHz). */
         lpec_excit_window_f640(s, 1, s->frame_excit, s->excit_src, lpec_ola_hist(s),
                                lpec_f640_window(s, mode), s->qmf_seg_m2_h1,
                                s->qmf_seg_m2_h1);
@@ -2845,30 +1962,9 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
                                 frame_size, order, 0, s->half_lsf_i16[2]) < 0)
             return AVERROR(EAGAIN);
         lpec_postprocess_excit(s, mode, s->excit_src, 0, frame_size, 2);
-        /* Mode-2 h2: dst+ctx+0xc, overlap=ctx+0xc, copy=ctx+0x8 (512). */
-        {
-            const char *inj = getenv("LPEC_INJECT_OLA");
-            const char *ijf = getenv("LPEC_INJECT_FRAME");
-            int inj_frame = ijf ? atoi(ijf) : -1;
-
-            if (inj && (inj_frame < 0 || s->lpec_frame_idx == inj_frame))
-                lpec_load_doubles(inj, lpec_ola_hist(s), frame_size);
-        }
         lpec_excit_window_f640(s, 2, s->frame_excit + s->qmf_seg_m2_h1, s->excit_src,
                                lpec_ola_hist(s), lpec_f640_window(s, mode),
                                s->qmf_seg_m2_h1, frame_size);
-        if (getenv("LPEC_DUMP_HIST_CHAIN") && s->next_frame_mode_peek == 1) {
-            char path[256];
-            FILE *df;
-
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_hist_chain_post_m2.bin",
-                     s->lpec_frame_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(lpec_ola_hist(s), sizeof(double), frame_size, df);
-                fclose(df);
-            }
-        }
         s->prev_pitch_lag = pitch2_lag;
 
         lpec_maybe_inject_frame_excit(s);
@@ -2877,54 +1973,17 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
             const double *synth_excit = lpec_prepare_synth_excit(s, mode, s->frame_excit,
                                                                  s->frame_excit);
 
-            if (lpec_dump_wants_frame(s)) {
-                char path[256];
-                FILE *df;
 
-                lpec_dump_lpc_frame = s->lpec_frame_idx;
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_lpc_hist.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->synth_buf, sizeof(double), order, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_lsf1.bin", s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->lsf1, sizeof(double), order + 1, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_cur_lsf2.bin", s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(cur_lsf2, sizeof(double), order + 1, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_synth_excit.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(synth_excit, sizeof(double), frame_size, df);
-                    fclose(df);
-                }
-            }
-
-            /* mode 2: prev=ctx+0x150 (lsf1), curr=ctx+0x260 (lsf2); not avg. */
+            /* mode 2: interpolate from lsf1 to lsf2, not from their average. */
             interpolated_lpc_synthesis(s->lsf1, cur_lsf2,
                                        synth_excit, pcm, 0, s->lpc_order,
                                        frame_size, lpec_lpc_segments_full(s));
-            lpec_dump_f1c0_pass(s, 0, pcm, 0, frame_size);
         }
         memcpy(output, pcm, frame_size * sizeof(double));
         memcpy(s->prev_lsf, cur_lsf2, (order + 1) * sizeof(double));
         memcpy(s->lsf2, cur_lsf2, (order + 1) * sizeof(double));
         lpec_end_frame(s);
         lpec_save_frame(s, output, s->frame_excit, frame_size, mode);
-        lpec_dump_ctx_bufs(s, "excit_src");
-        lpec_dump_ctx_bufs(s, "frame_excit");
-        lpec_dump_ctx_bufs(s, "synth_work");
-        lpec_dump_ctx_bufs(s, "excit_ola");
         return lpec_finish_frame(s, gb, mode, frame_start, frame_size);
 
     } else if (mode == 1) {
@@ -2942,14 +2001,6 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         lpec_refresh_half_lsf_i16(s, 2);
         memcpy(cur_lsf1, s->lsf1, (order + 1) * sizeof(double));
 
-        if (getenv("LPEC_TRACE_LSF") && s->lpec_frame_idx == 7) {
-            int ti;
-            fprintf(stderr, "LPEC_TRACE_LSF f7 mode1 idx=%d,%d,%d,%d\n",
-                    lsf_idx[0], lsf_idx[1], lsf_idx[2], lsf_idx[3]);
-            for (ti = 1; ti <= order; ti++)
-                fprintf(stderr, " lsf1[%d]=%.6f lsf2[%d]=%.6f\n",
-                        ti, cur_lsf1[ti], ti, cur_lsf2[ti]);
-        }
 
         int voiced, pitch_lag = read_pitch(s, gb, &voiced, &s->pitch_win_half2,
                                            &s->pitch_lag_off_half2);
@@ -2963,141 +2014,24 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
                                 frame_size, order, 0, s->half_lsf_i16[2]) < 0)
             return AVERROR(EAGAIN);
         s->prev_pitch_lag = pitch_lag;
-        if (lpec_dump_wants_frame(s)) {
-            char path[256];
-            FILE *df;
-
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_preqmf_m1.bin",
-                     s->lpec_frame_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(s->excit_src, sizeof(double), 768, df);
-                fclose(df);
-            }
-        }
         {
-            const char *inj = getenv("LPEC_INJECT_EXCIT_SRC");
-            const char *ijf = getenv("LPEC_INJECT_FRAME");
 
-            if (inj && ijf && s->lpec_frame_idx == atoi(ijf)) {
-                int nload = frame_size;
-
-                if (s->is_xaudio_lp && s->frame_size < LPEC_FRAME_16K)
-                    nload = s->qmf.desc768.len;
-                lpec_load_doubles(inj, s->excit_src, nload);
-            }
         }
         lpec_postprocess_excit(s, mode, s->excit_src, 0, lpec_mode1_ab80_len(s), 2);
-        if (lpec_dump_wants_frame(s)) {
-            char path[256];
-            FILE *df;
-
-            snprintf(path, sizeof(path), "/tmp/lpec_f%d_postqmf_m1.bin",
-                     s->lpec_frame_idx);
-            df = fopen(path, "wb");
-            if (df) {
-                fwrite(s->excit_src, sizeof(double), 768, df);
-                fclose(df);
-            }
-        }
-        if (getenv("LPEC_STAGE") && s->lpec_frame_idx == 7) {
-            const double *h2 = s->excit_src + subfr_size;
-            fprintf(stderr, "LPEC_STAGE f7 raw_excit_h2 first4=%.1f,%.1f,%.1f,%.1f pitch_win=%d lag_off=%d\n",
-                    h2[0], h2[1], h2[2], h2[3],
-                    s->pitch_win_half2, s->pitch_lag_off_half2);
-        }
 
         {
-            const char *inj = getenv("LPEC_INJECT_OLA");
-            const char *ijf = getenv("LPEC_INJECT_FRAME");
-            int inj_frame = -1;
 
-            if (ijf)
-                inj_frame = atoi(ijf);
-            if (inj && (inj_frame < 0 || s->lpec_frame_idx == inj_frame))
-                lpec_load_doubles(inj, lpec_ola_hist(s), frame_size);
         }
 
         {
             const double *synth_excit = lpec_prepare_synth_excit(s, mode, s->excit_src,
                                                                  s->frame_excit);
-            int nseg = lpec_lpc_segments_half(s);
 
-            if (lpec_dump_wants_frame(s)) {
-                char path[256];
-                FILE *df;
-
-                lpec_dump_lpc_frame = s->lpec_frame_idx;
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_lpc_hist.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->synth_buf, sizeof(double), order, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_lsf1.bin", s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->lsf1, sizeof(double), order + 1, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_cur_lsf1.bin", s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(cur_lsf1, sizeof(double), order + 1, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_cur_lsf2.bin", s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(cur_lsf2, sizeof(double), order + 1, df);
-                    fclose(df);
-                }
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_synth_excit.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(synth_excit, sizeof(double), frame_size, df);
-                    fclose(df);
-                }
-            }
-
-            /* the reference: ctx+0x128==0 -> full-frame f1c0 for modes 1/3. */
-            if (getenv("LPEC_MODE1_H2ISO")) {
-                memcpy(pcm, s->frame_out, subfr_size * sizeof(double));
-                lpec_mode1_half2_isolated(cur_lsf1, cur_lsf2, synth_excit,
-                                          s->synth_buf, pcm, order,
-                                          frame_size, subfr_size, nseg);
-                memcpy(output, s->frame_out, frame_size * sizeof(double));
-                memcpy(output + subfr_size, pcm + subfr_size,
-                       subfr_size * sizeof(double));
-            } else if (getenv("LPEC_MODE1_INPLACE")) {
-                memcpy(output, s->frame_out, frame_size * sizeof(double));
-                memcpy(pcm, output, subfr_size * sizeof(double));
-                lpec_interpolated_lpc_inplace(cur_lsf1, cur_lsf2, synth_excit,
-                                              s->synth_buf, pcm, order,
-                                              frame_size, nseg);
-                memcpy(output + subfr_size, pcm + subfr_size,
-                       subfr_size * sizeof(double));
-            } else if (getenv("LPEC_MODE1_HALF2") &&
-                       (!getenv("LPEC_MODE1_HALF2_FROM") ||
-                        s->lpec_frame_idx >= atoi(getenv("LPEC_MODE1_HALF2_FROM")))) {
-                memcpy(output, s->frame_out, frame_size * sizeof(double));
-                memcpy(pcm, output, subfr_size * sizeof(double));
-                lpec_mode1_half2_synthesis(cur_lsf1, cur_lsf2, synth_excit,
-                                           s->synth_buf, pcm, s->frame_out,
-                                           order, frame_size, subfr_size, nseg);
-                memcpy(output + subfr_size, pcm + subfr_size,
-                       subfr_size * sizeof(double));
-            } else {
-                /* ctx+0x128==0 -> full-frame f1c0 (all rates). */
-                interpolated_lpc_synthesis(cur_lsf1, cur_lsf2, synth_excit, pcm,
-                                           0, s->lpc_order, frame_size,
-                                           lpec_lpc_segments_full(s));
-                memcpy(output, pcm, frame_size * sizeof(double));
-            }
-            lpec_dump_f1c0_pass(s, 0, output, 0, frame_size);
-            lpec_trace_stage(s, mode, "pcm", output, 0, frame_size);
+            /* full-frame f1c0 for modes 1/3 */
+            interpolated_lpc_synthesis(cur_lsf1, cur_lsf2, synth_excit, pcm,
+                                       0, s->lpc_order, frame_size,
+                                       lpec_lpc_segments_full(s));
+            memcpy(output, pcm, frame_size * sizeof(double));
         }
         memcpy(s->prev_lsf, cur_lsf2, (order + 1) * sizeof(double));
         memcpy(s->lsf2, cur_lsf2, (order + 1) * sizeof(double));
@@ -3106,10 +2040,6 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
                         s->is_xaudio_lp ? s->excit_work + LPEC_WORK_SLACK
                                         : s->frame_excit,
                         frame_size, mode);
-        lpec_dump_ctx_bufs(s, "excit_src");
-        lpec_dump_ctx_bufs(s, "frame_excit");
-        lpec_dump_ctx_bufs(s, "synth_work");
-        lpec_dump_ctx_bufs(s, "excit_ola");
         return lpec_finish_frame(s, gb, mode, frame_start, frame_size);
 
     } else if (mode == 3) {
@@ -3142,38 +2072,17 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         lpec_postprocess_excit(s, mode, s->excit_src, 0, frame_size, 2);
 
         {
-            const char *inj = getenv("LPEC_INJECT_OLA");
-            const char *ijf = getenv("LPEC_INJECT_FRAME");
-            int inj_frame = -1;
 
-            if (ijf)
-                inj_frame = atoi(ijf);
-            if (inj && (inj_frame < 0 || s->lpec_frame_idx == inj_frame))
-                lpec_load_doubles(inj, lpec_ola_hist(s), frame_size);
 
             const double *synth_excit = lpec_prepare_synth_excit(s, mode, s->excit_src,
                                                                  s->frame_excit);
 
-            if (lpec_dump_wants_frame(s)) {
-                char path[256];
-                FILE *df;
 
-                lpec_dump_lpc_frame = s->lpec_frame_idx;
-                snprintf(path, sizeof(path), "/tmp/lpec_f%d_lpc_hist.bin",
-                         s->lpec_frame_idx);
-                df = fopen(path, "wb");
-                if (df) {
-                    fwrite(s->synth_buf, sizeof(double), order, df);
-                    fclose(df);
-                }
-            }
-
-            /* the reference: ctx+0x128==0 -> full-frame f1c0 for modes 1/3. */
+            /* full-frame f1c0 for modes 1/3 */
             interpolated_lpc_synthesis(cur_lsf1, cur_lsf2, synth_excit, pcm, 0,
                                        s->lpc_order, frame_size,
                                        lpec_lpc_segments_full(s));
             memcpy(output, pcm, frame_size * sizeof(double));
-            lpec_dump_f1c0_pass(s, 0, output, 0, frame_size);
         }
         memcpy(s->prev_lsf, cur_lsf2, (order + 1) * sizeof(double));
         memcpy(s->lsf2, cur_lsf2, (order + 1) * sizeof(double));
@@ -3182,10 +2091,6 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
                         s->is_xaudio_lp ? s->excit_work + LPEC_WORK_SLACK
                                         : s->frame_excit,
                         frame_size, mode);
-        lpec_dump_ctx_bufs(s, "excit_src");
-        lpec_dump_ctx_bufs(s, "frame_excit");
-        lpec_dump_ctx_bufs(s, "synth_work");
-        lpec_dump_ctx_bufs(s, "excit_ola");
         return lpec_finish_frame(s, gb, mode, frame_start, frame_size);
 
     } else {
@@ -3227,14 +2132,6 @@ static int lpec_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     int total_samples = 0;
     int num_frames = 0;
 
-    if (!draining && getenv("LPEC_TRACE") && s->frame_count < 3) {
-        int n = payload_size < 16 ? payload_size : 16;
-        fprintf(stderr, "LPEC_TRACE pkt%d size=%d payload:",
-                s->frame_count, payload_size);
-        for (int i = 0; i < n; i++)
-            fprintf(stderr, " %02x", src[i]);
-        fprintf(stderr, " stream_len=%d\n", s->stream_len);
-    }
 
     if (!draining && payload_size > (int)sizeof(s->carry_buf) - s->chunk_carry_len)
         return AVERROR(EINVAL);
@@ -3273,12 +2170,6 @@ static int lpec_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
     frame->nb_samples = total_samples;
-    if (getenv("LPEC_TRACE") && total_samples > 0) {
-        static int out_tr;
-        if (out_tr++ < 8)
-            fprintf(stderr, "LPEC_OUT #%d idx=%d nb=%d nf=%d\n",
-                    out_tr - 1, s->lpec_frame_idx, total_samples, num_frames);
-    }
     int16_t *dst;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
@@ -3306,167 +2197,8 @@ const FFCodec ff_lpec_decoder = {
     .init        = lpec_decode_init,
     .close       = lpec_decode_close,
     FF_CODEC_DECODE_CB(lpec_decode_frame),
-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_VARIABLE_FRAME_SIZE |
-                       AV_CODEC_CAP_DELAY,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
     CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
 };
 
 
-/*
- * LPEC LPC synthesis helpers (mode-1 half2 path).
- * lsf_to_lpc(), LPEC_LSF_MAX and LPEC_LPC_ORDER_MAX are defined earlier.
- */
-void lpec_mode1_half2_synthesis(const double *prev_lsf, const double *curr_lsf,
-                                const double *excit, double *synth_buf,
-                                double *output, const double *frame_out,
-                                int order, int frame_size, int subfr_size,
-                                int num_seg)
-{
-    double interp_lsf[LPEC_LSF_MAX];
-    double lpc[LPEC_LPC_ORDER_MAX + 2];
-    const double step = num_seg > 0 ? 1.0 / (double)num_seg : 1.0;
-    int out_pos = 0;
-    int i;
-
-    memcpy(output + subfr_size, frame_out + subfr_size, subfr_size * sizeof(double));
-    for (i = 0; i < subfr_size; i++)
-        synth_buf[order + subfr_size + i] = output[subfr_size + i];
-
-    if (getenv("LPEC_STAGE") && getenv("LPEC_SYNTH_DBG")) {
-        double e = 0, ex = 0;
-        for (i = 0; i < subfr_size; i++) {
-            e += synth_buf[order + i] * synth_buf[order + i];
-            ex += excit[subfr_size + i] * excit[subfr_size + i];
-        }
-        fprintf(stderr, "LPEC_STAGE half2 prefill synth rms=%.1f excit_h2 rms=%.1f\n",
-                sqrt(e / subfr_size), sqrt(ex / subfr_size));
-    }
-
-    for (int seg = 0; seg <= num_seg; seg++) {
-        double w_curr = (double)seg * step;
-        double w_prev = 1.0 - w_curr;
-        int div = (seg == 0 || seg == num_seg) ? num_seg * 2 : num_seg;
-        int seg_len = frame_size / div;
-
-        for (i = 0; i <= order; i++)
-            interp_lsf[i] = prev_lsf[i] * w_prev + curr_lsf[i] * w_curr;
-
-        lsf_to_lpc(interp_lsf, lpc, order);
-
-        for (int n = 0; n < seg_len; n++) {
-            int pos = out_pos + n;
-            double s;
-
-            if (pos < subfr_size)
-                continue;
-
-            s = excit[pos];
-            for (int k = 1; k <= order; k++)
-                s -= lpc[k] * synth_buf[order + pos - k];
-
-            if (!isfinite(s))
-                s = 0.0;
-
-            synth_buf[order + pos] = s;
-        }
-        out_pos += seg_len;
-    }
-
-    memcpy(output + subfr_size, synth_buf + order + subfr_size,
-           subfr_size * sizeof(double));
-    memcpy(synth_buf, synth_buf + order + frame_size - order,
-           order * sizeof(double));
-}
-
-void lpec_interpolated_lpc_inplace(const double *prev_lsf, const double *curr_lsf,
-                                   const double *excit, double *synth_buf,
-                                   double *output, int order, int frame_size,
-                                   int num_seg)
-{
-    double interp_lsf[LPEC_LSF_MAX];
-    double lpc[LPEC_LPC_ORDER_MAX + 2];
-    const double step = num_seg > 0 ? 1.0 / (double)num_seg : 1.0;
-    int out_pos = 0;
-
-    for (int seg = 0; seg <= num_seg; seg++) {
-        double w_curr = (double)seg * step;
-        double w_prev = 1.0 - w_curr;
-        int div = (seg == 0 || seg == num_seg) ? num_seg * 2 : num_seg;
-        int seg_len = frame_size / div;
-
-        for (int i = 0; i <= order; i++)
-            interp_lsf[i] = prev_lsf[i] * w_prev + curr_lsf[i] * w_curr;
-
-        lsf_to_lpc(interp_lsf, lpc, order);
-
-        for (int n = 0; n < seg_len; n++) {
-            int pos = out_pos + n;
-            double s = excit[pos];
-
-            for (int k = 1; k <= order; k++) {
-                if (pos >= k)
-                    s -= lpc[k] * output[pos - k];
-                else
-                    s -= lpc[k] * synth_buf[order + pos - k];
-            }
-
-            if (!isfinite(s))
-                s = 0.0;
-
-            output[pos] = s;
-            synth_buf[order + pos] = s;
-        }
-        out_pos += seg_len;
-    }
-
-    memcpy(synth_buf, synth_buf + order + frame_size - order,
-           order * sizeof(double));
-}
-
-void lpec_mode1_half2_isolated(const double *prev_lsf, const double *curr_lsf,
-                               const double *excit, double *synth_buf,
-                               double *output, int order, int frame_size,
-                               int subfr_size, int num_seg)
-{
-    double interp_lsf[LPEC_LSF_MAX];
-    double lpc[LPEC_LPC_ORDER_MAX + 2];
-    const double step = num_seg > 0 ? 1.0 / (double)num_seg : 1.0;
-    int out_pos = 0;
-
-    memset(synth_buf, 0, (order + frame_size) * sizeof(double));
-
-    for (int seg = 0; seg <= num_seg; seg++) {
-        double w_curr = (double)seg * step;
-        double w_prev = 1.0 - w_curr;
-        int div = (seg == 0 || seg == num_seg) ? num_seg * 2 : num_seg;
-        int seg_len = frame_size / div;
-
-        for (int i = 0; i <= order; i++)
-            interp_lsf[i] = prev_lsf[i] * w_prev + curr_lsf[i] * w_curr;
-
-        lsf_to_lpc(interp_lsf, lpc, order);
-
-        for (int n = 0; n < seg_len; n++) {
-            int pos = out_pos + n;
-            double s;
-
-            if (pos < subfr_size)
-                continue;
-
-            s = excit[pos];
-            for (int k = 1; k <= order; k++)
-                s -= lpc[k] * synth_buf[order + pos - k];
-
-            if (!isfinite(s))
-                s = 0.0;
-
-            synth_buf[order + pos] = s;
-        }
-        out_pos += seg_len;
-    }
-
-    memcpy(output + subfr_size, synth_buf + order + subfr_size,
-           subfr_size * sizeof(double));
-    memcpy(synth_buf, synth_buf + order + frame_size - order,
-           order * sizeof(double));
-}

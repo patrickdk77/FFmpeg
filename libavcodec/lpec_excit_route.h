@@ -784,7 +784,7 @@ static const int16_t lpec_8k_lsf_i16_q3[640] = {
     1434, -2569, -3255, -154, -916, -1557, -154, -349, 509, -271, -1808, -2511, -1056, -2898, -2585, 636,
 };
 
-/* rate != 8000: ctx+0x124 = (not the 16k-named table). */
+/* used for rates other than 8000 (despite the 16k name) */
 static const int16_t lpec_pitch_lag_tbl_sr16[384] = {
     941, 5023, 573, 3565, 11826, 5063, -1242, 4392, -1848, -3140, 7521, 4512,
     1256, 6178, 4067, 1940, 2336, -23, 467, 7315, -2003, -2220, 6198, 1082,
@@ -847,20 +847,12 @@ static const int16_t lpec_16k_pitch_lag_tbl[384] = {
     -60, 14, -528, -2347, -3159, -484, 148, -1569, -473, -1170, -1661, -2953, 1569, 1208, -904, -1867,
 };
 
-void lpec_lsf_indices_to_i16(int num_bands, int order, int num_cb,
+void ff_lpec_lsf_indices_to_i16(int num_bands, int order, int num_cb,
                              const int *idx, int16_t *lsf_out);
 
-int lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order);
+int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order);
 
-int lpec_c680_route_tables(const int16_t *a110_out, int pitch_win, double pitch_e,
-                           int32_t *route_out, int pitch_len, int order,
-                           const int16_t *rt_a, const int16_t *rt_b);
-
-int lpec_c680_route(const int16_t *a110_out, int pitch_win, double pitch_e,
+int ff_lpec_c680_route(const int16_t *a110_out, int pitch_win, double pitch_e,
                     int32_t *route_out, int pitch_len, int order);
-
-int lpec_autocorr_scale_c450_test(int *out_m, uint32_t *out_l,
-                                  int16_t *acf_out, const int16_t *lsf,
-                                  int order);
 
 #endif /* AVCODEC_LPEC_EXCIT_ROUTE_H */

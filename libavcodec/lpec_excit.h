@@ -32,7 +32,7 @@
 
 typedef struct LPECRouteEntry {
     double val;
-    int    dst; /* int at local_512c[i*2]+8 */
+    int    dst;
     int    idx;
 } LPECRouteEntry;
 
@@ -42,20 +42,20 @@ typedef struct LPECExcitState {
     int    subfr_size;
     int    excit_pos;
     int    f4e0_noise_pos;
-    int    cb_idx_pos;              /* ctx+0x70 scratch for 060e0 */
-    int    bit_overhead;            /* ctx+0x14 = 19 */
+    int    cb_idx_pos;
+    int    bit_overhead;
     int    pitch_ref;               /* legacy; use pitch_ref_route */
     int    pitch_scale;             /* legacy; use pitch_scale_route */
     int    pitch_mult;              /* legacy; use pitch_mult_route */
-    int    pitch_ref_route[4];      /* ctx+0xec + route*4 */
-    int    pitch_scale_route[4];    /* ctx+0x40 + route*4 (05d50 band step / c680) */
-    int    pitch_mult_route[4];     /* ctx+0xfc + route*4 */
-    int    route_excit_start[4];    /* ctx+0x40 + route*4 (05d50 head zero / gain start) */
-    int    route_tail_start[4];     /* ctx+0x50 + route*4 (05d50 tail zero start) */
+    int    pitch_ref_route[4];
+    int    pitch_scale_route[4];
+    int    pitch_mult_route[4];
+    int    route_excit_start[4];
+    int    route_tail_start[4];
     int    band_width;              /* ceil(subfr / num_bands); legacy alias */
     int    half_pitch_len;          /* subfr_size >> 1 */
-    int    route_pitch_base;        /* local_c -> pitch_len */
-    int    pitch_route_len[4];      /* *(ctx+0x74[slot]+4) QMF desc.len */
+    int    route_pitch_base;
+    int    pitch_route_len[4];
     int    is_xaudio_lp;            /* quality 0x19 selects the reference decoder tables */
     int    codec_rate_in;           /* InitCodec rate (6000 -> 03920 rtable_a) */
     int    xa_route_pitch;          /* ctx[0x13c + half_idx1*4] for 03920 rtable row */
@@ -71,16 +71,16 @@ typedef struct LPECExcitState {
     uint8_t  cb_idx_scratch[768];
 } LPECExcitState;
 
-int lpec_excit_route_idx(int mode, int half);
+int ff_lpec_excit_route_idx(int mode, int half);
 
-void lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
+void ff_lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
                      int num_bands, int frame_size, int subfr_size,
                      int is_xaudio_lp);
 
-void lpec_xa_lsf_indices_to_i16(int order, int num_cb,
+void ff_lpec_xa_lsf_indices_to_i16(int order, int num_cb,
                                 const int *idx, int16_t *lsf_out);
 
-int lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
+int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
                              double *excitation, int subfr_len,
                              int half_idx1, int pitch_lag, int pitch_lag_off,
                              int pitch_win, int voiced, const double *pitch_tbl,
