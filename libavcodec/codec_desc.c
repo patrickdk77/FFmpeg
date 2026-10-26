@@ -3597,6 +3597,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
     },
     {
+        .id        = AV_CODEC_ID_DS2,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "ds2",
+        .long_name = NULL_IF_CONFIG_SMALL("Digital Speech Standard Pro (DS2)"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+    },
+    {
         .id        = AV_CODEC_ID_APPLE_APAC,
         .type      = AVMEDIA_TYPE_AUDIO,
         .name      = "apple_apac",
