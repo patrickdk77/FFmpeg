@@ -241,6 +241,7 @@ static int dss_read_header(AVFormatContext *s)
     ctx->counter = 0;
     ctx->swap        = 0;
     ctx->frames_left = 0;
+    ctx->dss_sp_swap_byte = -1;
     /* dss_sp_next_block steps forward first, so start one block short. */
     ctx->block_pos   = ctx->dss_header_size - DSS_BLOCK_SIZE;
 
@@ -321,6 +322,21 @@ static int dss_sp_next_block(AVFormatContext *s)
         ctx->frames_left = dss_block_frames(header);
         if (!ctx->frames_left)
             continue;
+
+        /* A swapped frame takes one byte from the frame before it, two bytes
+         * before its own start, in this block or at the end of the previous
+         * one. Read it from there rather than carry it over: after a seek, at
+         * the start of a cut file, or where a block restarts the framing, the
+         * frame before has not been read. */
+        if (ctx->swap) {
+            int64_t at = ctx->block_pos + cont - 2;
+
+            if (cont >= 2)
+                at += DSS_AUDIO_BLOCK_HEADER_SIZE;
+            if (at >= ctx->dss_header_size + DSS_AUDIO_BLOCK_HEADER_SIZE &&
+                avio_seek(pb, at, SEEK_SET) >= 0)
+                ctx->dss_sp_swap_byte = avio_r8(pb);
+        }
 
         if (avio_seek(pb, ctx->block_pos + DSS_AUDIO_BLOCK_HEADER_SIZE + cont,
                       SEEK_SET) < 0)
@@ -418,7 +434,7 @@ static int dss_sp_read_packet(AVFormatContext *s, AVPacket *pkt)
     dss_sp_byte_swap(ctx, pkt->data, size);
 
     if (ctx->dss_sp_swap_byte < 0) {
-        return AVERROR(EAGAIN);
+        return FFERROR_REDO;
     }
 
     return 0;
