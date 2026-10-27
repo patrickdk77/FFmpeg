@@ -240,6 +240,8 @@ static int64_t ds2_count_total_frames(AVFormatContext *s) {
   uint8_t buf[DS2_BLOCK_SIZE];
   int len, qp7 = -1;
 
+  if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
+    return 0;
   if (size < header_size)
     return AVERROR_INVALIDDATA;
 
@@ -269,7 +271,6 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
   frame_count = ds2_block_frames(hdr);
   anchor      = ds2_block_anchor(hdr);
 
-  ctx->resync_drop = 0;
   ctx->blk_frames  = frame_count;
 
   if (frame_count == 0) {
@@ -289,10 +290,10 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
     aligned = (!in_frame_offset && !anchor) ||
               (in_frame_offset && in_frame_offset + anchor == ctx->frame_size);
     if (!aligned) {
-      if (anchor > 0)
-        avio_skip(pb, anchor);
-      ctx->counter     = DS2_BLOCK_PAYLOAD_SIZE - anchor;
       ctx->resync_drop = 1;
+      if (anchor > 0 && avio_skip(pb, anchor) < 0)
+        return AVERROR_EOF;
+      ctx->counter = DS2_BLOCK_PAYLOAD_SIZE - anchor;
       return 0;
     }
 
@@ -312,6 +313,7 @@ static int ds2_next_block(AVFormatContext *s, int in_frame_offset) {
   int64_t in_block = avio_tell(s->pb) % DS2_BLOCK_SIZE;
 
   ctx->counter = 0;
+  ctx->resync_drop = 0;
   if (in_block > 0 && avio_skip(s->pb, DS2_BLOCK_SIZE - in_block) < 0)
     return AVERROR_EOF;
 
@@ -450,7 +452,7 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
     int to_read = FFMIN(ctx->frame_size - offset, ctx->counter);
     if (to_read <= 0) {
       ret = ds2_next_block(s, offset);
-      if (ret == AVERROR_EOF && offset > 0)
+      if (ret == AVERROR_EOF && offset > 0 && !ctx->resync_drop)
         goto truncated;
       if (ret < 0)
         return ret;
