@@ -143,7 +143,7 @@ static int ds2_find_next_nonempty_swap(AVFormatContext *s, int block_idx) {
 
     avio_seek(pb, bstart, SEEK_SET);
     ret = avio_read(pb, hdr, sizeof(hdr));
-    if (ret < sizeof(hdr))
+    if (ret != DS2_AUDIO_BLOCK_HEADER_SIZE)
       break;
     if (hdr[2] > 0) {
       avio_seek(pb, pos, SEEK_SET);
@@ -167,7 +167,7 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
 
   block_pos = avio_tell(pb);
   ret = avio_read(pb, hdr, sizeof(hdr));
-  if (ret < sizeof(hdr))
+  if (ret != DS2_AUDIO_BLOCK_HEADER_SIZE)
     return ret < 0 ? ret : AVERROR_EOF;
 
   blk_swap    = hdr[0] >> 7;
