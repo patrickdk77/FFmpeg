@@ -8,8 +8,9 @@
  *
  * DS2 is an evolution of the Digital Speech Standard (DSS) format used by
  * Olympus dictation recorders. This demuxer reads QP (Quality Play, 16000 Hz,
- * CELP with a C(64,11) codebook). SP and LP files carry exactly the DSS
- * payload behind a bigger header, so the DSS demuxer reads those.
+ * CELP with a C(64,11) codebook). SP, variable rate SP and LP files carry
+ * exactly the DSS payload behind a bigger header, so the DSS demuxer reads
+ * those.
  *
  * Block layout and demuxing follow hirparak/dss-codec CODEC_SPECIFICATION.md.
  */
@@ -28,6 +29,7 @@
 #define DS2_BLOCK_PAYLOAD_SIZE (DS2_BLOCK_SIZE - DS2_AUDIO_BLOCK_HEADER_SIZE)
 
 #define DS2_FORMAT_SP 0 /* Standard Play, read by the DSS demuxer */
+#define DS2_FORMAT_SP_VR 1 /* variable rate SP, read by the DSS demuxer */
 #define DS2_FORMAT_LP 2 /* Long Play (G.723.1), read by the DSS demuxer */
 #define DS2_FORMAT_QP 6 /* Quality Play, 16000 Hz */
 
@@ -60,10 +62,11 @@ static int ds2_probe(const AVProbeData *p) {
   if (AV_RL32(p->buf) != MKTAG(0x3, 'd', 's', '2'))
     return 0;
 
-  /* SP and LP files belong to the DSS demuxer. */
+  /* SP, variable rate SP and LP files belong to the DSS demuxer. */
   if (p->buf_size >= DS2_HEADER_SIZE + DS2_AUDIO_BLOCK_HEADER_SIZE) {
     format = p->buf[DS2_HEADER_SIZE + 4];
-    if (format == DS2_FORMAT_SP || format == DS2_FORMAT_LP)
+    if (format == DS2_FORMAT_SP || format == DS2_FORMAT_SP_VR ||
+        format == DS2_FORMAT_LP)
       return 0;
   }
 
@@ -279,7 +282,9 @@ static int ds2_read_header(AVFormatContext *s) {
   st->codecpar->codec_tag = ctx->format_type;
   st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
-  if (ctx->format_type == DS2_FORMAT_SP || ctx->format_type == DS2_FORMAT_LP) {
+  if (ctx->format_type == DS2_FORMAT_SP ||
+      ctx->format_type == DS2_FORMAT_SP_VR ||
+      ctx->format_type == DS2_FORMAT_LP) {
     av_log(s, AV_LOG_ERROR, "DS2 SP and LP files are read by the dss demuxer\n");
     return AVERROR_INVALIDDATA;
   } else if (ctx->format_type == DS2_FORMAT_QP) {
