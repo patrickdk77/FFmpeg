@@ -24,11 +24,13 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
+#include "libavutil/opt.h"
 
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
 #include "avio_internal.h"
+#include "ds2crypto.h"
 #include "dss_metadata.h"
 
 #define DSS_HEAD_OFFSET_AUTHOR        0xc
@@ -63,6 +65,7 @@
 static const uint8_t frame_size[4] = { 24, 20, 4, 1 };
 
 typedef struct DSSDemuxContext {
+    AVClass *class;
     unsigned int audio_codec;
     int swap;
     int64_t block_pos;      /* offset of the current audio block header */
@@ -77,6 +80,10 @@ typedef struct DSSDemuxContext {
     int      grundig;
     unsigned grundig_word;  /* payload word being read */
     int      grundig_bits;  /* bits of it still to read */
+
+    AVIOContext *pb;        /* s->pb, or decrypt_pb in an encrypted DS2 file */
+    AVIOContext *decrypt_pb;
+    char *password;
 } DSSDemuxContext;
 
 /* Frames that start in an audio block: byte 2 when it is not 0, otherwise
@@ -133,9 +140,11 @@ static int dss_probe(const AVProbeData *p)
         return AVPROBE_SCORE_MAX;
 
     /* DS2 files in SP, variable rate SP or LP mode carry exactly the DSS
-     * payload; only the header is bigger. */
+     * payload; only the header is bigger. The block headers of an encrypted
+     * DS2 file are in the clear. */
     if (p->buf[0] >= 1 && p->buf[0] <= 16 &&
-        p->buf[1] == 'd' && p->buf[2] == 's' && p->buf[3] == '2') {
+        ((p->buf[1] == 'd' && p->buf[2] == 's' && p->buf[3] == '2') ||
+         AV_RL32(p->buf) == DS2_ENCRYPTED_MAGIC)) {
         format = dss_ds2_block_format(p->buf, p->buf_size);
         if (format == DSS_ACODEC_DSS_SP || format == DSS_ACODEC_DSS_SP_VR ||
             format == DSS_ACODEC_G723_1)
@@ -206,7 +215,7 @@ static int dss_read_packet(AVFormatContext *s, AVPacket *pkt);
 static int64_t dss_count_frames(AVFormatContext *s)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    AVIOContext *pb = s->pb;
+    AVIOContext *pb = ctx->pb;
     int64_t frames = 0;
     int ret;
     AVPacket *pkt;
@@ -238,16 +247,26 @@ static int dss_read_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     AVStream *st;
     int64_t ret64, frames;
+    unsigned int magic;
     int ret, version, is_ds2;
 
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
 
-    version = avio_r8(pb);
+    magic   = avio_rl32(pb);
+    version = magic & 0xff;
     ctx->dss_header_size = dss_header_size(version);
-    avio_skip(pb, 2);
-    is_ds2 = avio_r8(pb) == '2';
+    is_ds2  = magic >> 24 == '2' || magic == DS2_ENCRYPTED_MAGIC;
+
+    ctx->pb = s->pb;
+    if (magic == DS2_ENCRYPTED_MAGIC) {
+        ret = ff_ds2_decrypt_open(s, ctx->password, ctx->dss_header_size,
+                                  &ctx->decrypt_pb);
+        if (ret < 0)
+            return ret;
+        ctx->pb = ctx->decrypt_pb;
+    }
 
     /* A DS2 header can leave the recording date zeroed, which does not
      * parse. The audio does not depend on these fields, so in a DS2 file a
@@ -336,7 +355,7 @@ static int dss_read_header(AVFormatContext *s)
 static int dss_read_payload(AVFormatContext *s, uint8_t *buf, int size)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    AVIOContext *pb = s->pb;
+    AVIOContext *pb = ctx->pb;
     int ret;
 
     while (size > 0) {
@@ -371,7 +390,7 @@ static int dss_read_payload(AVFormatContext *s, uint8_t *buf, int size)
 static int dss_next_block(AVFormatContext *s)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    AVIOContext *pb = s->pb;
+    AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int cont, ret;
 
@@ -421,7 +440,7 @@ static int dss_next_block(AVFormatContext *s)
 static int64_t dss_frame_pos(AVFormatContext *s)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    int64_t pos = avio_tell(s->pb);
+    int64_t pos = avio_tell(ctx->pb);
     int64_t off = (pos - ctx->dss_header_size) % DSS_BLOCK_SIZE;
 
     if (off < DSS_AUDIO_BLOCK_HEADER_SIZE)
@@ -562,7 +581,7 @@ static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
 static int dss_grundig_next_block(AVFormatContext *s)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    AVIOContext *pb = s->pb;
+    AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE], word[2];
     int start, ret;
 
@@ -607,7 +626,7 @@ static int dss_grundig_read_packet(AVFormatContext *s, AVPacket *pkt)
             return ret;
     }
     /* The offset of the word that holds the first bit of the frame. */
-    pos = ctx->grundig_bits ? avio_tell(s->pb) - 2 : dss_frame_pos(s);
+    pos = ctx->grundig_bits ? avio_tell(ctx->pb) - 2 : dss_frame_pos(s);
 
     if ((ret = av_new_packet(pkt, DSS_GRUNDIG_FRAME_SIZE)) < 0)
         return ret;
@@ -661,9 +680,9 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
      * find the block from the per-block frame counts, taken as in
      * dss_next_block(). */
     for (seekto = ctx->dss_header_size; ; seekto += DSS_BLOCK_SIZE) {
-        ret = avio_seek(s->pb, seekto, SEEK_SET);
+        ret = avio_seek(ctx->pb, seekto, SEEK_SET);
         if (ret >= 0)
-            ret = ffio_read_size(s->pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+            ret = ffio_read_size(ctx->pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
         if (ret < 0) {
             /* Past the end: scan again for the block with the last frame. */
             if (!frames)
@@ -687,15 +706,40 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
     return 0;
 }
 
+static int dss_read_close(AVFormatContext *s)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+
+    ff_ds2_decrypt_close(&ctx->decrypt_pb);
+    return 0;
+}
+
+#define OFFSET(x) offsetof(DSSDemuxContext, x)
+#define DEC AV_OPT_FLAG_DECODING_PARAM
+static const AVOption dss_options[] = {
+    { "password", "Decryption password for encrypted DS2 (max 16 bytes)",
+      OFFSET(password), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { NULL },
+};
+
+static const AVClass dss_demuxer_class = {
+    .class_name = "dss demuxer",
+    .item_name  = av_default_item_name,
+    .option     = dss_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
 
 const FFInputFormat ff_dss_demuxer = {
     .p.name         = "dss",
     .p.long_name    = NULL_IF_CONFIG_SMALL("Digital Speech Standard (DSS)"),
     .p.extensions   = "dss",
     .p.flags        = AVFMT_NO_BYTE_SEEK,
+    .p.priv_class   = &dss_demuxer_class,
     .priv_data_size = sizeof(DSSDemuxContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = dss_probe,
     .read_header    = dss_read_header,
     .read_packet    = dss_read_packet,
     .read_seek      = dss_read_seek,
+    .read_close     = dss_read_close,
 };

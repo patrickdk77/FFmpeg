@@ -58,6 +58,32 @@ fate-ds2-lp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp.ds2 -af aresampl
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp
 fate-ds2-qp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-aes128
+fate-ds2-qp-aes128: CMD = framecrc -password 1234 -i $(TARGET_SAMPLES)/ds2/aes128-qp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-aes128-long-password
+fate-ds2-qp-aes128-long-password: CMD = framecrc -password 12345678901234567 -i $(TARGET_SAMPLES)/ds2/aes128-qp.ds2 ; test $$? -ne 0
+fate-ds2-qp-aes128-long-password: CMP = grep
+fate-ds2-qp-aes128-long-password: REF = DS2 password longer than 16 bytes is not supported
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-aes128-no-password
+fate-ds2-qp-aes128-no-password: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/aes128-qp.ds2 ; test $$? -ne 0
+fate-ds2-qp-aes128-no-password: CMP = grep
+fate-ds2-qp-aes128-no-password: REF = Encrypted DS2 file requires the -password option
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-aes128-wrong-password
+fate-ds2-qp-aes128-wrong-password: CMD = framecrc -password 1235 -i $(TARGET_SAMPLES)/ds2/aes128-qp.ds2 ; test $$? -ne 0
+fate-ds2-qp-aes128-wrong-password: CMP = grep
+fate-ds2-qp-aes128-wrong-password: REF = DS2 password rejected
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-aes256
+fate-ds2-qp-aes256: CMD = framecrc -password 1234 -i $(TARGET_SAMPLES)/ds2/aes256-qp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-aes256-wrong-password
+fate-ds2-qp-aes256-wrong-password: CMD = framecrc -password 1235 -i $(TARGET_SAMPLES)/ds2/aes256-qp.ds2 ; test $$? -ne 0
+fate-ds2-qp-aes256-wrong-password: CMP = grep
+fate-ds2-qp-aes256-wrong-password: REF = DS2 password rejected
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-paused
 fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
 
