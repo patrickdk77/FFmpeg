@@ -280,9 +280,11 @@ static int dss_sp_next_block(AVFormatContext *s)
         ctx->block_pos += DSS_BLOCK_SIZE;
         if (avio_seek(pb, ctx->block_pos, SEEK_SET) < 0)
             return AVERROR_EOF;
-        ret = ffio_read_size(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
-        if (ret < 0)
+        ret = avio_read(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+        if (ret < 0 && ret != AVERROR_EOF)
             return ret;
+        if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE)
+            return AVERROR_EOF;
 
         ctx->swap = !!(header[0] & 0x80);
         cont      = 2 * header[1] + 2 * ctx->swap - DSS_AUDIO_BLOCK_HEADER_SIZE;
