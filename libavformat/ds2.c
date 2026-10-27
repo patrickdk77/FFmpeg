@@ -32,11 +32,13 @@
 #define DS2_FORMAT_SP_VR 1 /* variable rate SP, read by the DSS demuxer */
 #define DS2_FORMAT_LP 2 /* Long Play (G.723.1), read by the DSS demuxer */
 #define DS2_FORMAT_QP 6 /* Quality Play, 16000 Hz */
+#define DS2_FORMAT_QP7 7 /* QP with 12-byte noise frames, 16000 Hz */
 
 #define DS2_QP_FRAME_BITS 448
 #define DS2_QP_FRAME_SIZE 56         /* 448 bits = 56 bytes */
 #define DS2_QP_SAMPLES_PER_FRAME 256 /* 64 samples * 4 subframes */
 #define DS2_QP_SAMPLE_RATE 16000
+#define DS2_QP7_NOISE_FRAME_SIZE 12
 
 /* Metadata offsets (same layout as DSS) */
 #define DS2_HEAD_OFFSET_AUTHOR 0xc
@@ -49,11 +51,12 @@
 
 typedef struct DS2DemuxContext {
   int header_size;      /* first_byte * 512 (0x600 Olympus, 0xe00 Grundig/Philips) */
-  int format_type;      /* block format byte, DS2_FORMAT_QP */
+  int format_type;      /* block format byte, DS2_FORMAT_QP or DS2_FORMAT_QP7 */
   int counter;          /* bytes remaining in current block payload */
   int total_frames;     /* total frame count from block headers */
   int frames_read;      /* frames read so far */
   int resync_drop;      /* QP: partial frame orphaned at a re-sync block */
+  int frame_size;       /* QP: size of the frame being read */
   int blk_frames;       /* frames still to start in the current block */
 } DS2DemuxContext;
 
@@ -145,7 +148,10 @@ static int ds2_partial_block_frames(const uint8_t *buf, int size) {
 
   while (n < frame_count && off < size) {
     n++;
-    off += DS2_QP_FRAME_SIZE;
+    if (buf[4] == DS2_FORMAT_QP7 && off + 1 < size && !(buf[off + 1] & 0x80))
+      off += DS2_QP7_NOISE_FRAME_SIZE;
+    else
+      off += DS2_QP_FRAME_SIZE;
   }
   return n;
 }
@@ -213,7 +219,7 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
      */
     anchor  = FFMIN(cont_size, DS2_BLOCK_PAYLOAD_SIZE);
     aligned = (!in_frame_offset && !anchor) ||
-              (in_frame_offset && in_frame_offset + anchor == DS2_QP_FRAME_SIZE);
+              (in_frame_offset && in_frame_offset + anchor == ctx->frame_size);
     if (!aligned) {
       if (anchor > 0)
         avio_skip(pb, anchor);
@@ -302,7 +308,8 @@ static int ds2_read_header(AVFormatContext *s) {
       ctx->format_type == DS2_FORMAT_LP) {
     av_log(s, AV_LOG_ERROR, "DS2 SP and LP files are read by the dss demuxer\n");
     return AVERROR_INVALIDDATA;
-  } else if (ctx->format_type == DS2_FORMAT_QP) {
+  } else if (ctx->format_type == DS2_FORMAT_QP ||
+             ctx->format_type == DS2_FORMAT_QP7) {
     st->codecpar->sample_rate = DS2_QP_SAMPLE_RATE;
     samples_per_frame = DS2_QP_SAMPLES_PER_FRAME;
   } else {
@@ -370,21 +377,31 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
   pkt->stream_index = 0;
 
   /*
-   * QP frames are 56 bytes in a continuous bitstream across blocks.
-   * Frames can span block boundaries, so we read in pieces if needed.
+   * Frames are 56 bytes, or 12 for a QP7 noise frame, in a continuous
+   * bitstream across blocks. Frames can span block boundaries, so we read
+   * in pieces if needed.
    */
-  while (offset < DS2_QP_FRAME_SIZE) {
-    int to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
+  ctx->frame_size = DS2_QP_FRAME_SIZE;
+  while (offset < ctx->frame_size) {
+    int to_read = FFMIN(ctx->frame_size - offset, ctx->counter);
     if (to_read <= 0) {
       ret = ds2_next_block(s, offset);
       if (ret == AVERROR_EOF && offset > 0)
         goto truncated;
       if (ret < 0)
         return ret;
-      if (ctx->resync_drop)
+      if (ctx->resync_drop) {
         offset = 0;
-      to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
+        ctx->frame_size = DS2_QP_FRAME_SIZE;
+      }
+      to_read = FFMIN(ctx->frame_size - offset, ctx->counter);
+      if (to_read <= 0)
+        continue;
     }
+
+    /* QP7: the type bit in the first 16-bit word gives the frame size */
+    if (ctx->format_type == DS2_FORMAT_QP7 && !offset)
+      to_read = FFMIN(to_read, 2);
 
     ret = avio_read(s->pb, pkt->data + offset, to_read);
     if (ret < to_read) {
@@ -397,11 +414,17 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
       goto truncated;
     }
 
-    if (!offset)
+    if (!offset) {
       ctx->blk_frames--;
+      if (ctx->format_type == DS2_FORMAT_QP7 && !(pkt->data[1] & 0x80))
+        ctx->frame_size = DS2_QP7_NOISE_FRAME_SIZE;
+    }
     offset += to_read;
     ctx->counter -= to_read;
   }
+
+  if (ctx->frame_size != DS2_QP_FRAME_SIZE)
+    av_shrink_packet(pkt, ctx->frame_size);
 
   ctx->frames_read++;
   return 0;
@@ -409,7 +432,9 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
 truncated:
   /* The file ends inside a frame its block still counts. Olympus decodes
    * that frame too, so keep it, with the missing bytes zeroed. */
-  memset(pkt->data + offset, 0, DS2_QP_FRAME_SIZE - offset);
+  memset(pkt->data + offset, 0, ctx->frame_size - offset);
+  if (ctx->frame_size != DS2_QP_FRAME_SIZE)
+    av_shrink_packet(pkt, ctx->frame_size);
   ctx->counter = 0;
   ctx->frames_read++;
   return 0;
@@ -421,6 +446,31 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   int64_t ret, seekto;
   uint8_t header[DS2_AUDIO_BLOCK_HEADER_SIZE];
   int frame_count, cont_size, blk_swap;
+
+  if (ctx->format_type == DS2_FORMAT_QP7) {
+    /* Frame sizes vary, so find the block from the per-block frame counts */
+    int64_t target = timestamp / DS2_QP_SAMPLES_PER_FRAME, frames = 0;
+
+    for (seekto = ctx->header_size; ; seekto += DS2_BLOCK_SIZE) {
+      ret = avio_seek(s->pb, seekto, SEEK_SET);
+      if (ret < 0)
+        return ret;
+      ret = avio_read(s->pb, header, DS2_AUDIO_BLOCK_HEADER_SIZE);
+      if (ret < DS2_AUDIO_BLOCK_HEADER_SIZE)
+        return ret < 0 ? ret : AVERROR_EOF;
+      frame_count = ds2_block_frames(header);
+      if (frames + frame_count > target)
+        break;
+      frames += frame_count;
+    }
+
+    /* The next read loads this block and starts at its first frame */
+    avio_skip(s->pb, -DS2_AUDIO_BLOCK_HEADER_SIZE);
+    ctx->frames_read = frames;
+    ctx->counter     = 0;
+    ctx->blk_frames  = 0;
+    return 0;
+  }
 
   seekto = timestamp / DS2_QP_SAMPLES_PER_FRAME * DS2_QP_FRAME_SIZE /
            DS2_BLOCK_PAYLOAD_SIZE * DS2_BLOCK_SIZE;
