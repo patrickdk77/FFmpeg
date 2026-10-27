@@ -600,6 +600,7 @@ OBJS-$(CONFIG_MSRLE_ENCODER)           += msrleenc.o
 OBJS-$(CONFIG_MSRLE_DECODER)           += msrle.o msrledec.o
 OBJS-$(CONFIG_MSS1_DECODER)            += mss1.o mss12.o
 OBJS-$(CONFIG_MSS2_DECODER)            += mss2.o mss12.o mss2dsp.o wmv2data.o
+OBJS-$(CONFIG_MSV_ADPCM_DECODER)       += msv_adpcmdec.o msv_adpcm_sony.o
 OBJS-$(CONFIG_MSVIDEO1_DECODER)        += msvideo1.o
 OBJS-$(CONFIG_MSVIDEO1_ENCODER)        += msvideo1enc.o elbg.o
 OBJS-$(CONFIG_MSZH_DECODER)            += lcldec.o
