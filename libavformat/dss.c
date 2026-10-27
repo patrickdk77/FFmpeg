@@ -60,6 +60,16 @@ typedef struct DSSDemuxContext {
     int dss_header_size;
 } DSSDemuxContext;
 
+/* Frames that start in an audio block: byte 2 when it is not 0, otherwise
+ * byte 5 unless that is 0xff. A recorder writes the second form where it
+ * pauses or stops, and Olympus's decoder plays those frames. */
+static int dss_block_frames(const uint8_t *header)
+{
+    if (header[2] || header[5] == 0xff)
+        return header[2];
+    return header[5];
+}
+
 /* Format byte of the first audio block of a DS2 file, or -1 if the probe
  * buffer does not reach it. */
 static int dss_ds2_block_format(const uint8_t *buf, int size)
@@ -291,15 +301,28 @@ static int dss_sp_next_block(AVFormatContext *s)
         if (cont < 0 || cont > DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE)
             cont = 0;
 
-        if (!header[2])         /* an empty block: nothing to emit, move on */
+        ctx->frames_left = dss_block_frames(header);
+        if (!ctx->frames_left)
             continue;
 
-        ctx->frames_left = header[2];
         if (avio_seek(pb, ctx->block_pos + DSS_AUDIO_BLOCK_HEADER_SIZE + cont,
                       SEEK_SET) < 0)
             return AVERROR_EOF;
         return 0;
     }
+}
+
+/* Offset of the next frame. A frame can start where a block does, after the
+ * block header that dss_sp_read_payload() steps over. */
+static int64_t dss_frame_pos(AVFormatContext *s)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    int64_t pos = avio_tell(s->pb);
+    int64_t off = (pos - ctx->dss_header_size) % DSS_BLOCK_SIZE;
+
+    if (off < DSS_AUDIO_BLOCK_HEADER_SIZE)
+        pos += DSS_AUDIO_BLOCK_HEADER_SIZE - off;
+    return pos;
 }
 
 static void dss_sp_byte_swap(DSSDemuxContext *ctx, uint8_t *data)
@@ -333,7 +356,7 @@ static int dss_sp_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret < 0)
             return ret;
     }
-    pos = avio_tell(s->pb);
+    pos = dss_frame_pos(s);
 
     if (ctx->swap) {
         read_size   = DSS_FRAME_SIZE - 2;
