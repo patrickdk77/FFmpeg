@@ -58,6 +58,7 @@ typedef struct DS2DemuxContext {
   int frames_read;      /* frames read so far */
   int swap_reset_pending;
   int next_blk_swap;    /* swap state from next non-empty block */
+  int resync_drop;      /* QP: partial frame orphaned at a re-sync block */
 } DS2DemuxContext;
 
 static int ds2_probe(const AVProbeData *p) {
@@ -154,7 +155,7 @@ static int ds2_find_next_nonempty_swap(AVFormatContext *s, int block_idx) {
   return 0;
 }
 
-static int ds2_load_block(AVFormatContext *s) {
+static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
   DS2DemuxContext *ctx = s->priv_data;
   AVIOContext *pb = s->pb;
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
@@ -174,6 +175,8 @@ static int ds2_load_block(AVFormatContext *s) {
   cont_size   = FFMAX(0, 2 * hdr[1] + 2 * blk_swap - DS2_AUDIO_BLOCK_HEADER_SIZE);
   block_idx   = (block_pos - DS2_HEADER_SIZE) / DS2_BLOCK_SIZE;
 
+  ctx->resync_drop = 0;
+
   if (frame_count == 0) {
     ctx->counter = cont_size;
     if (ctx->format_type == DS2_FORMAT_SP) {
@@ -186,6 +189,32 @@ static int ds2_load_block(AVFormatContext *s) {
       ctx->ds2_sp_swap_byte = -1;
       ctx->swap_reset_pending = 0;
     }
+
+    /*
+     * QP frames re-anchor at payload offset 2*byte1 - 6 at every block
+     * (blk_swap == 0 in QP, so this equals cont_size). On gap-free audio the
+     * anchor coincides with the straddle carried from the previous block, so a
+     * flat concatenation is correct. At a segment boundary the recorder emits
+     * a re-sync block whose anchor jumps: the leading bytes are an orphaned
+     * straddle tail, the partial frame in flight is stale, and framing must
+     * restart at the anchor. frame_count over-counts on these blocks (observed
+     * 19), so it is not trusted to drive framing; the block end is the limit.
+     * Confirmed byte-for-byte against the Olympus DssParser.dll.
+     */
+    if (ctx->format_type == DS2_FORMAT_QP) {
+      int anchor  = FFMIN(cont_size, DS2_BLOCK_PAYLOAD_SIZE);
+      int aligned = (!in_frame_offset && !anchor) ||
+                    (in_frame_offset &&
+                     in_frame_offset + anchor == DS2_QP_FRAME_SIZE);
+      if (!aligned) {
+        if (anchor > 0)
+          avio_skip(pb, anchor);
+        ctx->counter     = DS2_BLOCK_PAYLOAD_SIZE - anchor;
+        ctx->resync_drop = 1;
+        return 0;
+      }
+    }
+
     ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
   }
 
@@ -322,7 +351,7 @@ static int ds2_sp_read_packet(AVFormatContext *s, AVPacket *pkt) {
     return AVERROR_EOF;
 
   if (ctx->counter == 0) {
-    ret = ds2_load_block(s);
+    ret = ds2_load_block(s, 0);
     if (ret < 0)
       return ret;
   }
@@ -349,7 +378,7 @@ static int ds2_sp_read_packet(AVFormatContext *s, AVPacket *pkt) {
       goto error_eof;
 
     offset = ctx->counter;
-    ret = ds2_load_block(s);
+    ret = ds2_load_block(s, 0);
     if (ret < 0)
       goto error_eof;
   }
@@ -380,7 +409,7 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
     return AVERROR_EOF;
 
   if (ctx->counter == 0) {
-    ret = ds2_load_block(s);
+    ret = ds2_load_block(s, 0);
     if (ret < 0)
       return ret;
   }
@@ -401,9 +430,11 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
   while (offset < DS2_QP_FRAME_SIZE) {
     int to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
     if (to_read <= 0) {
-      ret = ds2_load_block(s);
+      ret = ds2_load_block(s, offset);
       if (ret < 0)
         return ret;
+      if (ctx->resync_drop)
+        offset = 0;
       to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
     }
 
