@@ -31,17 +31,35 @@ fate-dolby-e: CMD = pcm -i $(TARGET_SAMPLES)/dolby_e/16-11
 fate-dolby-e: CMP = oneoff
 fate-dolby-e: REF = $(SAMPLES)/dolby_e/16-11.pcm
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-format1
+fate-dss-format1: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP, ARESAMPLE_FILTER) += fate-dss-lp
 fate-dss-lp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/lp.dss -frames 30 -af aresample
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp
 fate-dss-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/sp.dss -frames 30
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-paused
+fate-dss-sp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/dss/sp-paused.dss
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-format1
+fate-ds2-format1: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-format1.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp
+fate-ds2-lp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp.ds2 -af aresample
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp
 fate-ds2-qp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-paused
 fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7
+fate-ds2-qp7: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp7.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp
+fate-ds2-sp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
 
 FATE_SAMPLES_AUDIO-$(call PCM, DSF, DST, ARESAMPLE_FILTER) += fate-dsf-dst
 fate-dsf-dst: CMD = pcm -i $(TARGET_SAMPLES)/dst/dst-64fs44-2ch.dff
