@@ -148,6 +148,7 @@ extern const FFInputFormat  ff_dsf_demuxer;
 extern const FFInputFormat  ff_dsicin_demuxer;
 extern const FFInputFormat  ff_dss_demuxer;
 extern const FFInputFormat  ff_dts_demuxer;
+extern const FFInputFormat  ff_ds2_demuxer;
 extern const FFOutputFormat ff_dts_muxer;
 extern const FFInputFormat  ff_dtshd_demuxer;
 extern const FFInputFormat  ff_dv_demuxer;
