@@ -1,0 +1,8 @@
+stream|codec_name=atrac3p|sample_rate=44100|channels=2|duration=1.114558|bit_rate=128165|nb_frames=24
+format|duration=1.114558
+stream|codec_name=lpec|sample_rate=8000|channels=1|duration=2.048000|bit_rate=6000|nb_frames=32
+format|duration=2.048000
+stream|codec_name=trc|sample_rate=8000|channels=1|duration=2.100000|bit_rate=4400|nb_frames=105
+format|duration=2.100000
+stream|codec_name=msv_adpcm|sample_rate=8000|channels=1|duration=2.000000|bit_rate=16000|nb_frames=84
+format|duration=2.000000
