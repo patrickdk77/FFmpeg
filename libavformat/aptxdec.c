@@ -25,6 +25,7 @@
 #include "libavutil/opt.h"
 #include "avformat.h"
 #include "demux.h"
+#include "internal.h"
 
 #define APTX_BLOCK_SIZE   4
 #define APTX_PACKET_SIZE  (256*APTX_BLOCK_SIZE)
@@ -45,10 +46,25 @@ static AVStream *aptx_read_header_common(AVFormatContext *s)
         return NULL;
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->format = AV_SAMPLE_FMT_S32P;
-    st->codecpar->ch_layout.nb_channels = 2;
+    st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     st->codecpar->sample_rate = s1->sample_rate;
     st->start_time = 0;
     return st;
+}
+
+static void aptx_set_timing(AVFormatContext *s, AVStream *st)
+{
+    AVCodecParameters *par = st->codecpar;
+    int64_t size = avio_size(s->pb);
+
+    if (par->sample_rate <= 0)
+        return;
+    par->bit_rate = (int64_t)par->sample_rate *
+                    par->ch_layout.nb_channels *
+                    par->bits_per_coded_sample;
+    avpriv_set_pts_info(st, 64, 1, par->sample_rate);
+    if (size > 0)
+        st->duration = size / par->block_align * 4;
 }
 
 static int aptx_read_header(AVFormatContext *s)
@@ -59,6 +75,7 @@ static int aptx_read_header(AVFormatContext *s)
     st->codecpar->codec_id = AV_CODEC_ID_APTX;
     st->codecpar->bits_per_coded_sample = 4;
     st->codecpar->block_align = APTX_BLOCK_SIZE;
+    aptx_set_timing(s, st);
     return 0;
 }
 
@@ -70,6 +87,7 @@ static int aptx_hd_read_header(AVFormatContext *s)
     st->codecpar->codec_id = AV_CODEC_ID_APTX_HD;
     st->codecpar->bits_per_coded_sample = 6;
     st->codecpar->block_align = APTX_HD_BLOCK_SIZE;
+    aptx_set_timing(s, st);
     return 0;
 }
 
