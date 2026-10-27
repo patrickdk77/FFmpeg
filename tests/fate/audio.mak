@@ -46,6 +46,9 @@ fate-dss-grundig-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/grundig-sp.dss
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-paused
 fate-dss-sp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/dss/sp-paused.dss
 
+FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DSS_DEMUXER) += fate-dss-sp-tags
+fate-dss-sp-tags: CMD = probetags $(TARGET_SAMPLES)/dss/sp.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-format1
 fate-ds2-format1: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-format1.ds2
 
@@ -58,11 +61,20 @@ fate-ds2-qp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-paused
 fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
 
+FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DS2_DEMUXER) += fate-ds2-qp-paused-tags
+fate-ds2-qp-paused-tags: CMD = probetags $(TARGET_SAMPLES)/ds2/paused-qp.ds2
+
+FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DS2_DEMUXER) += fate-ds2-qp-tags
+fate-ds2-qp-tags: CMD = probetags $(TARGET_SAMPLES)/ds2/sample-qp.ds2
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7
 fate-ds2-qp7: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp7.ds2
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp
 fate-ds2-sp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
+
+FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DSS_DEMUXER) += fate-ds2-sp-tags
+fate-ds2-sp-tags: CMD = probetags $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
 
 FATE_SAMPLES_AUDIO-$(call PCM, DSF, DST, ARESAMPLE_FILTER) += fate-dsf-dst
 fate-dsf-dst: CMD = pcm -i $(TARGET_SAMPLES)/dst/dst-64fs44-2ch.dff

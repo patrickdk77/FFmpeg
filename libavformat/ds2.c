@@ -22,6 +22,7 @@
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
+#include "dss_metadata.h"
 
 #define DS2_BLOCK_SIZE 512
 #define DS2_AUDIO_BLOCK_HEADER_SIZE 6
@@ -37,15 +38,6 @@
 #define DS2_QP_SAMPLES_PER_FRAME 256 /* 64 samples * 4 subframes */
 #define DS2_QP_SAMPLE_RATE 16000
 #define DS2_QP7_NOISE_FRAME_SIZE 12
-
-/* Metadata offsets (same layout as DSS) */
-#define DS2_HEAD_OFFSET_AUTHOR 0xc
-#define DS2_AUTHOR_SIZE 16
-#define DS2_HEAD_OFFSET_START_TIME 0x26
-#define DS2_HEAD_OFFSET_END_TIME 0x32
-#define DS2_TIME_SIZE 12
-#define DS2_HEAD_OFFSET_COMMENT 0x31e
-#define DS2_COMMENT_SIZE 64
 
 typedef struct DS2DemuxContext {
   int header_size;      /* in bytes, from ds2_header_size() */
@@ -88,48 +80,6 @@ static int ds2_probe(const AVProbeData *p) {
     return 0;
 
   return AVPROBE_SCORE_MAX;
-}
-
-static int ds2_read_metadata_date(AVFormatContext *s, unsigned int offset,
-                                  const char *key) {
-  AVIOContext *pb = s->pb;
-  char datetime[64], string[DS2_TIME_SIZE + 1] = {0};
-  int y, month, d, h, minute, sec;
-  int ret;
-
-  avio_seek(pb, offset, SEEK_SET);
-
-  ret = avio_read(pb, string, DS2_TIME_SIZE);
-  if (ret < DS2_TIME_SIZE)
-    return ret < 0 ? ret : AVERROR_EOF;
-
-  if (sscanf(string, "%2d%2d%2d%2d%2d%2d", &y, &month, &d, &h, &minute, &sec) != 6)
-    return AVERROR_INVALIDDATA;
-
-  snprintf(datetime, sizeof(datetime), "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d",
-           y + 2000, month, d, h, minute, sec);
-  return av_dict_set(&s->metadata, key, datetime, 0);
-}
-
-static int ds2_read_metadata_string(AVFormatContext *s, unsigned int offset,
-                                    unsigned int size, const char *key) {
-  AVIOContext *pb = s->pb;
-  char *value;
-  int ret;
-
-  avio_seek(pb, offset, SEEK_SET);
-
-  value = av_mallocz(size + 1);
-  if (!value)
-    return AVERROR(ENOMEM);
-
-  ret = avio_read(pb, value, size);
-  if (ret < size) {
-    av_free(value);
-    return ret < 0 ? ret : AVERROR_EOF;
-  }
-
-  return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
 }
 
 /*
@@ -339,19 +289,9 @@ static int ds2_read_header(AVFormatContext *s) {
   if (!st)
     return AVERROR(ENOMEM);
 
-  ret = ds2_read_metadata_string(s, DS2_HEAD_OFFSET_AUTHOR, DS2_AUTHOR_SIZE,
-                                 "author");
+  ret = ff_dss_read_ds2_metadata(s);
   if (ret < 0)
-    av_log(s, AV_LOG_WARNING, "Failed to read author metadata\n");
-
-  ret = ds2_read_metadata_date(s, DS2_HEAD_OFFSET_END_TIME, "date");
-  if (ret < 0)
-    av_log(s, AV_LOG_WARNING, "Failed to read date metadata\n");
-
-  ret = ds2_read_metadata_string(s, DS2_HEAD_OFFSET_COMMENT, DS2_COMMENT_SIZE,
-                                 "comment");
-  if (ret < 0)
-    av_log(s, AV_LOG_WARNING, "Failed to read comment metadata\n");
+    av_log(s, AV_LOG_WARNING, "Failed to read DS2 metadata\n");
 
   ret64 = ds2_count_total_frames(s);
   if (ret64 < 0)
