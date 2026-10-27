@@ -55,6 +55,10 @@ fate-ds2-format1: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-format1.ds2
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp
 fate-ds2-lp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp.ds2 -af aresample
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-extract-main
+fate-ds2-lp-extract-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-lp.ds2 -af aresample
+fate-ds2-lp-extract-main: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp
 fate-ds2-qp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
 
@@ -84,6 +88,23 @@ fate-ds2-qp-aes256-wrong-password: CMD = framecrc -password 1235 -i $(TARGET_SAM
 fate-ds2-qp-aes256-wrong-password: CMP = grep
 fate-ds2-qp-aes256-wrong-password: REF = DS2 password rejected
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-extract-annotations
+fate-ds2-qp-extract-annotations: CMD = framecrc -extract annotations -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-extract-annotations-none
+fate-ds2-qp-extract-annotations-none: CMD = framecrc -extract annotations -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
+fate-ds2-qp-extract-annotations-none: CMP = grep
+fate-ds2-qp-extract-annotations-none: REF = No annotations to extract
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-extract-invalid
+fate-ds2-qp-extract-invalid: CMD = framecrc -extract foo -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2 ; test $$? -ne 0
+fate-ds2-qp-extract-invalid: CMP = grep
+fate-ds2-qp-extract-invalid: REF = Error setting option extract to value foo
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-extract-main
+fate-ds2-qp-extract-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
+fate-ds2-qp-extract-main: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-paused
 fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
 
@@ -96,8 +117,21 @@ fate-ds2-qp-tags: CMD = probetags $(TARGET_SAMPLES)/ds2/sample-qp.ds2
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7
 fate-ds2-qp7: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp7.ds2
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7-extract-main
+fate-ds2-qp7-extract-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-qp7.ds2
+fate-ds2-qp7-extract-main: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp7
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp
 fate-ds2-sp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp-extract-annotations-none
+fate-ds2-sp-extract-annotations-none: CMD = framecrc -extract annotations -i $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
+fate-ds2-sp-extract-annotations-none: CMP = grep
+fate-ds2-sp-extract-annotations-none: REF = No annotations to extract
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp-extract-main
+fate-ds2-sp-extract-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
+fate-ds2-sp-extract-main: REF = $(SRC_PATH)/tests/ref/fate/ds2-sp
 
 FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DSS_DEMUXER) += fate-ds2-sp-tags
 fate-ds2-sp-tags: CMD = probetags $(TARGET_SAMPLES)/ds2/olympus-sp.ds2

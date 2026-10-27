@@ -805,6 +805,9 @@ static int dss_sp_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     int16_t *out;
     int ret;
 
+    if (av_packet_get_side_data(avpkt, AV_PKT_DATA_DECODER_RESET, NULL))
+        dss_sp_reset(avctx);
+
     if (buf_size < DSS_SP_FRAME_SIZE) {
         if (buf_size)
             av_log(avctx, AV_LOG_WARNING,
