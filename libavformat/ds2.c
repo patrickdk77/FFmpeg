@@ -23,7 +23,6 @@
 #include "demux.h"
 #include "internal.h"
 
-#define DS2_HEADER_SIZE 0x600 /* 1536 bytes */
 #define DS2_BLOCK_SIZE 512
 #define DS2_AUDIO_BLOCK_HEADER_SIZE 6
 #define DS2_BLOCK_PAYLOAD_SIZE (DS2_BLOCK_SIZE - DS2_AUDIO_BLOCK_HEADER_SIZE)
@@ -50,7 +49,7 @@
 #define DS2_COMMENT_SIZE 64
 
 typedef struct DS2DemuxContext {
-  int header_size;      /* first_byte * 512 (0x600 Olympus, 0xe00 Grundig/Philips) */
+  int header_size;      /* in bytes, from ds2_header_size() */
   int format_type;      /* block format byte, DS2_FORMAT_QP or DS2_FORMAT_QP7 */
   int counter;          /* bytes remaining in current block payload */
   int total_frames;     /* total frame count from block headers */
@@ -60,24 +59,34 @@ typedef struct DS2DemuxContext {
   int blk_frames;       /* frames still to start in the current block */
 } DS2DemuxContext;
 
+/*
+ * The first byte is the header size in 512-byte blocks (Olympus 2/3,
+ * Grundig/Philips 6/7, newer Olympus firmware 8). Philips SpeechExec
+ * writes 1 in the files it splits out of a recording, over the usual
+ * 3-block header.
+ */
+static int ds2_header_size(int first_byte) {
+  return (first_byte == 1 ? 3 : first_byte) * DS2_BLOCK_SIZE;
+}
+
 static int ds2_probe(const AVProbeData *p) {
   int format, header_size;
 
-  /* First byte is the header size in 512-byte blocks (Olympus 2/3,
-   * Grundig/Philips 6/7); bytes 1..3 are the "ds2" tag. */
+  /* bytes 1..3 are the "ds2" tag */
   if (p->buf_size < 4 || p->buf[1] != 'd' || p->buf[2] != 's' || p->buf[3] != '2')
     return 0;
-  if (p->buf[0] < 2 || p->buf[0] > 16)
+  if (p->buf[0] < 1 || p->buf[0] > 16)
     return 0;
 
-  /* SP, variable rate SP and LP files belong to the DSS demuxer. */
-  header_size = p->buf[0] * DS2_BLOCK_SIZE;
-  if (p->buf_size >= header_size + DS2_AUDIO_BLOCK_HEADER_SIZE) {
-    format = p->buf[header_size + 4];
-    if (format == DS2_FORMAT_SP || format == DS2_FORMAT_SP_VR ||
-        format == DS2_FORMAT_LP)
-      return 0;
-  }
+  /* SP, variable rate SP and LP files belong to the DSS demuxer. A long
+   * header can put the first block past the probe buffer; ask for more. */
+  header_size = ds2_header_size(p->buf[0]);
+  if (p->buf_size < header_size + DS2_AUDIO_BLOCK_HEADER_SIZE)
+    return AVPROBE_SCORE_RETRY;
+  format = p->buf[header_size + 4];
+  if (format == DS2_FORMAT_SP || format == DS2_FORMAT_SP_VR ||
+      format == DS2_FORMAT_LP)
+    return 0;
 
   return AVPROBE_SCORE_MAX;
 }
@@ -262,9 +271,9 @@ static int ds2_read_header(AVFormatContext *s) {
   if ((ret64 = avio_seek(pb, 0, SEEK_SET)) < 0)
     return (int)ret64;
   version = avio_r8(pb);
-  if (version < 2 || version > 16)
+  if (version < 1 || version > 16)
     return AVERROR_INVALIDDATA;
-  ctx->header_size = version * DS2_BLOCK_SIZE;
+  ctx->header_size = ds2_header_size(version);
 
   st = avformat_new_stream(s, NULL);
   if (!st)

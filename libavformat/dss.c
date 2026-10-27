@@ -72,11 +72,19 @@ static int dss_block_frames(const uint8_t *header)
     return header[5];
 }
 
+/* Header size from the first byte, in 512-byte blocks. Philips SpeechExec
+ * writes 1 in the DS2 files it splits out of a recording, over the usual 3
+ * blocks. */
+static int dss_header_size(int first_byte)
+{
+    return (first_byte == 1 ? 3 : first_byte) * DSS_BLOCK_SIZE;
+}
+
 /* Format byte of the first audio block of a DS2 file, or -1 if the probe
  * buffer does not reach it. */
 static int dss_ds2_block_format(const uint8_t *buf, int size)
 {
-    int header_size = buf[0] * DSS_BLOCK_SIZE;
+    int header_size = dss_header_size(buf[0]);
 
     if (header_size + DSS_AUDIO_BLOCK_HEADER_SIZE > size)
         return -1;
@@ -93,7 +101,8 @@ static int dss_probe(const AVProbeData *p)
 
     /* DS2 files in SP, variable rate SP or LP mode carry exactly the DSS
      * payload; only the header is bigger. */
-    if (AV_RL32(p->buf) == MKTAG(0x3, 'd', 's', '2')) {
+    if (p->buf[0] >= 1 && p->buf[0] <= 16 &&
+        p->buf[1] == 'd' && p->buf[2] == 's' && p->buf[3] == '2') {
         format = dss_ds2_block_format(p->buf, p->buf_size);
         if (format == DSS_ACODEC_DSS_SP || format == DSS_ACODEC_DSS_SP_VR ||
             format == DSS_ACODEC_G723_1)
@@ -161,7 +170,7 @@ static int dss_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
 
     version = avio_r8(pb);
-    ctx->dss_header_size = version * DSS_BLOCK_SIZE;
+    ctx->dss_header_size = dss_header_size(version);
     avio_skip(pb, 2);
     is_ds2 = avio_r8(pb) == '2';
 
