@@ -1870,6 +1870,137 @@ static void fill_all_stream_timings(AVFormatContext *ic)
     }
 }
 
+typedef struct TailParser {
+    AVCodecParserContext *pc;
+    AVCodecContext *avctx;
+    int64_t next_dts;
+    int64_t end_pts;
+    int frame_size;
+} TailParser;
+
+static void tail_parsers_free(TailParser *tp, unsigned nb)
+{
+    for (unsigned i = 0; tp && i < nb; i++) {
+        av_parser_close(tp[i].pc);
+        avcodec_free_context(&tp[i].avctx);
+    }
+    av_free(tp);
+}
+
+static TailParser *tail_parsers_alloc(AVFormatContext *ic)
+{
+    TailParser *tp = av_calloc(ic->nb_streams, sizeof(*tp));
+
+    for (unsigned i = 0; tp && i < ic->nb_streams; i++) {
+        const AVStream *st = ic->streams[i];
+        const AVCodecParameters *par = st->codecpar;
+        const AVCodecContext *dec = cffstream(st)->avctx;
+
+        tp[i].next_dts = AV_NOPTS_VALUE;
+        tp[i].end_pts  = AV_NOPTS_VALUE;
+        if (!(par->codec_type == AVMEDIA_TYPE_AUDIO && par->sample_rate > 0) &&
+            par->codec_type != AVMEDIA_TYPE_VIDEO)
+            continue;
+        tp[i].frame_size = dec && dec->frame_size > 0 ? dec->frame_size
+                                                       : par->frame_size;
+        tp[i].pc = av_parser_init(par->codec_id);
+        if (!tp[i].pc)
+            continue;
+        tp[i].avctx = avcodec_alloc_context3(NULL);
+        if (!tp[i].avctx ||
+            avcodec_parameters_to_context(tp[i].avctx, par) < 0) {
+            av_parser_close(tp[i].pc);
+            tp[i].pc = NULL;
+        }
+    }
+    return tp;
+}
+
+static int64_t tail_frame_duration(AVFormatContext *ic, TailParser *tp,
+                                   AVStream *st)
+{
+    int num, den;
+
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        int samples = tp->pc->duration > 0 ? tp->pc->duration
+                                           : tp->frame_size;
+
+        if (samples <= 0)
+            return 0;
+        return av_rescale_q(samples,
+                            (AVRational){ 1, st->codecpar->sample_rate },
+                            st->time_base);
+    }
+    compute_frame_duration(ic, &num, &den, st, tp->pc, NULL);
+    if (!num || !den)
+        return 0;
+    return av_rescale_rnd(1, num * (int64_t)st->time_base.den,
+                          den * (int64_t)st->time_base.num, AV_ROUND_DOWN);
+}
+
+static int64_t tail_parse(AVFormatContext *ic, TailParser *tp, AVStream *st,
+                          const uint8_t *data, int size,
+                          int64_t pts, int64_t dts)
+{
+    int delay = st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ?
+                ffstream(st)->avctx->has_b_frames : 0;
+    int64_t end = AV_NOPTS_VALUE;
+
+    if (!tp->pc)
+        return AV_NOPTS_VALUE;
+    do {
+        uint8_t *out;
+        int out_size;
+        int len = av_parser_parse2(tp->pc, tp->avctx, &out, &out_size,
+                                   data, size, pts, dts, 0);
+
+        if (len < 0)
+            break;
+        pts = dts = AV_NOPTS_VALUE;
+        if (out_size) {
+            int64_t fpts = tp->pc->pts;
+            int64_t fdts = tp->pc->dts;
+            int64_t dur  = tail_frame_duration(ic, tp, st);
+
+            if (fdts == AV_NOPTS_VALUE)
+                fdts = fpts != AV_NOPTS_VALUE && !delay ? fpts : tp->next_dts;
+            if (fpts == AV_NOPTS_VALUE && !delay)
+                fpts = fdts;
+
+            if (dur > 0) {
+                if (fdts != AV_NOPTS_VALUE)
+                    tp->next_dts = fdts + dur;
+                if (fpts != AV_NOPTS_VALUE &&
+                    (tp->end_pts == AV_NOPTS_VALUE || fpts + dur > tp->end_pts))
+                    tp->end_pts = fpts + dur;
+                end = tp->end_pts;
+            }
+        }
+        if (!len && !out_size)
+            break;
+        data += len;
+        size -= len;
+    } while (size > 0);
+    return end;
+}
+
+static void update_end_duration(AVStream *st, int64_t end)
+{
+    FFStream *const sti = ffstream(st);
+    int64_t duration = end;
+
+    if (st->start_time != AV_NOPTS_VALUE)
+        duration -= st->start_time;
+    else
+        duration -= sti->first_dts;
+    if (duration > 0) {
+        if (st->duration == AV_NOPTS_VALUE || sti->info->last_duration<= 0 ||
+            (st->duration < duration && FFABS(duration - sti->info->last_duration) < 60LL*st->time_base.den / st->time_base.num))
+            st->duration = duration;
+        sti->info->last_duration = duration;
+    }
+}
+
 static void estimate_timings_from_bit_rate(AVFormatContext *ic)
 {
     FFFormatContext *const si = ffformatcontext(ic);
@@ -1939,6 +2070,8 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
     int is_end;
     int64_t filesize, offset, duration;
     int retry = 0;
+    TailParser *tp = NULL;
+    unsigned nb_tp = 0;
 
     /* flush packet queue */
     ff_flush_packet_queue(ic);
@@ -1976,6 +2109,8 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
 
         avio_seek(ic->pb, offset, SEEK_SET);
         read_size = 0;
+        tp = tail_parsers_alloc(ic);
+        nb_tp = ic->nb_streams;
         for (;;) {
             AVStream *st;
             FFStream *sti;
@@ -1993,6 +2128,14 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
             if (pkt->pts != AV_NOPTS_VALUE &&
                 (st->start_time != AV_NOPTS_VALUE ||
                  sti->first_dts != AV_NOPTS_VALUE)) {
+                int64_t end = tp && (unsigned)pkt->stream_index < nb_tp ?
+                              tail_parse(ic, &tp[pkt->stream_index], st,
+                                         pkt->data, pkt->size,
+                                         pkt->pts, pkt->dts) :
+                              AV_NOPTS_VALUE;
+
+                if (end != AV_NOPTS_VALUE)
+                    update_end_duration(st, end);
                 if (pkt->duration == 0) {
                     compute_frame_duration(ic, &num, &den, st, sti->parser, pkt);
                     if (den && num) {
@@ -2004,19 +2147,19 @@ static void estimate_timings_from_pts(AVFormatContext *ic, int64_t old_offset)
                 }
                 duration = pkt->pts + pkt->duration;
                 found_duration = 1;
-                if (st->start_time != AV_NOPTS_VALUE)
-                    duration -= st->start_time;
-                else
-                    duration -= sti->first_dts;
-                if (duration > 0) {
-                    if (st->duration == AV_NOPTS_VALUE || sti->info->last_duration<= 0 ||
-                        (st->duration < duration && FFABS(duration - sti->info->last_duration) < 60LL*st->time_base.den / st->time_base.num))
-                        st->duration = duration;
-                    sti->info->last_duration = duration;
-                }
+                update_end_duration(st, duration);
             }
             av_packet_unref(pkt);
         }
+        for (unsigned i = 0; tp && i < nb_tp; i++) {
+            int64_t end = tail_parse(ic, &tp[i], ic->streams[i], NULL, 0,
+                                     AV_NOPTS_VALUE, AV_NOPTS_VALUE);
+
+            if (end != AV_NOPTS_VALUE)
+                update_end_duration(ic->streams[i], end);
+        }
+        tail_parsers_free(tp, nb_tp);
+        tp = NULL;
 
         /* check if all audio/video streams have valid duration */
         if (!is_end) {
@@ -2081,6 +2224,33 @@ static const char *duration_estimate_name(enum AVDurationEstimationMethod method
     return duration_name[method];
 }
 
+static void fill_relative_start_times(AVFormatContext *ic)
+{
+    for (unsigned i = 0; i < ic->nb_streams; i++) {
+        const AVStream *const st = ic->streams[i];
+
+        if (st->start_time != AV_NOPTS_VALUE ||
+            cffstream(st)->first_dts != AV_NOPTS_VALUE)
+            return;
+    }
+
+    for (unsigned i = 0; i < ic->nb_streams; i++) {
+        AVStream *const st = ic->streams[i];
+        const FFStream *const sti = ffstream(st);
+        const AVCodecParameters *const par = st->codecpar;
+
+        if (par->codec_type != AVMEDIA_TYPE_AUDIO ||
+            !sti->codec_info_nb_frames ||
+            sti->cur_dts == AV_NOPTS_VALUE || !is_relative(sti->cur_dts))
+            continue;
+        st->start_time = 0;
+        if (par->sample_rate > 0)
+            st->start_time = av_rescale_q(sti->skip_samples,
+                                          (AVRational){ 1, par->sample_rate },
+                                          st->time_base);
+    }
+}
+
 static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
 {
     int64_t file_size;
@@ -2113,6 +2283,7 @@ static void estimate_timings(AVFormatContext *ic, int64_t old_offset)
         estimate_timings_from_bit_rate(ic);
         ic->duration_estimation_method = AVFMT_DURATION_FROM_BITRATE;
     }
+    fill_relative_start_times(ic);
     update_stream_timings(ic);
 
     for (unsigned i = 0; i < ic->nb_streams; i++) {

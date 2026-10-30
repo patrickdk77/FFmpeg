@@ -347,8 +347,11 @@ static int sbc_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         return frame_length;
 
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
-    avctx->ch_layout.nb_channels = sbc->frame.channels;
+    if (sbc->frame.mode == DUAL_CHANNEL) {
+        avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+        avctx->ch_layout.nb_channels = sbc->frame.channels;
+    } else
+        av_channel_layout_default(&avctx->ch_layout, sbc->frame.channels);
 
     frame->nb_samples = sbc->frame.blocks * sbc->frame.subbands;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)

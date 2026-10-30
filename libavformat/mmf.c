@@ -200,7 +200,7 @@ static int mmf_read_header(AVFormatContext *s)
     unsigned int tag;
     AVIOContext *pb = s->pb;
     AVStream *st;
-    int64_t size;
+    int64_t size, file_size;
     int rate, params;
 
     tag = avio_rl32(pb);
@@ -269,9 +269,17 @@ static int mmf_read_header(AVFormatContext *s)
     av_channel_layout_default(&st->codecpar->ch_layout, (params >> 7) + 1);
     st->codecpar->bits_per_coded_sample = 4;
     st->codecpar->bit_rate              = st->codecpar->sample_rate *
-                                          st->codecpar->bits_per_coded_sample;
+                                          st->codecpar->bits_per_coded_sample *
+                                          st->codecpar->ch_layout.nb_channels;
 
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
+    st->start_time = 0;
+    file_size = avio_size(pb);
+    if (file_size > 0)
+        size = FFMIN(size, file_size - avio_tell(pb));
+    if (size > 0)
+        st->duration = size * 8 / (st->codecpar->bits_per_coded_sample *
+                                   st->codecpar->ch_layout.nb_channels);
 
     return 0;
 }

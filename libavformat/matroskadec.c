@@ -48,6 +48,7 @@
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/time_internal.h"
 #include "libavutil/spherical.h"
@@ -3581,6 +3582,23 @@ static int matroska_read_header(AVFormatContext *s)
     matroska_add_index_entries(matroska);
 
     matroska_convert_tags(s);
+
+    for (i = 0; i < matroska->tracks.nb_elem; i++) {
+        MatroskaTrack *track = (MatroskaTrack *)matroska->tracks.elem + i;
+        AVStream *st = track->stream;
+        const AVDictionaryEntry *tag;
+        int64_t us, duration;
+
+        if (!st || st->duration != AV_NOPTS_VALUE)
+            continue;
+        tag = av_dict_get(st->metadata, "DURATION", NULL, AV_DICT_IGNORE_SUFFIX);
+        if (!tag || av_parse_time(&us, tag->value, 1) < 0 || us <= 0)
+            continue;
+        duration = av_rescale_q(us, AV_TIME_BASE_Q, st->time_base) -
+                   track->codec_delay_in_track_tb;
+        if (duration > 0)
+            st->duration = duration;
+    }
 
     res = matroska_parse_dovi_streams(s);
     if (res < 0)
