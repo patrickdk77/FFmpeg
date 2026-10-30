@@ -40,6 +40,9 @@ fate-dss-format1-duration: CMD = probe -show_entries stream=duration,nb_frames $
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-format1-format-sp
 fate-dss-format1-format-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1-format-sp.dss
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-format1-header-copy
+fate-dss-format1-header-copy: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1-header-copy.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-dss-lp
 fate-dss-lp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/lp.dss -frames 30 -af aresample
 
@@ -132,6 +135,9 @@ fate-ds2-format1-annot-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/d
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP, PIPE_PROTOCOL) += fate-ds2-format1-annot-main-pipe
 fate-ds2-format1-annot-main-pipe: CMD = cat $(SAMPLES)/ds2/olympus-format1-annot.ds2 | framecrc -extract main -i pipe:0
 fate-ds2-format1-annot-main-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-format1-annot-main
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-format1-header-copy
+fate-ds2-format1-header-copy: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-format1-header-copy.ds2
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp
 fate-ds2-lp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp.ds2 -af aresample
@@ -246,6 +252,9 @@ fate-ds2-qp-no-header: REF = Invalid data found when processing input
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-pause-block
 fate-ds2-qp-pause-block: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-pause-block.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-header-copy
+fate-ds2-qp-header-copy: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-header-copy.ds2
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-paused
 fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
