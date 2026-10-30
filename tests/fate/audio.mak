@@ -61,6 +61,10 @@ fate-dss-lp-format-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-lp-format
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-dss-lp-format4
 fate-dss-lp-format4: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-lp-format4.dss -af aresample
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-dss-lp-format4-pipe
+fate-dss-lp-format4-pipe: CMD = cat $(SAMPLES)/dss/olympus-lp-format4.dss | framecrc -i pipe:0 -af aresample
+fate-dss-lp-format4-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-lp-format4
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-no-header
 fate-dss-no-header: CMD = framecrc -f dss -i $(TARGET_SAMPLES)/dss/olympus-format1-no-header.dss ; test $$? -ne 0
 fate-dss-no-header: CMP = grep
@@ -72,28 +76,28 @@ fate-dss-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/sp.dss -frames 30
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-sp-empty56
 fate-dss-sp-empty56: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-empty56.dss
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-dss-sp-empty56-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-dss-sp-empty56-pipe
 fate-dss-sp-empty56-pipe: CMD = cat $(SAMPLES)/dss/olympus-sp-empty56.dss | framecrc -blocksize 7 -i pipe:0
 fate-dss-sp-empty56-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-sp-empty56
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-format1-noswap-prev-empty60
 fate-dss-format1-noswap-prev-empty60: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1-noswap-prev-empty60.dss
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-dss-format1-noswap-prev-empty60-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-dss-format1-noswap-prev-empty60-pipe
 fate-dss-format1-noswap-prev-empty60-pipe: CMD = cat $(SAMPLES)/dss/olympus-format1-noswap-prev-empty60.dss | framecrc -blocksize 7 -i pipe:0
 fate-dss-format1-noswap-prev-empty60-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-format1-noswap-prev-empty60
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-format1-hdr6-empty52
 fate-dss-format1-hdr6-empty52: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1-hdr6-empty52.dss
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-dss-format1-hdr6-empty52-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-dss-format1-hdr6-empty52-pipe
 fate-dss-format1-hdr6-empty52-pipe: CMD = cat $(SAMPLES)/dss/olympus-format1-hdr6-empty52.dss | framecrc -blocksize 7 -i pipe:0
 fate-dss-format1-hdr6-empty52-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-format1-hdr6-empty52
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-format1-noswap-prev4-empty62
 fate-dss-format1-noswap-prev4-empty62: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1-noswap-prev4-empty62.dss
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-dss-format1-noswap-prev4-empty62-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-dss-format1-noswap-prev4-empty62-pipe
 fate-dss-format1-noswap-prev4-empty62-pipe: CMD = cat $(SAMPLES)/dss/olympus-format1-noswap-prev4-empty62.dss | framecrc -blocksize 7 -i pipe:0
 fate-dss-format1-noswap-prev4-empty62-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-format1-noswap-prev4-empty62
 
@@ -113,6 +117,9 @@ FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-sp-byte3-none
 fate-dss-sp-byte3-none: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-byte3-none.dss ; test $$? -ne 0
 fate-dss-sp-byte3-none: CMP = grep
 fate-dss-sp-byte3-none: REF = Invalid data found when processing input
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-sp-byte3-mid
+fate-dss-sp-byte3-mid: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-byte3-mid.dss
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-sp-hdr0
 fate-dss-sp-hdr0: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr0.dss
@@ -141,14 +148,14 @@ fate-ds2-format1: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-format1.ds2
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-ds2-format1-annot-annotations
 fate-ds2-format1-annot-annotations: CMD = framecrc -extract annotations -i $(TARGET_SAMPLES)/ds2/olympus-format1-annot.ds2
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-ds2-format1-annot-annotations-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-ds2-format1-annot-annotations-pipe
 fate-ds2-format1-annot-annotations-pipe: CMD = cat $(SAMPLES)/ds2/olympus-format1-annot.ds2 | framecrc -extract annotations -i pipe:0
 fate-ds2-format1-annot-annotations-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-format1-annot-annotations
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-ds2-format1-annot-main
 fate-ds2-format1-annot-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-format1-annot.ds2
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-ds2-format1-annot-main-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-ds2-format1-annot-main-pipe
 fate-ds2-format1-annot-main-pipe: CMD = cat $(SAMPLES)/ds2/olympus-format1-annot.ds2 | framecrc -extract main -i pipe:0
 fate-ds2-format1-annot-main-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-format1-annot-main
 
@@ -161,14 +168,14 @@ fate-ds2-lp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp.ds2 -af aresampl
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-annot-annotations
 fate-ds2-lp-annot-annotations: CMD = framecrc -extract annotations -i $(TARGET_SAMPLES)/ds2/olympus-lp-annot.ds2 -af aresample
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-annot-annotations-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-annot-annotations-pipe
 fate-ds2-lp-annot-annotations-pipe: CMD = cat $(SAMPLES)/ds2/olympus-lp-annot.ds2 | framecrc -extract annotations -i pipe:0 -af aresample
 fate-ds2-lp-annot-annotations-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp-annot-annotations
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-annot-main
 fate-ds2-lp-annot-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-lp-annot.ds2 -af aresample
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-annot-main-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-annot-main-pipe
 fate-ds2-lp-annot-main-pipe: CMD = cat $(SAMPLES)/ds2/olympus-lp-annot.ds2 | framecrc -extract main -i pipe:0 -af aresample
 fate-ds2-lp-annot-main-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp-annot-main
 
@@ -278,7 +285,7 @@ fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-empty64
 fate-ds2-lp-empty64: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp-empty64.ds2 -af aresample
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-empty64-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-empty64-pipe
 fate-ds2-lp-empty64-pipe: CMD = cat $(SAMPLES)/ds2/olympus-lp-empty64.ds2 | framecrc -i pipe:0 -af aresample
 fate-ds2-lp-empty64-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp-empty64
 
@@ -320,14 +327,14 @@ fate-ds2-sp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-ds2-sp-annot-annotations
 fate-ds2-sp-annot-annotations: CMD = framecrc -extract annotations -i $(TARGET_SAMPLES)/ds2/olympus-sp-annot.ds2
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-ds2-sp-annot-annotations-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-ds2-sp-annot-annotations-pipe
 fate-ds2-sp-annot-annotations-pipe: CMD = cat $(SAMPLES)/ds2/olympus-sp-annot.ds2 | framecrc -extract annotations -i pipe:0
 fate-ds2-sp-annot-annotations-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-sp-annot-annotations
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-ds2-sp-annot-main
 fate-ds2-sp-annot-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-sp-annot.ds2
 
-FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-ds2-sp-annot-main-pipe
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, PIPE_PROTOCOL) += fate-ds2-sp-annot-main-pipe
 fate-ds2-sp-annot-main-pipe: CMD = cat $(SAMPLES)/ds2/olympus-sp-annot.ds2 | framecrc -extract main -i pipe:0
 fate-ds2-sp-annot-main-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-sp-annot-main
 
@@ -357,6 +364,35 @@ fate-ds2-sp-hdr1: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-hdr1.ds2
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-ds2-sp-hdr17
 fate-ds2-sp-hdr17: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-hdr17.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER) += fate-ds2-sp-qp
+fate-ds2-sp-qp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-qp.ds2 -af aresample=16000:tsf=s16p
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER) += fate-ds2-sp-qp-cut
+fate-ds2-sp-qp-cut: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-qp-cut.ds2 -af aresample=16000:tsf=s16p
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER) += fate-ds2-sp-qp-format3
+fate-ds2-sp-qp-format3: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-qp-format3.ds2 -af aresample=16000:tsf=s16p
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED) += fate-ds2-sp-qp-seek
+fate-ds2-sp-qp-seek: CMD = framecrc -ss 3 -i $(TARGET_SAMPLES)/ds2/olympus-sp-qp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-sp-qp-pipe
+fate-ds2-sp-qp-pipe: CMD = cat $(SAMPLES)/ds2/olympus-sp-qp.ds2 | framecrc -i pipe:0 -af aresample=16000:tsf=s16p
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-resync-past-end
+fate-ds2-qp-resync-past-end: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/qp-resync-past-end.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-qp-resync-past-end-pipe
+fate-ds2-qp-resync-past-end-pipe: CMD = cat $(SAMPLES)/ds2/qp-resync-past-end.ds2 | framecrc -f dss -i pipe:0 -af aresample
+fate-ds2-qp-resync-past-end-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp-resync-past-end
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER) += fate-ds2-qp7-lp-empty109
+fate-ds2-qp7-lp-empty109: CMD = framecrc -f dss -i $(TARGET_SAMPLES)/ds2/olympus-qp7-lp-empty109.ds2 -af aresample=16000:tsf=s16p
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_MIXED, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-qp7-lp-empty109-pipe
+fate-ds2-qp7-lp-empty109-pipe: CMD = cat $(SAMPLES)/ds2/olympus-qp7-lp-empty109.ds2 | framecrc -f dss -blocksize 7 -i pipe:0 -af aresample=16000:tsf=s16p
+fate-ds2-qp7-lp-empty109-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp7-lp-empty109
 
 FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DSS_DEMUXER) += fate-ds2-sp-tags
 fate-ds2-sp-tags: CMD = probetags $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
