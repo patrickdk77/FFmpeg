@@ -92,6 +92,9 @@ fate-dss-sp-byte3-none: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-byte3
 fate-dss-sp-byte3-none: CMP = grep
 fate-dss-sp-byte3-none: REF = Invalid data found when processing input
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-hdr0
+fate-dss-sp-hdr0: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr0.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-hdr1
 fate-dss-sp-hdr1: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr1.dss
 
