@@ -275,17 +275,23 @@ typedef struct GrundigSPContext {
     double deemph;                 /* de-emphasis memory                      */
 } GrundigSPContext;
 
-static av_cold int grundig_sp_decode_init(AVCodecContext *avctx)
+/* Bring the context back to what a newly opened decoder starts with. */
+static void grundig_sp_reset(AVCodecContext *avctx)
 {
     GrundigSPContext *p = avctx->priv_data;
 
+    memset(p, 0, sizeof(*p));
+}
+
+static av_cold int grundig_sp_decode_init(AVCodecContext *avctx)
+{
     av_channel_layout_uninit(&avctx->ch_layout);
     avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avctx->sample_fmt     = AV_SAMPLE_FMT_S16;
     if (!avctx->sample_rate)
         avctx->sample_rate = 12000;
 
-    memset(p, 0, sizeof(*p));
+    grundig_sp_reset(avctx);
     return 0;
 }
 
@@ -475,5 +481,6 @@ const FFCodec ff_grundig_sp_decoder = {
     .priv_data_size = sizeof(GrundigSPContext),
     .init           = grundig_sp_decode_init,
     FF_CODEC_DECODE_CB(grundig_sp_decode_frame),
+    .flush          = grundig_sp_reset,
     .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
 };
