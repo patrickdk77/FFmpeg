@@ -269,6 +269,21 @@ static void dss_skip_audio_header(AVFormatContext *s, AVPacket *pkt)
     ctx->counter += DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE;
 }
 
+static int dss_seek_block(AVFormatContext *s, int64_t pos)
+{
+    AVIOContext *pb = s->pb;
+    int ret;
+
+    if (avio_seek(pb, pos, SEEK_SET) < 0)
+        return AVERROR_EOF;
+    if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+        ret = ffio_ensure_seekback(pb, 2 * DSS_BLOCK_SIZE);
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
+
 /* Read `size` bytes of frame payload, stepping over any block header met on
  * the way. Block payloads are contiguous as far as the frames are concerned,
  * and a frame is short enough to straddle at most one boundary. */
@@ -312,15 +327,20 @@ static int dss_sp_next_block(AVFormatContext *s)
     DSSDemuxContext *ctx = s->priv_data;
     AVIOContext *pb = s->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+    int64_t block_pos = ctx->block_pos;
     int cont, ret;
 
     for (;;) {
         ctx->block_pos += DSS_BLOCK_SIZE;
-        if (avio_seek(pb, ctx->block_pos, SEEK_SET) < 0)
-            return AVERROR_EOF;
-        ret = ffio_read_size(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
-        if (ret < 0)
-            return ret;
+        if ((ret = dss_seek_block(s, ctx->block_pos)) < 0)
+            goto fail;
+        ret = avio_read(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+        if (ret < 0 && ret != AVERROR_EOF)
+            goto fail;
+        if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE) {
+            ret = AVERROR_EOF;
+            goto fail;
+        }
 
         ctx->swap = !!(header[0] & 0x80);
         cont      = 2 * header[1] + 2 * ctx->swap - DSS_AUDIO_BLOCK_HEADER_SIZE;
@@ -332,10 +352,17 @@ static int dss_sp_next_block(AVFormatContext *s)
 
         ctx->frames_left = header[2];
         if (avio_seek(pb, ctx->block_pos + DSS_AUDIO_BLOCK_HEADER_SIZE + cont,
-                      SEEK_SET) < 0)
-            return AVERROR_EOF;
+                      SEEK_SET) < 0) {
+            ret = AVERROR_EOF;
+            goto fail;
+        }
         return 0;
     }
+
+fail:
+    ctx->block_pos   = block_pos;
+    ctx->frames_left = 0;
+    return ret;
 }
 
 static void dss_sp_byte_swap(DSSDemuxContext *ctx, uint8_t *data)
