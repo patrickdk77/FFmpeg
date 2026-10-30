@@ -98,6 +98,9 @@ fate-dss-sp-hdr0: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr0.dss
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-hdr1
 fate-dss-sp-hdr1: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr1.dss
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-no-date
+fate-dss-sp-no-date: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-no-date.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-pause-block
 fate-dss-sp-pause-block: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-pause-block.dss
 
