@@ -33,7 +33,6 @@
 #define DS2_FORMAT_QP 6 /* Quality Play, 16000 Hz */
 #define DS2_FORMAT_QP7 7 /* QP with 12-byte noise frames, 16000 Hz */
 
-#define DS2_QP_FRAME_BITS 448
 #define DS2_QP_FRAME_SIZE 56         /* 448 bits = 56 bytes */
 #define DS2_QP_SAMPLES_PER_FRAME 256 /* 64 samples * 4 subframes */
 #define DS2_QP_SAMPLE_RATE 16000

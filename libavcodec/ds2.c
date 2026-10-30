@@ -54,9 +54,6 @@
 
 /* ---- Quantization tables (from DssDecoder.dll via hirparak/dss-codec) ---- */
 
-static const int ds2_qp_refl_cb_sizes[DS2_QP_NUM_REFL] = {
-    128, 128, 64, 64, 32, 32, 32, 32, 32, 16, 16, 16, 16, 8, 8, 8};
-
 static const int ds2_qp_refl_bits[DS2_QP_NUM_REFL] = {7, 7, 6, 6, 5, 5, 5, 5,
                                                       5, 4, 4, 4, 4, 3, 3, 3};
 
@@ -462,7 +459,6 @@ typedef struct DS2Subframe {
 } DS2Subframe;
 
 typedef struct DS2Context {
-  AVCodecContext *avctx;
   int variable;      /* QP7: frames start with a type bit */
 
   /* Per-frame decoded parameters */
@@ -689,7 +685,6 @@ static void ds2_reset_state(DS2Context *p) {
 
 static av_cold int ds2_decode_init(AVCodecContext *avctx) {
   DS2Context *p = avctx->priv_data;
-  p->avctx = avctx;
 
   avctx->sample_fmt = AV_SAMPLE_FMT_S16;
   av_channel_layout_uninit(&avctx->ch_layout);
