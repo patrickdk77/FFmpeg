@@ -155,9 +155,7 @@ static int dss_probe(const AVProbeData *p)
 {
     int format;
 
-    if (   AV_RL32(p->buf) == MKTAG(0x2, 'd', 's', 's')
-        || AV_RL32(p->buf) == MKTAG(0x3, 'd', 's', 's')
-        || AV_RL32(p->buf) == MKTAG(0x6, 'd', 's', 's'))
+    if (p->buf[1] == 'd' && p->buf[2] == 's' && p->buf[3] == 's')
         return AVPROBE_SCORE_MAX;
 
     /* DS2 files in SP, variable rate SP or LP mode carry exactly the DSS
@@ -326,7 +324,7 @@ static int dss_read_header(AVFormatContext *s)
     version = buf[0];
     is_ds2  = magic >> 24 == '2' || magic == DS2_ENCRYPTED_MAGIC;
     ctx->dss_header_size = is_ds2 ? dss_ds2_header_size(buf, ret)
-                                  : version * DSS_BLOCK_SIZE;
+                                  : FFMAX(version, 1) * DSS_BLOCK_SIZE;
 
     ctx->pb = s->pb;
     if (magic == DS2_ENCRYPTED_MAGIC) {
