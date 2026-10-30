@@ -40,7 +40,6 @@
 #define DSS_HEAD_OFFSET_END_TIME      0x32
 #define DSS_TIME_SIZE                 12
 
-#define DSS_HEAD_OFFSET_ACODEC        0x2a4
 #define DSS_ACODEC_DSS_SP             0x0    /* SP mode */
 #define DSS_ACODEC_DSS_SP_VR          0x1    /* SP mode, variable rate */
 #define DSS_ACODEC_G723_1             0x2    /* LP mode */
@@ -103,6 +102,17 @@ static int dss_block_frames(const uint8_t *header)
     if (header[2] || header[5] == 0xff)
         return header[2];
     return header[5];
+}
+
+static int dss_format_known(const uint8_t *header)
+{
+    if (header[3] != 0xff)
+        return 0;
+    switch (header[4]) {
+    case 0: case 1: case 2: case 4: case 6: case 7:
+        return 1;
+    }
+    return 0;
 }
 
 /* Frames that start in an audio block of the file being read. A Grundig block
@@ -260,7 +270,7 @@ static int dss_first_format(AVFormatContext *s)
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int64_t pos = ctx->dss_header_size, end = INT64_MAX;
-    int ret;
+    int ret, first = -1, held = 0;
 
     if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         end = pos + FFMAX(FFMIN(s->probesize, INT_MAX / 2),
@@ -279,10 +289,17 @@ static int dss_first_format(AVFormatContext *s)
             return ret;
         if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE)
             break;
-        if (dss_block_frames(header))
-            return header[4];
+        if (dss_block_frames(header)) {
+            if (dss_format_known(header))
+                return header[4];
+            if (first < 0 && header[3] == 0xff)
+                first = header[4];
+            held = 1;
+        }
     }
-    return DSS_ACODEC_DSS_SP;
+    if (first >= 0)
+        return first;
+    return held ? AVERROR_INVALIDDATA : DSS_ACODEC_DSS_SP;
 }
 
 static int dss_read_header(AVFormatContext *s)
@@ -303,6 +320,9 @@ static int dss_read_header(AVFormatContext *s)
     if (ret < 4)
         return ret < 0 ? ret : AVERROR_INVALIDDATA;
     magic   = AV_RL32(buf);
+    if (memcmp(buf + 1, "dss", 3) && memcmp(buf + 1, "ds2", 3) &&
+        magic != DS2_ENCRYPTED_MAGIC)
+        return AVERROR_INVALIDDATA;
     version = buf[0];
     is_ds2  = magic >> 24 == '2' || magic == DS2_ENCRYPTED_MAGIC;
     ctx->dss_header_size = is_ds2 ? dss_ds2_header_size(buf, ret)
@@ -340,16 +360,10 @@ static int dss_read_header(AVFormatContext *s)
             return ret;
     }
 
-    /* DS2 leaves the DSS codec field unset; each block header states it. */
-    if (is_ds2) {
-        format = dss_first_format(s);
-        if (format < 0)
-            return format;
-        ctx->audio_codec = format;
-    } else {
-        avio_seek(pb, DSS_HEAD_OFFSET_ACODEC, SEEK_SET);
-        ctx->audio_codec = avio_r8(pb);
-    }
+    format = dss_first_format(s);
+    if (format < 0)
+        return format;
+    ctx->audio_codec = format;
 
     if (version == DSS_GRUNDIG_VERSION && !is_ds2) {
         ctx->grundig = 1;

@@ -37,8 +37,19 @@ fate-dss-format1: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1.dss
 FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DSS_DEMUXER) += fate-dss-format1-duration
 fate-dss-format1-duration: CMD = probe -show_entries stream=duration,nb_frames $(TARGET_SAMPLES)/dss/olympus-format1.dss
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-format1-format-sp
+fate-dss-format1-format-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1-format-sp.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-dss-lp
 fate-dss-lp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/lp.dss -frames 30 -af aresample
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-dss-lp-format-sp
+fate-dss-lp-format-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-lp-format-sp.dss -af aresample
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-no-header
+fate-dss-no-header: CMD = framecrc -f dss -i $(TARGET_SAMPLES)/dss/olympus-format1-no-header.dss ; test $$? -ne 0
+fate-dss-no-header: CMP = grep
+fate-dss-no-header: REF = Invalid data found when processing input
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp
 fate-dss-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/sp.dss -frames 30
@@ -66,6 +77,20 @@ fate-dss-format1-hdr6-empty52-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-format1
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-grundig-sp
 fate-dss-grundig-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/grundig-sp.dss
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-empty-lp
+fate-dss-sp-empty-lp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-empty-lp.dss
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-format-ff
+fate-dss-sp-format-ff: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-format-ff.dss
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-format3-first
+fate-dss-sp-format3-first: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-format3-first.dss
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-byte3-none
+fate-dss-sp-byte3-none: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-byte3-none.dss ; test $$? -ne 0
+fate-dss-sp-byte3-none: CMP = grep
+fate-dss-sp-byte3-none: REF = Invalid data found when processing input
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-hdr1
 fate-dss-sp-hdr1: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr1.dss
