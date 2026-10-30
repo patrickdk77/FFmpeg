@@ -435,7 +435,7 @@ static uint64_t ds2_comb(int n, int k) {
  */
 static void ds2_decode_combinatorial(uint64_t index, int n, int k,
                                      int *positions) {
-  uint64_t remaining = index;
+  uint64_t remaining = FFMIN(index, ds2_comb(n, k) - 1);
   int i, v;
 
   for (i = k; i >= 1; i--) {
