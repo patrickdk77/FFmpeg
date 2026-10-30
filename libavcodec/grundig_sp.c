@@ -504,6 +504,9 @@ static int grundig_sp_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     int16_t *out;
     int ret, noise, size = GRUNDIG_FRAME_BYTES;
 
+    if (av_packet_get_side_data(avpkt, AV_PKT_DATA_DECODER_RESET, NULL))
+        grundig_sp_reset(avctx);
+
     /* In variable rate SP a clear first bit marks a short frame. */
     noise = p->variable_rate && avpkt->size && !(avpkt->data[0] & 0x80);
     if (noise)
