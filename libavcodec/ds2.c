@@ -6,9 +6,11 @@
  * @file
  * DS2 (DSS Pro) CELP audio decoder
  *
- * Supports one mode:
+ * Supports two modes:
  *   - QP mode: 16000 Hz, 16 reflection coefficients, 4x64-sample subframes,
  *              C(64,11) combinatorial codebook, 448-bit frames
+ *   - QP7 mode: QP with a type bit per frame; a 96-bit noise frame or a
+ *              448-bit QP frame, the last reflection coefficient in 2 bits
  *
  * The DSS demuxer reads DS2 SP and LP files, which dss_sp and g723_1 decode.
  *
@@ -37,13 +39,18 @@
 #define DS2_QP_SUBFRAME_SIZE 64
 #define DS2_QP_FRAME_SAMPLES (DS2_QP_SUBFRAME_SIZE * DS2_SUBFRAMES) /* 256 */
 #define DS2_QP_FRAME_SIZE 56 /* bytes per packet from demuxer */
-#define DS2_QP_FRAME_BITS 448
 #define DS2_QP_NUM_REFL 16
 #define DS2_QP_NUM_PULSES 11
 #define DS2_QP_COMB_N 64
 #define DS2_QP_COMB_BITS 40
 #define DS2_QP_PITCH_MIN 45
 #define DS2_QP_PITCH_MAX 300
+
+/* QP7 mode */
+#define DS2_QP7_FORMAT 7
+#define DS2_QP7_NOISE_FRAME_SIZE 12 /* 96 bits */
+#define DS2_QP7_LAST_REFL_BITS 2
+#define DS2_QP7_NOISE_GAIN_BITS 5
 
 /* ---- Quantization tables (from DssDecoder.dll via hirparak/dss-codec) ---- */
 
@@ -389,6 +396,17 @@ static const double ds2_qp_pulse_amp[8] = {
     -0.921705, -0.628998, -0.397315, -0.140886, 0.206959, 0.433678, 0.652927, 0.931249,
 };
 
+/* QP7 last reflection coefficient: 4 entries, 2-bit index */
+static const double ds2_qp7_refl_cb_last[4] = {
+    -0.18670480070000001, -0.043956328250000003, 0.053421623610000003, 0.172256036,
+};
+
+/* QP7 noise gain in 1/32768 units: 32 entries, 5-bit index */
+static const uint16_t ds2_qp7_noise_gain[32] = {
+    0, 5, 10, 15, 21, 28, 35, 42, 50, 59, 69, 79, 90, 102, 115, 129,
+    144, 160, 178, 197, 218, 240, 264, 290, 318, 348, 381, 417, 455, 496, 541, 589,
+};
+
 /* De-emphasis coefficient for QP mode */
 #define DS2_QP_DEEMPH_COEFF 0.1
 
@@ -445,16 +463,20 @@ typedef struct DS2Subframe {
 
 typedef struct DS2Context {
   AVCodecContext *avctx;
+  int variable;      /* QP7: frames start with a type bit */
 
   /* Per-frame decoded parameters */
   double refl_coeffs[DS2_QP_NUM_REFL];
   DS2Subframe sf[DS2_SUBFRAMES];
+  int noise_frame;
+  int noise_gain[DS2_SUBFRAMES];
 
   /* Persistent state */
   double lattice_state[DS2_QP_NUM_REFL]; /* lattice filter state */
   double pitch_memory[DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE];
   int pitch_mem_len;
   double deemph_state; /* QP de-emphasis */
+  uint16_t noise_seed; /* QP7 noise frames */
 
   /* Working buffers */
   double excitation[DS2_QP_SUBFRAME_SIZE];
@@ -483,17 +505,32 @@ static void ds2_swap_bytes(DS2Context *p, const uint8_t *src, int size) {
     p->bits[size - 1] = src[size - 1];
 }
 
-static void ds2_qp_unpack_frame(DS2Context *p, const uint8_t *src) {
+static void ds2_qp_unpack_frame(DS2Context *p, const uint8_t *src, int size) {
   GetBitContext gb;
   int i, sf_idx;
 
-  ds2_swap_bytes(p, src, DS2_QP_FRAME_SIZE);
-  init_get_bits(&gb, p->bits, DS2_QP_FRAME_BITS);
+  ds2_swap_bytes(p, src, size);
+  init_get_bits(&gb, p->bits, size * 8);
+
+  p->noise_frame = p->variable && !get_bits1(&gb);
 
   /* Reflection coefficients */
   for (i = 0; i < DS2_QP_NUM_REFL; i++) {
-    int idx = get_bits(&gb, ds2_qp_refl_bits[i]);
+    int idx;
+
+    if (p->variable && i == DS2_QP_NUM_REFL - 1) {
+      idx = get_bits(&gb, DS2_QP7_LAST_REFL_BITS);
+      p->refl_coeffs[i] = ds2_qp7_refl_cb_last[idx];
+      break;
+    }
+    idx = get_bits(&gb, ds2_qp_refl_bits[i]);
     p->refl_coeffs[i] = ds2_qp_refl_cb[i][idx];
+  }
+
+  if (p->noise_frame) {
+    for (sf_idx = 0; sf_idx < DS2_SUBFRAMES; sf_idx++)
+      p->noise_gain[sf_idx] = get_bits(&gb, DS2_QP7_NOISE_GAIN_BITS);
+    return;
   }
 
   /* Per-subframe parameters */
@@ -566,6 +603,19 @@ static void ds2_gen_excitation(DS2Context *p, int sf_idx, int subframe_size) {
 }
 
 /**
+ * Noise excitation for QP7 noise frames.
+ */
+static void ds2_gen_noise(DS2Context *p, int sf_idx, int subframe_size) {
+  int gain = ds2_qp7_noise_gain[p->noise_gain[sf_idx]];
+  int i;
+
+  for (i = 0; i < subframe_size; i++) {
+    p->noise_seed = p->noise_seed * 0x209 + 0x103;
+    p->excitation[i] = (int16_t)p->noise_seed * gain / 32768.0;
+  }
+}
+
+/**
  * Lattice synthesis filter.
  * Normalized form with reflection coefficients.
  */
@@ -634,12 +684,14 @@ static av_cold int ds2_decode_init(AVCodecContext *avctx) {
   avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
   /* The demuxer passes the block format in codec_tag. This decoder takes
-   * QP only. */
-  if (avctx->codec_tag != DS2_QP_FORMAT) {
+   * QP and QP7 only. */
+  if (avctx->codec_tag != DS2_QP_FORMAT &&
+      avctx->codec_tag != DS2_QP7_FORMAT) {
     avpriv_request_sample(avctx, "DS2 format %u", avctx->codec_tag);
     return AVERROR_PATCHWELCOME;
   }
 
+  p->variable = avctx->codec_tag == DS2_QP7_FORMAT;
   avctx->sample_rate = DS2_QP_SAMPLE_RATE;
 
   /* Initialize pitch memory */
@@ -657,13 +709,18 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   DS2Context *p = avctx->priv_data;
   const uint8_t *buf = avpkt->data;
   int buf_size = avpkt->size;
+  int frame_size = DS2_QP_FRAME_SIZE;
   int16_t *out;
   int ret, j, i;
 
-  if (buf_size < DS2_QP_FRAME_SIZE) {
+  /* The type bit is the top bit of the first byte in 16-bit word order */
+  if (p->variable && buf_size >= 2 && !(buf[1] & 0x80))
+    frame_size = DS2_QP7_NOISE_FRAME_SIZE;
+
+  if (buf_size < frame_size) {
     if (buf_size)
       av_log(avctx, AV_LOG_WARNING,
-             "Expected %d bytes, got %d - skipping packet.\n", DS2_QP_FRAME_SIZE,
+             "Expected %d bytes, got %d - skipping packet.\n", frame_size,
              buf_size);
     *got_frame_ptr = 0;
     return AVERROR_INVALIDDATA;
@@ -676,21 +733,26 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   out = (int16_t *)frame->data[0];
 
   /* Unpack frame parameters from bitstream */
-  ds2_qp_unpack_frame(p, buf);
+  ds2_qp_unpack_frame(p, buf, frame_size);
 
   /* Decode each subframe */
   for (j = 0; j < DS2_SUBFRAMES; j++) {
-    /* Generate adaptive excitation from pitch memory */
-    ds2_gen_adaptive_exc(p, p->sf[j].pitch_lag, DS2_QP_SUBFRAME_SIZE);
+    if (p->noise_frame) {
+      /* Noise does not enter the pitch memory */
+      ds2_gen_noise(p, j, DS2_QP_SUBFRAME_SIZE);
+    } else {
+      /* Generate adaptive excitation from pitch memory */
+      ds2_gen_adaptive_exc(p, p->sf[j].pitch_lag, DS2_QP_SUBFRAME_SIZE);
 
-    /* Generate fixed excitation from pulse codebook */
-    ds2_gen_fixed_exc(p, j, DS2_QP_SUBFRAME_SIZE);
+      /* Generate fixed excitation from pulse codebook */
+      ds2_gen_fixed_exc(p, j, DS2_QP_SUBFRAME_SIZE);
 
-    /* Combine: excitation = pitch_gain * adaptive + fixed */
-    ds2_gen_excitation(p, j, DS2_QP_SUBFRAME_SIZE);
+      /* Combine: excitation = pitch_gain * adaptive + fixed */
+      ds2_gen_excitation(p, j, DS2_QP_SUBFRAME_SIZE);
 
-    /* Update pitch memory */
-    ds2_update_pitch_memory(p, DS2_QP_SUBFRAME_SIZE);
+      /* Update pitch memory */
+      ds2_update_pitch_memory(p, DS2_QP_SUBFRAME_SIZE);
+    }
 
     /* Lattice synthesis filter */
     ds2_lattice_filter(p, DS2_QP_SUBFRAME_SIZE);
@@ -712,7 +774,7 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   }
 
   *got_frame_ptr = 1;
-  return DS2_QP_FRAME_SIZE;
+  return buf_size;
 }
 
 const FFCodec ff_ds2_decoder = {
