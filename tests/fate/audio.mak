@@ -260,6 +260,13 @@ fate-ds2-lp-empty64-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp-empty64
 FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DS2_DEMUXER) += fate-ds2-qp-resync-pos
 fate-ds2-qp-resync-pos: CMD = probe -show_entries packet=pts,pos -of compact $(TARGET_SAMPLES)/ds2/olympus-qp-resync.ds2
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7-empty64
+fate-ds2-qp7-empty64: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp7-empty64.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2, PIPE_PROTOCOL) += fate-ds2-qp7-empty64-pipe
+fate-ds2-qp7-empty64-pipe: CMD = cat $(SAMPLES)/ds2/olympus-qp7-empty64.ds2 | framecrc -i pipe:0
+fate-ds2-qp7-empty64-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp7-empty64
+
 FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DS2_DEMUXER) += fate-ds2-qp-paused-duration
 fate-ds2-qp-paused-duration: CMD = probe -show_entries stream=duration,nb_frames $(TARGET_SAMPLES)/ds2/paused-qp.ds2
 
@@ -274,6 +281,9 @@ fate-ds2-qp-tail-start: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-tail-
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7
 fate-ds2-qp7: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp7.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7-empty-lp
+fate-ds2-qp7-empty-lp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp7-empty-lp.ds2
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp7-extract-main
 fate-ds2-qp7-extract-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-qp7.ds2
