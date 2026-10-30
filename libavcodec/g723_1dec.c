@@ -953,7 +953,7 @@ static int g723_1_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     int16_t lpc[SUBFRAMES * LPC_ORDER];
     int16_t acb_vector[SUBFRAME_LEN];
     int16_t *out;
-    int bad_frame = 0, i, j, ret;
+    int i, j, ret;
 
     if (av_packet_get_side_data(avpkt, AV_PKT_DATA_DECODER_RESET, NULL))
         g723_1_reset(avctx);
@@ -974,6 +974,7 @@ static int g723_1_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     for (int ch = 0; ch < channels; ch++) {
         G723_1_ChannelContext *p = &s->ch[ch];
         int16_t *audio = p->audio;
+        int bad_frame = 0;
 
         if (unpack_bitstream(p, buf + ch * (buf_size / channels),
                              buf_size / channels) < 0) {
