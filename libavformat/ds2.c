@@ -277,7 +277,7 @@ static int ds2_read_header(AVFormatContext *s) {
   AVStream *st;
   uint8_t block_header[DS2_AUDIO_BLOCK_HEADER_SIZE];
   uint8_t file_magic[DS2_BLOCK_SIZE + 4];
-  int ret, frame_count, cont_size, blk_swap, samples_per_frame;
+  int ret, samples_per_frame;
   int64_t ret64;
 
   if ((ret64 = avio_seek(pb, 0, SEEK_SET)) < 0)
@@ -359,18 +359,13 @@ static int ds2_read_header(AVFormatContext *s) {
     st->codecpar->bit_rate = (int)s->bit_rate;
   }
 
-  blk_swap    = block_header[0] >> 7;
-  frame_count = ds2_block_frames(block_header);
-  cont_size   = FFMAX(0, 2 * block_header[1] + 2 * blk_swap -
-                           DS2_AUDIO_BLOCK_HEADER_SIZE);
-
+  /* Let the first read load the block: a file cut out of a longer recording
+   * can start with the tail of a frame, before the block's anchor. */
+  if ((ret64 = avio_seek(pb, ctx->header_size, SEEK_SET)) < 0)
+    return (int)ret64;
   ctx->frames_read = 0;
-  ctx->blk_frames  = frame_count;
-
-  if (frame_count == 0)
-    ctx->counter = cont_size;
-  else
-    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+  ctx->counter     = 0;
+  ctx->blk_frames  = 0;
 
   return 0;
 }
@@ -466,7 +461,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   DS2DemuxContext *ctx = s->priv_data;
   int64_t ret, seekto;
   uint8_t header[DS2_AUDIO_BLOCK_HEADER_SIZE];
-  int frame_count, cont_size, blk_swap;
+  int frame_count;
 
   if (ctx->format_type == DS2_FORMAT_QP7) {
     /* Frame sizes vary, so find the block from the per-block frame counts */
@@ -505,22 +500,11 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   if (ret < 0)
     return ret;
 
-  ret = avio_read(s->pb, header, DS2_AUDIO_BLOCK_HEADER_SIZE);
-  if (ret < DS2_AUDIO_BLOCK_HEADER_SIZE)
-    return ret < 0 ? ret : AVERROR_EOF;
-
-  blk_swap    = header[0] >> 7;
-  frame_count = ds2_block_frames(header);
-  cont_size   = FFMAX(0, 2 * header[1] + 2 * blk_swap -
-                           DS2_AUDIO_BLOCK_HEADER_SIZE);
-
+  /* The next read loads this block and starts at its anchor, skipping the
+   * tail of a frame that began in the previous block. */
   ctx->frames_read = timestamp / DS2_QP_SAMPLES_PER_FRAME;
-  ctx->blk_frames  = frame_count;
-
-  if (frame_count == 0)
-    ctx->counter = cont_size;
-  else
-    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+  ctx->counter     = 0;
+  ctx->blk_frames  = 0;
 
   return 0;
 }
