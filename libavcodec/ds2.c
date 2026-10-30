@@ -675,6 +675,18 @@ static void ds2_qp_deemphasis_frame(DS2Context *p, double *samples, int size) {
 
 /* ---- Main decode entry points ---- */
 
+/**
+ * Reset the state carried from frame to frame to that of a new decoder.
+ */
+static void ds2_reset_state(DS2Context *p) {
+  memset(p->pitch_memory, 0, sizeof(p->pitch_memory));
+  p->pitch_mem_len = DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE;
+
+  memset(p->lattice_state, 0, sizeof(p->lattice_state));
+  p->deemph_state = 0.0;
+  p->noise_seed = 0;
+}
+
 static av_cold int ds2_decode_init(AVCodecContext *avctx) {
   DS2Context *p = avctx->priv_data;
   p->avctx = avctx;
@@ -694,14 +706,13 @@ static av_cold int ds2_decode_init(AVCodecContext *avctx) {
   p->variable = avctx->codec_tag == DS2_QP7_FORMAT;
   avctx->sample_rate = DS2_QP_SAMPLE_RATE;
 
-  /* Initialize pitch memory */
-  memset(p->pitch_memory, 0, sizeof(p->pitch_memory));
-  p->pitch_mem_len = DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE;
-
-  memset(p->lattice_state, 0, sizeof(p->lattice_state));
-  p->deemph_state = 0.0;
+  ds2_reset_state(p);
 
   return 0;
+}
+
+static void ds2_decode_flush(AVCodecContext *avctx) {
+  ds2_reset_state(avctx->priv_data);
 }
 
 static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
@@ -785,5 +796,6 @@ const FFCodec ff_ds2_decoder = {
     .priv_data_size = sizeof(DS2Context),
     .init = ds2_decode_init,
     FF_CODEC_DECODE_CB(ds2_decode_frame),
+    .flush = ds2_decode_flush,
     .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
 };
