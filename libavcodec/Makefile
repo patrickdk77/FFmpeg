@@ -349,6 +349,7 @@ OBJS-$(CONFIG_DSD_LSBF_PLANAR_DECODER) += dsddec.o dsd.o
 OBJS-$(CONFIG_DSD_MSBF_PLANAR_DECODER) += dsddec.o dsd.o
 OBJS-$(CONFIG_DSICINAUDIO_DECODER)     += dsicinaudio.o
 OBJS-$(CONFIG_DSICINVIDEO_DECODER)     += dsicinvideo.o
+OBJS-$(CONFIG_DSS_MIXED_DECODER)       += dss_mixed.o
 OBJS-$(CONFIG_DSS_SP_DECODER)          += dss_sp.o
 OBJS-$(CONFIG_DS2_DECODER)             += ds2.o
 OBJS-$(CONFIG_DST_DECODER)             += dstdec.o dsd.o

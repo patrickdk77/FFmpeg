@@ -3571,6 +3571,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .long_name = NULL_IF_CONFIG_SMALL("Grundig DSS-SP (Digta CELP)"),
         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
     },
+    {
+        .id        = AV_CODEC_ID_DSS_MIXED,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "dss_mixed",
+        .long_name = NULL_IF_CONFIG_SMALL("DSS/DS2 with changing block formats"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+    },
 
     /* subtitle codecs */
     {
