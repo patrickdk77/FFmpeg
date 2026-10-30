@@ -33,6 +33,7 @@
 #define DS2_FORMAT_SP 0 /* Standard Play, read by the DSS demuxer */
 #define DS2_FORMAT_SP_VR 1 /* variable rate SP, read by the DSS demuxer */
 #define DS2_FORMAT_LP 2 /* Long Play (G.723.1), read by the DSS demuxer */
+#define DS2_FORMAT_LP_ALT 4 /* LP, read by the DSS demuxer */
 #define DS2_FORMAT_QP 6 /* Quality Play, 16000 Hz */
 #define DS2_FORMAT_QP7 7 /* QP with 12-byte noise frames, 16000 Hz */
 
@@ -113,7 +114,7 @@ static int ds2_probe(const AVProbeData *p) {
   if (format < 0)
     return AVPROBE_SCORE_RETRY;
   if (format == DS2_FORMAT_SP || format == DS2_FORMAT_SP_VR ||
-      format == DS2_FORMAT_LP)
+      format == DS2_FORMAT_LP || format == DS2_FORMAT_LP_ALT)
     return 0;
 
   return AVPROBE_SCORE_MAX;
@@ -366,7 +367,8 @@ static int ds2_read_header(AVFormatContext *s) {
 
   if (ctx->format_type == DS2_FORMAT_SP ||
       ctx->format_type == DS2_FORMAT_SP_VR ||
-      ctx->format_type == DS2_FORMAT_LP) {
+      ctx->format_type == DS2_FORMAT_LP ||
+      ctx->format_type == DS2_FORMAT_LP_ALT) {
     av_log(s, AV_LOG_ERROR, "DS2 SP and LP files are read by the dss demuxer\n");
     return AVERROR_INVALIDDATA;
   } else if (ctx->format_type == DS2_FORMAT_QP ||

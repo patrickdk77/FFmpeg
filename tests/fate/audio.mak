@@ -46,6 +46,9 @@ fate-dss-lp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/lp.dss -frames 30 -af aresa
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-dss-lp-format-sp
 fate-dss-lp-format-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-lp-format-sp.dss -af aresample
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-dss-lp-format4
+fate-dss-lp-format4: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-lp-format4.dss -af aresample
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-no-header
 fate-dss-no-header: CMD = framecrc -f dss -i $(TARGET_SAMPLES)/dss/olympus-format1-no-header.dss ; test $$? -ne 0
 fate-dss-no-header: CMP = grep
@@ -153,6 +156,9 @@ fate-ds2-lp-duration: CMD = probe -show_entries stream=duration,nb_frames $(TARG
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-extract-main
 fate-ds2-lp-extract-main: CMD = framecrc -extract main -i $(TARGET_SAMPLES)/ds2/olympus-lp.ds2 -af aresample
 fate-ds2-lp-extract-main: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-format4
+fate-ds2-lp-format4: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp-format4.ds2 -af aresample
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp
 fate-ds2-qp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
