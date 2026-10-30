@@ -391,6 +391,14 @@ enum AVPacketSideDataType {
     AV_PKT_DATA_GAIN_MAP_PARAMS,
 
     /**
+     * Decode this packet as a newly opened decoder would, without the state
+     * that earlier packets left. A demuxer sets this on the first packet
+     * after a part of the stream it skipped. There is no payload. Decoders
+     * that keep no state from packet to packet ignore it.
+     */
+    AV_PKT_DATA_DECODER_RESET,
+
+    /**
      * The number of side data types.
      * This is not part of the public API/ABI in the sense that it may
      * change when new side data types are added.

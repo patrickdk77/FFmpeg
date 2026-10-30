@@ -42,3 +42,4 @@
 41: hdr_smpte_2094_app5
 42: hevc_conf
 43: gain_map_params
+44: decoder_reset
