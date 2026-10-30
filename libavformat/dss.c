@@ -73,15 +73,25 @@ static int dss_block_frames(const uint8_t *header)
     return header[5];
 }
 
-/* Format byte of the first audio block of a DS2 file, or -1 if the probe
- * buffer does not reach it. */
-static int dss_ds2_block_format(const uint8_t *buf, int size)
+/* Header size of a DS2 file from the first byte, in 512-byte blocks. Philips
+ * SpeechExec writes 1 in the DS2 files it splits out of a recording, over the
+ * usual 3 blocks; Olympus writes 1 over 1 block, followed by an audio block. */
+static int dss_ds2_header_size(const uint8_t *buf, int size)
 {
-    int header_size = buf[0] * DSS_BLOCK_SIZE;
+    if (buf[0] == 1 && (size < DSS_BLOCK_SIZE + 4 ||
+                        buf[DSS_BLOCK_SIZE + 3] != 0xff))
+        return 3 * DSS_BLOCK_SIZE;
+    return buf[0] * DSS_BLOCK_SIZE;
+}
 
-    if (header_size + DSS_AUDIO_BLOCK_HEADER_SIZE > size)
-        return -1;
-    return buf[header_size + 4];
+static int dss_probe_format(const uint8_t *buf, int size, int pos)
+{
+    while (pos + DSS_AUDIO_BLOCK_HEADER_SIZE <= size) {
+        if (dss_block_frames(buf + pos))
+            return buf[pos + 4];
+        pos += DSS_BLOCK_SIZE;
+    }
+    return -1;
 }
 
 static int dss_probe(const AVProbeData *p)
@@ -94,8 +104,10 @@ static int dss_probe(const AVProbeData *p)
 
     /* DS2 files in SP, variable rate SP or LP mode carry exactly the DSS
      * payload; only the header is bigger. */
-    if (AV_RL32(p->buf) == MKTAG(0x3, 'd', 's', '2')) {
-        format = dss_ds2_block_format(p->buf, p->buf_size);
+    if (p->buf[0] &&
+        p->buf[1] == 'd' && p->buf[2] == 's' && p->buf[3] == '2') {
+        format = dss_probe_format(p->buf, p->buf_size,
+                                  dss_ds2_header_size(p->buf, p->buf_size));
         if (format == DSS_ACODEC_DSS_SP || format == DSS_ACODEC_DSS_SP_VR ||
             format == DSS_ACODEC_G723_1)
             return AVPROBE_SCORE_MAX;
@@ -185,6 +197,7 @@ static int dss_read_header(AVFormatContext *s)
     DSSDemuxContext *ctx = s->priv_data;
     AVIOContext *pb = s->pb;
     AVStream *st;
+    uint8_t buf[DSS_BLOCK_SIZE + 4];
     int64_t ret64;
     int ret, version, is_ds2, format;
 
@@ -192,10 +205,13 @@ static int dss_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    version = avio_r8(pb);
-    ctx->dss_header_size = version * DSS_BLOCK_SIZE;
-    avio_skip(pb, 2);
-    is_ds2 = avio_r8(pb) == '2';
+    ret = avio_read(pb, buf, sizeof(buf));
+    if (ret < 4)
+        return ret < 0 ? ret : AVERROR_INVALIDDATA;
+    version = buf[0];
+    is_ds2  = buf[3] == '2';
+    ctx->dss_header_size = is_ds2 ? dss_ds2_header_size(buf, ret)
+                                  : version * DSS_BLOCK_SIZE;
 
     /* A DS2 header can leave the recording date zeroed, which does not
      * parse. The audio does not depend on these fields, so in a DS2 file a
