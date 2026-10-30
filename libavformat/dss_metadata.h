@@ -37,4 +37,37 @@ void ff_dss_trim_string(char *s, int size);
  */
 int ff_dss_read_ds2_metadata(AVFormatContext *s);
 
+#define DS2_MAX_ANNOTATIONS 32
+
+enum DS2ExtractMode {
+    DS2_EXTRACT_ALL = 0,
+    DS2_EXTRACT_MAIN,
+    DS2_EXTRACT_ANNOTATIONS,
+};
+
+typedef struct DS2AnnotationRange {
+    int first_frame; /* inclusive */
+    int last_frame;  /* exclusive */
+} DS2AnnotationRange;
+
+typedef struct DS2Annotations {
+    DS2AnnotationRange range[DS2_MAX_ANNOTATIONS];
+    int nb;
+} DS2Annotations;
+
+/**
+ * Read the annotations of a DS2 file header as ranges of frames of frame_ms
+ * ms each. A header of header_size bytes that does not reach the table has
+ * none.
+ */
+int ff_dss_read_ds2_annotations(AVFormatContext *s, int header_size,
+                                int frame_ms, DS2Annotations *ann);
+
+/**
+ * Whether frame number frame of the recording is returned in the
+ * DS2ExtractMode extract.
+ */
+int ff_dss_ds2_frame_included(const DS2Annotations *ann, int extract,
+                              int64_t frame);
+
 #endif /* AVFORMAT_DSS_METADATA_H */

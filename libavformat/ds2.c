@@ -54,6 +54,9 @@ typedef struct DS2DemuxContext {
   AVIOContext *pb;      /* s->pb, or decrypt_pb in an encrypted file */
   AVIOContext *decrypt_pb;
   char *password;
+  int extract;          /* DS2ExtractMode */
+  int64_t frames_out;   /* frames returned so far */
+  DS2Annotations annotations;
 } DS2DemuxContext;
 
 #define OFFSET(x) offsetof(DS2DemuxContext, x)
@@ -114,6 +117,16 @@ static int ds2_probe(const AVProbeData *p) {
     return 0;
 
   return AVPROBE_SCORE_MAX;
+}
+
+static int64_t ds2_qp_count_output_frames(const DS2DemuxContext *ctx) {
+  int64_t f, n = 0;
+
+  for (f = 0; f < ctx->total_frames; f++) {
+    if (ff_dss_ds2_frame_included(&ctx->annotations, ctx->extract, f))
+      n++;
+  }
+  return n;
 }
 
 /*
@@ -302,7 +315,7 @@ static int ds2_read_header(AVFormatContext *s) {
   uint8_t block_header[DS2_AUDIO_BLOCK_HEADER_SIZE];
   uint8_t file_magic[DS2_BLOCK_SIZE + 4];
   int ret, samples_per_frame;
-  int64_t ret64;
+  int64_t ret64, out_frames;
 
   if ((ret64 = avio_seek(pb, 0, SEEK_SET)) < 0)
     return (int)ret64;
@@ -360,15 +373,28 @@ static int ds2_read_header(AVFormatContext *s) {
              ctx->format_type == DS2_FORMAT_QP7) {
     st->codecpar->sample_rate = DS2_QP_SAMPLE_RATE;
     samples_per_frame = DS2_QP_SAMPLES_PER_FRAME;
+
+    ret = ff_dss_read_ds2_annotations(s, ctx->header_size,
+                                      DS2_QP_SAMPLES_PER_FRAME * 1000 /
+                                      DS2_QP_SAMPLE_RATE, &ctx->annotations);
+    if (ret < 0)
+      return ret;
+    if (ctx->extract == DS2_EXTRACT_ANNOTATIONS && !ctx->annotations.nb)
+      av_log(s, AV_LOG_WARNING, "No annotations to extract\n");
   } else {
     avpriv_request_sample(s, "DS2 format type %d", ctx->format_type);
     return AVERROR_PATCHWELCOME;
   }
 
+  out_frames = ctx->extract == DS2_EXTRACT_ALL ? ctx->total_frames
+                                               : ds2_qp_count_output_frames(ctx);
+
   avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
   st->start_time = 0;
-  if (ctx->total_frames > 0) {
-    int64_t nb_samples = (int64_t)ctx->total_frames * samples_per_frame;
+  if (out_frames > 0) {
+    int64_t nb_samples = (int64_t)out_frames * samples_per_frame;
+    int64_t total_duration = av_rescale(ctx->total_frames * samples_per_frame,
+                                        AV_TIME_BASE, st->codecpar->sample_rate);
     int frame_bytes = DS2_QP_FRAME_SIZE;
     int64_t file_size = avio_size(pb);
 
@@ -376,8 +402,8 @@ static int ds2_read_header(AVFormatContext *s) {
     s->duration  = av_rescale_q(nb_samples, (AVRational){1, st->codecpar->sample_rate},
                                 AV_TIME_BASE_Q);
 
-    if (file_size > ctx->header_size && s->duration > 0)
-      s->bit_rate = (file_size - ctx->header_size) * 8LL * AV_TIME_BASE / s->duration;
+    if (file_size > ctx->header_size && total_duration > 0)
+      s->bit_rate = (file_size - ctx->header_size) * 8LL * AV_TIME_BASE / total_duration;
     else
       s->bit_rate = 8LL * frame_bytes * st->codecpar->sample_rate / samples_per_frame;
 
@@ -389,13 +415,14 @@ static int ds2_read_header(AVFormatContext *s) {
   if ((ret64 = avio_seek(pb, ctx->header_size, SEEK_SET)) < 0)
     return (int)ret64;
   ctx->frames_read = 0;
+  ctx->frames_out  = 0;
   ctx->counter     = 0;
   ctx->blk_frames  = 0;
 
   return 0;
 }
 
-static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
+static int ds2_qp_read_frame(AVFormatContext *s, AVPacket *pkt) {
   DS2DemuxContext *ctx = s->priv_data;
   int ret, offset = 0;
 
@@ -482,6 +509,29 @@ truncated:
   return 0;
 }
 
+static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
+  DS2DemuxContext *ctx = s->priv_data;
+  int ret, skipped = 0;
+
+  for (;;) {
+    ret = ds2_qp_read_frame(s, pkt);
+    if (ret < 0)
+      return ret;
+
+    if (ff_dss_ds2_frame_included(&ctx->annotations, ctx->extract,
+                                  ctx->frames_read - 1)) {
+      pkt->pts = ctx->frames_out++ * DS2_QP_SAMPLES_PER_FRAME;
+      if (skipped &&
+          !av_packet_new_side_data(pkt, AV_PKT_DATA_DECODER_RESET, 0))
+        return AVERROR(ENOMEM);
+      return 0;
+    }
+
+    av_packet_unref(pkt);
+    skipped = 1;
+  }
+}
+
 static int ds2_read_seek(AVFormatContext *s, int stream_index,
                          int64_t timestamp, int flags) {
   DS2DemuxContext *ctx = s->priv_data;
@@ -492,6 +542,20 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
 
   if (target < 0)
     target = 0;
+
+  /* With extract, timestamps count the frames returned: find the frame of
+   * the file that the target is, or past the end the last one returned. */
+  if (ctx->extract != DS2_EXTRACT_ALL) {
+    int64_t out = target, f;
+
+    for (f = target = 0; f < ctx->total_frames; f++) {
+      if (!ff_dss_ds2_frame_included(&ctx->annotations, ctx->extract, f))
+        continue;
+      target = f;
+      if (!out--)
+        break;
+    }
+  }
 
   /* Find the block in which the target frame starts, or past the end the
    * last block that holds frames. */
@@ -521,6 +585,10 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   if (ret < 0)
     return ret;
   ctx->frames_read = frames;
+  ctx->frames_out  = 0;
+  for (frames = 0; frames < ctx->frames_read; frames++)
+    ctx->frames_out += ff_dss_ds2_frame_included(&ctx->annotations,
+                                                 ctx->extract, frames);
   ctx->counter     = 0;
   ctx->blk_frames  = 0;
 
@@ -537,6 +605,16 @@ static int ds2_read_close(AVFormatContext *s) {
 static const AVOption ds2_options[] = {
     { "password", "Decryption password for encrypted DS2 (max 16 bytes)",
       OFFSET(password), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { "extract", "select DS2 recording content to demux",
+      OFFSET(extract), AV_OPT_TYPE_INT,
+      { .i64 = DS2_EXTRACT_ALL }, DS2_EXTRACT_ALL, DS2_EXTRACT_ANNOTATIONS,
+      DEC, .unit = "extract" },
+    { "all", "full recording in original order", 0, AV_OPT_TYPE_CONST,
+      { .i64 = DS2_EXTRACT_ALL }, 0, 0, DEC, .unit = "extract" },
+    { "main", "main dictation only (skip annotations)", 0, AV_OPT_TYPE_CONST,
+      { .i64 = DS2_EXTRACT_MAIN }, 0, 0, DEC, .unit = "extract" },
+    { "annotations", "annotation segments only", 0, AV_OPT_TYPE_CONST,
+      { .i64 = DS2_EXTRACT_ANNOTATIONS }, 0, 0, DEC, .unit = "extract" },
     { NULL },
 };
 
