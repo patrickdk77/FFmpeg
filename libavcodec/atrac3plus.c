@@ -31,13 +31,13 @@
 #include "atrac3plus.h"
 #include "atrac3plus_data.h"
 
-static VLCElem tables_data[154276];
+static VLCElem tables_data[154276 + 128 + 128 + 32];
 static VLC wl_vlc_tabs[4];
 static VLC sf_vlc_tabs[8];
 static VLC ct_vlc_tabs[4];
 static VLC spec_vlc_tabs[112];
 static VLC gain_vlc_tabs[11];
-static VLC tone_vlc_tabs[7];
+static VLC tone_vlc_tabs[10];
 
 /**
  * Generate canonical VLC table from given descriptor.
@@ -109,7 +109,7 @@ av_cold void ff_atrac3p_init_vlcs(void)
 
     /* build huffman tables for tone decoding */
     xlats = atrac3p_tone_xlats;
-    for (i = 0; i < 7; i++)
+    for (i = 0; i < 10; i++)
         build_canonical_huff(atrac3p_tone_cbs[i], &xlats,
                              &tab_offset, &tone_vlc_tabs[i]);
 }
@@ -1464,6 +1464,47 @@ static void decode_tones_frequency(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
 }
 
 /**
+ * Find the wave of the master channel each slave wave refers to.
+ *
+ * @param[in]     ctx               ptr to the channel unit context
+ * @param[in]     ch_num            channel to process
+ * @param[in]     band_has_tones    ptr to an array of per-band-flags:
+ *                                  1 - tone data present
+ * @param[out]    refwaves          receives the reference wave indexes, -1 for none
+ */
+static void get_ref_waves(Atrac3pChanUnitCtx *ctx, int ch_num,
+                          int band_has_tones[], int refwaves[48])
+{
+    int sb, j, i, diff, maxdiff, fi;
+    Atrac3pWaveParam *wsrc, *wref;
+    Atrac3pWavesData *dst = ctx->channels[ch_num].tones_info;
+    Atrac3pWavesData *ref = ctx->channels[0].tones_info;
+
+    for (sb = 0; sb < ctx->waves_info->num_tone_bands; sb++) {
+        if (!band_has_tones[sb] || !dst[sb].num_wavs)
+            continue;
+        wsrc = &ctx->waves_info->waves[dst[sb].start_index];
+        wref = &ctx->waves_info->waves[ref[sb].start_index];
+        for (j = 0; j < dst[sb].num_wavs; j++) {
+            for (i = 0, fi = 0, maxdiff = 1024; i < ref[sb].num_wavs; i++) {
+                diff = FFABS(wsrc[j].freq_index - wref[i].freq_index);
+                if (diff < maxdiff) {
+                    maxdiff = diff;
+                    fi      = i;
+                }
+            }
+
+            if (maxdiff < 8)
+                refwaves[dst[sb].start_index + j] = fi + ref[sb].start_index;
+            else if (j < ref[sb].num_wavs)
+                refwaves[dst[sb].start_index + j] = j + ref[sb].start_index;
+            else
+                refwaves[dst[sb].start_index + j] = -1;
+        }
+    }
+}
+
+/**
  * Decode amplitude information for each subband of a channel.
  *
  * @param[in]     gb                the GetBit context
@@ -1475,36 +1516,13 @@ static void decode_tones_frequency(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
 static void decode_tones_amplitude(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
                                    int ch_num, int band_has_tones[])
 {
-    int mode, sb, j, i, diff, maxdiff, fi, delta, pred;
-    Atrac3pWaveParam *wsrc, *wref;
+    int mode, sb, i, delta, pred;
     int refwaves[48] = { 0 };
     Atrac3pWavesData *dst = ctx->channels[ch_num].tones_info;
-    Atrac3pWavesData *ref = ctx->channels[0].tones_info;
+    Atrac3pWaveParam *w;
 
-    if (ch_num) {
-        for (sb = 0; sb < ctx->waves_info->num_tone_bands; sb++) {
-            if (!band_has_tones[sb] || !dst[sb].num_wavs)
-                continue;
-            wsrc = &ctx->waves_info->waves[dst[sb].start_index];
-            wref = &ctx->waves_info->waves[ref[sb].start_index];
-            for (j = 0; j < dst[sb].num_wavs; j++) {
-                for (i = 0, fi = 0, maxdiff = 1024; i < ref[sb].num_wavs; i++) {
-                    diff = FFABS(wsrc[j].freq_index - wref[i].freq_index);
-                    if (diff < maxdiff) {
-                        maxdiff = diff;
-                        fi      = i;
-                    }
-                }
-
-                if (maxdiff < 8)
-                    refwaves[dst[sb].start_index + j] = fi + ref[sb].start_index;
-                else if (j < ref[sb].num_wavs)
-                    refwaves[dst[sb].start_index + j] = j + ref[sb].start_index;
-                else
-                    refwaves[dst[sb].start_index + j] = -1;
-            }
-        }
-    }
+    if (ch_num)
+        get_ref_waves(ctx, ch_num, band_has_tones, refwaves);
 
     mode = get_bits(gb, ch_num + 1);
 
@@ -1513,26 +1531,32 @@ static void decode_tones_amplitude(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
         for (sb = 0; sb < ctx->waves_info->num_tone_bands; sb++) {
             if (!band_has_tones[sb] || !dst[sb].num_wavs)
                 continue;
-            if (ctx->waves_info->amplitude_mode)
+            w = &ctx->waves_info->waves[dst[sb].start_index];
+            if (ctx->waves_info->amplitude_mode) {
                 for (i = 0; i < dst[sb].num_wavs; i++)
-                    ctx->waves_info->waves[dst[sb].start_index + i].amp_sf = get_bits(gb, 6);
-            else
-                ctx->waves_info->waves[dst[sb].start_index].amp_sf = get_bits(gb, 6);
+                    w[i].amp_sf = get_bits(gb, 6);
+            } else { /* one scale factor for all waves of the band */
+                w[0].amp_sf = get_bits(gb, 6);
+                for (i = 1; i < dst[sb].num_wavs; i++)
+                    w[i].amp_sf = w[0].amp_sf;
+            }
         }
         break;
     case 1: /** min + VLC delta */
         for (sb = 0; sb < ctx->waves_info->num_tone_bands; sb++) {
             if (!band_has_tones[sb] || !dst[sb].num_wavs)
                 continue;
-            if (ctx->waves_info->amplitude_mode)
+            w = &ctx->waves_info->waves[dst[sb].start_index];
+            if (ctx->waves_info->amplitude_mode) {
                 for (i = 0; i < dst[sb].num_wavs; i++)
-                    ctx->waves_info->waves[dst[sb].start_index + i].amp_sf =
-                        get_vlc2(gb, tone_vlc_tabs[3].table,
-                                 tone_vlc_tabs[3].bits, 1) + 20;
-            else
-                ctx->waves_info->waves[dst[sb].start_index].amp_sf =
-                    get_vlc2(gb, tone_vlc_tabs[4].table,
-                             tone_vlc_tabs[4].bits, 1) + 24;
+                    w[i].amp_sf = get_vlc2(gb, tone_vlc_tabs[3].table,
+                                           tone_vlc_tabs[3].bits, 1) + 20;
+            } else { /* one scale factor for all waves of the band */
+                w[0].amp_sf = get_vlc2(gb, tone_vlc_tabs[4].table,
+                                       tone_vlc_tabs[4].bits, 1) + 24;
+                for (i = 1; i < dst[sb].num_wavs; i++)
+                    w[i].amp_sf = w[0].amp_sf;
+            }
         }
         break;
     case 2: /** VLC modulo delta to master (slave only) */
@@ -1560,6 +1584,66 @@ static void decode_tones_amplitude(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
                     : 32;
         }
         break;
+    }
+}
+
+/**
+ * Decode amplitude indexes of amplitude mode 0 for each subband of a channel.
+ *
+ * @param[in]     gb                the GetBit context
+ * @param[in,out] ctx               ptr to the channel unit context
+ * @param[in]     ch_num            channel to process
+ * @param[in]     band_has_tones    ptr to an array of per-band-flags:
+ *                                  1 - tone data present
+ */
+static void decode_tones_amp_index(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
+                                   int ch_num, int band_has_tones[])
+{
+    int mode, sb, i, delta, ref;
+    int refwaves[48] = { 0 };
+    Atrac3pWavesData *dst = ctx->channels[ch_num].tones_info;
+    Atrac3pWaveParam *w;
+
+    if (ch_num)
+        get_ref_waves(ctx, ch_num, band_has_tones, refwaves);
+
+    mode = get_bits(gb, ch_num + 1);
+
+    for (sb = 0; sb < ctx->waves_info->num_tone_bands; sb++) {
+        if (!band_has_tones[sb] || !dst[sb].num_wavs)
+            continue;
+        w = &ctx->waves_info->waves[dst[sb].start_index];
+
+        switch (mode) {
+        case 0: /** fixed-length coding */
+            for (i = 0; i < dst[sb].num_wavs; i++)
+                w[i].amp_index = get_bits(gb, 4);
+            break;
+        case 1: /** VLC, separate table for single tones */
+            if (dst[sb].num_wavs == 1)
+                w[0].amp_index = get_vlc2(gb, tone_vlc_tabs[7].table,
+                                          tone_vlc_tabs[7].bits, 1);
+            else
+                for (i = 0; i < dst[sb].num_wavs; i++)
+                    w[i].amp_index = get_vlc2(gb, tone_vlc_tabs[8].table,
+                                              tone_vlc_tabs[8].bits, 1);
+            break;
+        case 2: /** VLC modulo delta to master (slave only) */
+            for (i = 0; i < dst[sb].num_wavs; i++) {
+                delta = sign_extend(get_vlc2(gb, tone_vlc_tabs[9].table,
+                                             tone_vlc_tabs[9].bits, 1), 3);
+                ref   = refwaves[dst[sb].start_index + i];
+                w[i].amp_index = (ref >= 0 ? ctx->waves_info->waves[ref].amp_index + delta
+                                           : delta - 4) & 0xF;
+            }
+            break;
+        case 3: /** clone master (slave only) */
+            for (i = 0; i < dst[sb].num_wavs; i++) {
+                ref = refwaves[dst[sb].start_index + i];
+                w[i].amp_index = ref >= 0 ? ctx->waves_info->waves[ref].amp_index : 14;
+            }
+            break;
+        }
     }
 }
 
@@ -1614,10 +1698,6 @@ static int decode_tones_info(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
     memset(ctx->waves_info->waves, 0, sizeof(ctx->waves_info->waves));
 
     ctx->waves_info->amplitude_mode = get_bits1(gb);
-    if (!ctx->waves_info->amplitude_mode) {
-        avpriv_report_missing_feature(avctx, "GHA amplitude mode 0");
-        return AVERROR_PATCHWELCOME;
-    }
 
     ctx->waves_info->num_tone_bands =
         get_vlc2(gb, tone_vlc_tabs[0].table,
@@ -1642,6 +1722,8 @@ static int decode_tones_info(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
 
         decode_tones_frequency(gb, ctx, ch_num, band_has_tones);
         decode_tones_amplitude(gb, ctx, ch_num, band_has_tones);
+        if (!ctx->waves_info->amplitude_mode)
+            decode_tones_amp_index(gb, ctx, ch_num, band_has_tones);
         decode_tones_phase(gb, ctx, ch_num, band_has_tones);
     }
 
