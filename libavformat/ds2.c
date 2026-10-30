@@ -48,6 +48,7 @@
 #define DS2_COMMENT_SIZE 64
 
 typedef struct DS2DemuxContext {
+  int header_size;      /* first_byte * 512 (0x600 Olympus, 0xe00 Grundig/Philips) */
   int format_type;      /* block format byte, DS2_FORMAT_QP */
   int counter;          /* bytes remaining in current block payload */
   int total_frames;     /* total frame count from block headers */
@@ -57,14 +58,19 @@ typedef struct DS2DemuxContext {
 } DS2DemuxContext;
 
 static int ds2_probe(const AVProbeData *p) {
-  int format;
+  int format, header_size;
 
-  if (AV_RL32(p->buf) != MKTAG(0x3, 'd', 's', '2'))
+  /* First byte is the header size in 512-byte blocks (Olympus 2/3,
+   * Grundig/Philips 6/7); bytes 1..3 are the "ds2" tag. */
+  if (p->buf_size < 4 || p->buf[1] != 'd' || p->buf[2] != 's' || p->buf[3] != '2')
+    return 0;
+  if (p->buf[0] < 2 || p->buf[0] > 16)
     return 0;
 
   /* SP, variable rate SP and LP files belong to the DSS demuxer. */
-  if (p->buf_size >= DS2_HEADER_SIZE + DS2_AUDIO_BLOCK_HEADER_SIZE) {
-    format = p->buf[DS2_HEADER_SIZE + 4];
+  header_size = p->buf[0] * DS2_BLOCK_SIZE;
+  if (p->buf_size >= header_size + DS2_AUDIO_BLOCK_HEADER_SIZE) {
+    format = p->buf[header_size + 4];
     if (format == DS2_FORMAT_SP || format == DS2_FORMAT_SP_VR ||
         format == DS2_FORMAT_LP)
       return 0;
@@ -146,24 +152,25 @@ static int ds2_partial_block_frames(const uint8_t *buf, int size) {
 
 static int ds2_count_total_frames(AVFormatContext *s) {
   AVIOContext *pb = s->pb;
+  int header_size = ((DS2DemuxContext *)s->priv_data)->header_size;
   int64_t size = avio_size(pb);
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE], buf[DS2_BLOCK_SIZE];
   int blocks, i, tail, total = 0;
 
-  if (size < DS2_HEADER_SIZE)
+  if (size < header_size)
     return AVERROR_INVALIDDATA;
 
-  blocks = (size - DS2_HEADER_SIZE) / DS2_BLOCK_SIZE;
+  blocks = (size - header_size) / DS2_BLOCK_SIZE;
   for (i = 0; i < blocks; i++) {
-    avio_seek(pb, DS2_HEADER_SIZE + (int64_t)i * DS2_BLOCK_SIZE, SEEK_SET);
+    avio_seek(pb, header_size + (int64_t)i * DS2_BLOCK_SIZE, SEEK_SET);
     if (avio_read(pb, hdr, sizeof(hdr)) != sizeof(hdr))
       break;
     total += ds2_block_frames(hdr);
   }
 
-  tail = (size - DS2_HEADER_SIZE) % DS2_BLOCK_SIZE;
+  tail = (size - header_size) % DS2_BLOCK_SIZE;
   if (i == blocks && tail >= DS2_AUDIO_BLOCK_HEADER_SIZE &&
-      avio_seek(pb, DS2_HEADER_SIZE + (int64_t)blocks * DS2_BLOCK_SIZE, SEEK_SET) >= 0 &&
+      avio_seek(pb, header_size + (int64_t)blocks * DS2_BLOCK_SIZE, SEEK_SET) >= 0 &&
       avio_read(pb, buf, tail) == tail)
     total += ds2_partial_block_frames(buf, tail);
 
@@ -244,6 +251,14 @@ static int ds2_read_header(AVFormatContext *s) {
   uint8_t block_header[DS2_AUDIO_BLOCK_HEADER_SIZE];
   int ret, frame_count, cont_size, blk_swap, samples_per_frame;
   int64_t ret64;
+  int version;
+
+  if ((ret64 = avio_seek(pb, 0, SEEK_SET)) < 0)
+    return (int)ret64;
+  version = avio_r8(pb);
+  if (version < 2 || version > 16)
+    return AVERROR_INVALIDDATA;
+  ctx->header_size = version * DS2_BLOCK_SIZE;
 
   st = avformat_new_stream(s, NULL);
   if (!st)
@@ -268,7 +283,7 @@ static int ds2_read_header(AVFormatContext *s) {
     return ret;
   ctx->total_frames = ret;
 
-  if ((ret64 = avio_seek(pb, DS2_HEADER_SIZE, SEEK_SET)) < 0)
+  if ((ret64 = avio_seek(pb, ctx->header_size, SEEK_SET)) < 0)
     return (int)ret64;
 
   ret = avio_read(pb, block_header, DS2_AUDIO_BLOCK_HEADER_SIZE);
@@ -306,8 +321,8 @@ static int ds2_read_header(AVFormatContext *s) {
     s->duration  = av_rescale_q(nb_samples, (AVRational){1, st->codecpar->sample_rate},
                                 AV_TIME_BASE_Q);
 
-    if (file_size > DS2_HEADER_SIZE && s->duration > 0)
-      s->bit_rate = (file_size - DS2_HEADER_SIZE) * 8LL * AV_TIME_BASE / s->duration;
+    if (file_size > ctx->header_size && s->duration > 0)
+      s->bit_rate = (file_size - ctx->header_size) * 8LL * AV_TIME_BASE / s->duration;
     else
       s->bit_rate = 8LL * frame_bytes * st->codecpar->sample_rate / samples_per_frame;
 
@@ -411,7 +426,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   if (seekto < 0)
     seekto = 0;
 
-  seekto += DS2_HEADER_SIZE;
+  seekto += ctx->header_size;
 
   ret = avio_seek(s->pb, seekto, SEEK_SET);
   if (ret < 0)
