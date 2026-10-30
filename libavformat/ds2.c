@@ -111,10 +111,29 @@ static int ds2_read_metadata_string(AVFormatContext *s, unsigned int offset,
   return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
 }
 
+/*
+ * Frames that start in the part of a block a cut file still holds, from the
+ * block's header and payload, size bytes of them. Only frames whose first
+ * byte is there count; the reader returns the last one zero-filled.
+ */
+static int ds2_partial_block_frames(const uint8_t *buf, int size) {
+  int frame_count = buf[2], n = 0;
+  int off = DS2_AUDIO_BLOCK_HEADER_SIZE +
+            av_clip(2 * buf[1] + 2 * (buf[0] >> 7) -
+                    DS2_AUDIO_BLOCK_HEADER_SIZE, 0, DS2_BLOCK_PAYLOAD_SIZE);
+
+  while (n < frame_count && off < size) {
+    n++;
+    off += DS2_QP_FRAME_SIZE;
+  }
+  return n;
+}
+
 static int ds2_count_total_frames(AVFormatContext *s) {
   AVIOContext *pb = s->pb;
   int64_t size = avio_size(pb);
-  int blocks, i, total = 0;
+  uint8_t buf[DS2_BLOCK_SIZE];
+  int blocks, i, tail, total = 0;
 
   if (size < DS2_HEADER_SIZE)
     return AVERROR_INVALIDDATA;
@@ -124,6 +143,12 @@ static int ds2_count_total_frames(AVFormatContext *s) {
     avio_seek(pb, DS2_HEADER_SIZE + (int64_t)i * DS2_BLOCK_SIZE + 2, SEEK_SET);
     total += avio_r8(pb);
   }
+
+  tail = (size - DS2_HEADER_SIZE) % DS2_BLOCK_SIZE;
+  if (i == blocks && tail >= DS2_AUDIO_BLOCK_HEADER_SIZE &&
+      avio_seek(pb, DS2_HEADER_SIZE + (int64_t)blocks * DS2_BLOCK_SIZE, SEEK_SET) >= 0 &&
+      avio_read(pb, buf, tail) == tail)
+    total += ds2_partial_block_frames(buf, tail);
 
   return total;
 }
@@ -271,7 +296,6 @@ static int ds2_read_header(AVFormatContext *s) {
 static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
   DS2DemuxContext *ctx = s->priv_data;
   int ret, offset = 0;
-  int64_t pos = avio_tell(s->pb);
 
   if (ctx->total_frames > 0 && ctx->frames_read >= ctx->total_frames)
     return AVERROR_EOF;
@@ -282,13 +306,11 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
       return ret;
   }
 
-  ret = av_new_packet(pkt, DS2_QP_FRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
+  ret = av_new_packet(pkt, DS2_QP_FRAME_SIZE);
   if (ret < 0)
     return ret;
-  pkt->size = DS2_QP_FRAME_SIZE;
 
   pkt->duration = DS2_QP_SAMPLES_PER_FRAME;
-  pkt->pos = pos;
   pkt->stream_index = 0;
 
   /*
@@ -299,6 +321,8 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
     int to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
     if (to_read <= 0) {
       ret = ds2_load_block(s, offset);
+      if (ret == AVERROR_EOF && offset > 0)
+        goto truncated;
       if (ret < 0)
         return ret;
       if (ctx->resync_drop)
@@ -306,15 +330,31 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
       to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
     }
 
+    if (!offset)
+      pkt->pos = avio_tell(s->pb);
     ret = avio_read(s->pb, pkt->data + offset, to_read);
     if (ret < to_read) {
-      return ret < 0 ? ret : AVERROR_EOF;
+      if (ret < 0 && ret != AVERROR_EOF)
+        return ret;
+      if (ret > 0)
+        offset += ret;
+      if (!offset)
+        return AVERROR_EOF;
+      goto truncated;
     }
 
     offset += to_read;
     ctx->counter -= to_read;
   }
 
+  ctx->frames_read++;
+  return 0;
+
+truncated:
+  /* The file ends inside a frame its block still counts. Olympus decodes
+   * that frame too, so keep it, with the missing bytes zeroed. */
+  memset(pkt->data + offset, 0, DS2_QP_FRAME_SIZE - offset);
+  ctx->counter = 0;
   ctx->frames_read++;
   return 0;
 }
