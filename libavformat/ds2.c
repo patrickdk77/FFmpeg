@@ -18,10 +18,12 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
+#include "libavutil/opt.h"
 
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
+#include "ds2crypto.h"
 #include "dss_metadata.h"
 
 #define DS2_BLOCK_SIZE 512
@@ -40,6 +42,7 @@
 #define DS2_QP7_NOISE_FRAME_SIZE 12
 
 typedef struct DS2DemuxContext {
+  AVClass *class;
   int header_size;      /* in bytes, from ds2_header_size() */
   int format_type;      /* block format byte, DS2_FORMAT_QP or DS2_FORMAT_QP7 */
   int counter;          /* bytes remaining in current block payload */
@@ -48,7 +51,13 @@ typedef struct DS2DemuxContext {
   int resync_drop;      /* QP: partial frame orphaned at a re-sync block */
   int frame_size;       /* QP: size of the frame being read */
   int blk_frames;       /* frames still to start in the current block */
+  AVIOContext *pb;      /* s->pb, or decrypt_pb in an encrypted file */
+  AVIOContext *decrypt_pb;
+  char *password;
 } DS2DemuxContext;
+
+#define OFFSET(x) offsetof(DS2DemuxContext, x)
+#define DEC AV_OPT_FLAG_DECODING_PARAM
 
 /*
  * The first byte is the header size in 512-byte blocks (Olympus 2/3,
@@ -86,8 +95,10 @@ static int ds2_probe_format(const uint8_t *buf, int size, int pos) {
 static int ds2_probe(const AVProbeData *p) {
   int format;
 
-  /* bytes 1..3 are the "ds2" tag */
-  if (p->buf_size < 4 || p->buf[1] != 'd' || p->buf[2] != 's' || p->buf[3] != '2')
+  /* bytes 1..3 are the "ds2" tag, or "enc" in an encrypted file, whose block
+   * headers are in the clear */
+  if (p->buf_size < 4 || (AV_RL32(p->buf) != DS2_ENCRYPTED_MAGIC &&
+      (p->buf[1] != 'd' || p->buf[2] != 's' || p->buf[3] != '2')))
     return 0;
   if (!p->buf[0])
     return 0;
@@ -147,12 +158,13 @@ static int ds2_block_frames_held(const uint8_t *buf, int size, int qp7,
  * block after it. Where the file ends, the reader keeps the frame.
  */
 static int ds2_frame_dropped(AVFormatContext *s, int64_t pos, int need) {
+  AVIOContext *pb = ((DS2DemuxContext *)s->priv_data)->pb;
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
 
   while (need > 0) {
     pos += DS2_BLOCK_SIZE;
-    if (avio_seek(s->pb, pos, SEEK_SET) < 0 ||
-        avio_read(s->pb, hdr, sizeof(hdr)) != sizeof(hdr))
+    if (avio_seek(pb, pos, SEEK_SET) < 0 ||
+        avio_read(pb, hdr, sizeof(hdr)) != sizeof(hdr))
       return 0;
     if (ds2_block_frames(hdr))
       return ds2_block_anchor(hdr) != need;
@@ -168,15 +180,17 @@ static int ds2_frame_dropped(AVFormatContext *s, int64_t pos, int need) {
  */
 static int ds2_read_block(AVFormatContext *s, int64_t pos, uint8_t *buf,
                           int len, int *qp7) {
+  AVIOContext *pb = ((DS2DemuxContext *)s->priv_data)->pb;
+
   if (len < DS2_AUDIO_BLOCK_HEADER_SIZE ||
-      avio_seek(s->pb, pos, SEEK_SET) < 0 ||
-      avio_read(s->pb, buf, DS2_AUDIO_BLOCK_HEADER_SIZE) !=
+      avio_seek(pb, pos, SEEK_SET) < 0 ||
+      avio_read(pb, buf, DS2_AUDIO_BLOCK_HEADER_SIZE) !=
           DS2_AUDIO_BLOCK_HEADER_SIZE)
     return AVERROR_EOF;
   if (*qp7 < 0)
     *qp7 = buf[4] == DS2_FORMAT_QP7;
   len -= DS2_AUDIO_BLOCK_HEADER_SIZE;
-  if (*qp7 && avio_read(s->pb, buf + DS2_AUDIO_BLOCK_HEADER_SIZE, len) != len)
+  if (*qp7 && avio_read(pb, buf + DS2_AUDIO_BLOCK_HEADER_SIZE, len) != len)
     return AVERROR_EOF;
   return 0;
 }
@@ -195,7 +209,7 @@ static int ds2_block_frames_read(AVFormatContext *s, int64_t pos,
 }
 
 static int64_t ds2_count_total_frames(AVFormatContext *s) {
-  AVIOContext *pb = s->pb;
+  AVIOContext *pb = ((DS2DemuxContext *)s->priv_data)->pb;
   int header_size = ((DS2DemuxContext *)s->priv_data)->header_size;
   int64_t size = avio_size(pb), total = 0, pos;
   uint8_t buf[DS2_BLOCK_SIZE];
@@ -218,7 +232,7 @@ static int64_t ds2_count_total_frames(AVFormatContext *s) {
 
 static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
   DS2DemuxContext *ctx = s->priv_data;
-  AVIOContext *pb = s->pb;
+  AVIOContext *pb = ctx->pb;
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
   int ret, frame_count, anchor, aligned;
 
@@ -271,11 +285,11 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
  */
 static int ds2_next_block(AVFormatContext *s, int in_frame_offset) {
   DS2DemuxContext *ctx = s->priv_data;
-  int64_t in_block = avio_tell(s->pb) % DS2_BLOCK_SIZE;
+  int64_t in_block = avio_tell(ctx->pb) % DS2_BLOCK_SIZE;
 
   ctx->counter = 0;
   ctx->resync_drop = 0;
-  if (in_block > 0 && avio_skip(s->pb, DS2_BLOCK_SIZE - in_block) < 0)
+  if (in_block > 0 && avio_skip(ctx->pb, DS2_BLOCK_SIZE - in_block) < 0)
     return AVERROR_EOF;
 
   return ds2_load_block(s, in_frame_offset);
@@ -295,9 +309,20 @@ static int ds2_read_header(AVFormatContext *s) {
   ret = avio_read(pb, file_magic, sizeof(file_magic));
   if (ret < 4)
     return ret < 0 ? ret : AVERROR_EOF;
-  if (!file_magic[0] || memcmp(file_magic + 1, "ds2", 3))
+  if (!file_magic[0] || (memcmp(file_magic + 1, "ds2", 3) &&
+                          AV_RL32(file_magic) != DS2_ENCRYPTED_MAGIC))
     return AVERROR_INVALIDDATA;
   ctx->header_size = ds2_header_size(file_magic, ret);
+
+  ctx->pb = s->pb;
+  if (AV_RL32(file_magic) == DS2_ENCRYPTED_MAGIC) {
+    ret = ff_ds2_decrypt_open(s, ctx->password, ctx->header_size,
+                              &ctx->decrypt_pb);
+    if (ret < 0)
+      return ret;
+    ctx->pb = ctx->decrypt_pb;
+  }
+  pb = ctx->pb;
 
   st = avformat_new_stream(s, NULL);
   if (!st)
@@ -419,8 +444,8 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
       to_read = FFMIN(to_read, 2);
 
     if (!offset)
-      pkt->pos = avio_tell(s->pb);
-    ret = avio_read(s->pb, pkt->data + offset, to_read);
+      pkt->pos = avio_tell(ctx->pb);
+    ret = avio_read(ctx->pb, pkt->data + offset, to_read);
     if (ret < to_read) {
       if (ret < 0 && ret != AVERROR_EOF)
         return ret;
@@ -461,7 +486,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
                          int64_t timestamp, int flags) {
   DS2DemuxContext *ctx = s->priv_data;
   int64_t ret, seekto, target = timestamp / DS2_QP_SAMPLES_PER_FRAME, frames = 0;
-  int64_t last = -1, last_frames = 0, size = avio_size(s->pb);
+  int64_t last = -1, last_frames = 0, size = avio_size(ctx->pb);
   uint8_t buf[DS2_BLOCK_SIZE];
   int frame_count, len, qp7 = ctx->format_type == DS2_FORMAT_QP7;
 
@@ -492,7 +517,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
 
   /* The next read loads this block and starts at its anchor, skipping the
    * tail of a frame that began in the previous block. */
-  ret = avio_seek(s->pb, seekto, SEEK_SET);
+  ret = avio_seek(ctx->pb, seekto, SEEK_SET);
   if (ret < 0)
     return ret;
   ctx->frames_read = frames;
@@ -502,14 +527,37 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   return 0;
 }
 
+static int ds2_read_close(AVFormatContext *s) {
+  DS2DemuxContext *ctx = s->priv_data;
+
+  ff_ds2_decrypt_close(&ctx->decrypt_pb);
+  return 0;
+}
+
+static const AVOption ds2_options[] = {
+    { "password", "Decryption password for encrypted DS2 (max 16 bytes)",
+      OFFSET(password), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { NULL },
+};
+
+static const AVClass ds2_demuxer_class = {
+    .class_name = "ds2 demuxer",
+    .item_name  = av_default_item_name,
+    .option     = ds2_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
 const FFInputFormat ff_ds2_demuxer = {
     .p.name = "ds2",
     .p.long_name = NULL_IF_CONFIG_SMALL("Digital Speech Standard Pro (DS2)"),
     .p.extensions = "ds2",
     .p.flags = AVFMT_NO_BYTE_SEEK,
+    .p.priv_class = &ds2_demuxer_class,
     .priv_data_size = sizeof(DS2DemuxContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe = ds2_probe,
     .read_header = ds2_read_header,
     .read_packet = ds2_qp_read_packet,
     .read_seek = ds2_read_seek,
+    .read_close = ds2_read_close,
 };
