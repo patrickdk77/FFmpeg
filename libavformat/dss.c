@@ -260,7 +260,7 @@ static int dss_probe_format(const uint8_t *buf, int size, int pos)
             pos += copy * DSS_BLOCK_SIZE;
             continue;
         }
-        if (dss_block_frames(buf + pos))
+        if (dss_block_frames(buf + pos) && dss_format_known(buf + pos))
             return buf[pos + 4];
         pos += DSS_BLOCK_SIZE;
     }
