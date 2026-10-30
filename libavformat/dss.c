@@ -43,6 +43,7 @@
 #define DSS_ACODEC_DSS_SP             0x0    /* SP mode */
 #define DSS_ACODEC_DSS_SP_VR          0x1    /* SP mode, variable rate */
 #define DSS_ACODEC_G723_1             0x2    /* LP mode */
+#define DSS_ACODEC_G723_1_ALT         0x4    /* LP mode */
 
 /* Grundig DSS-SP (Digta) variant: magic byte 6, fixed 6 x 512-byte header.
  * Native CELP codec at 12 kHz, 41-byte (328-bit) frames packed as a
@@ -167,7 +168,7 @@ static int dss_probe(const AVProbeData *p)
         format = dss_probe_format(p->buf, p->buf_size,
                                   dss_ds2_header_size(p->buf, p->buf_size));
         if (format == DSS_ACODEC_DSS_SP || format == DSS_ACODEC_DSS_SP_VR ||
-            format == DSS_ACODEC_G723_1)
+            format == DSS_ACODEC_G723_1 || format == DSS_ACODEC_G723_1_ALT)
             return AVPROBE_SCORE_MAX;
     }
 
@@ -378,7 +379,9 @@ static int dss_read_header(AVFormatContext *s)
          * decimates 11:12, so the output rate is 11000 Hz, not 11025. This
          * also sets the packet time base just below. */
         st->codecpar->sample_rate = 11000;
-    } else if (ctx->audio_codec == DSS_ACODEC_G723_1) {
+    } else if (format == DSS_ACODEC_G723_1 ||
+               format == DSS_ACODEC_G723_1_ALT) {
+        ctx->audio_codec = DSS_ACODEC_G723_1;
         st->codecpar->codec_id    = AV_CODEC_ID_G723_1;
         st->codecpar->sample_rate = 8000;
     } else {
