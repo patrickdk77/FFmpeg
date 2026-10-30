@@ -21,6 +21,7 @@
 #include "libavutil/opt.h"
 
 #include "avformat.h"
+#include "avio_internal.h"
 #include "demux.h"
 #include "internal.h"
 #include "ds2crypto.h"
@@ -42,10 +43,12 @@
 #define DS2_QP_SAMPLE_RATE 16000
 #define DS2_QP7_NOISE_FRAME_SIZE 12
 
+#define DS2_FORMAT_SCAN_BLOCKS 64
+
 typedef struct DS2DemuxContext {
   AVClass *class;
   int header_size;      /* in bytes, from ds2_header_size() */
-  int format_type;      /* block format byte, DS2_FORMAT_QP or DS2_FORMAT_QP7 */
+  int format_type;      /* format of the first block that holds frames */
   int counter;          /* bytes remaining in current block payload */
   int64_t total_frames; /* total frame count from block headers */
   int64_t frames_read;  /* frames read so far */
@@ -148,10 +151,10 @@ static int ds2_block_anchor(const uint8_t *hdr) {
  * zero-filled. *need is set to the bytes the last frame of a whole block takes
  * from the blocks after it.
  */
-static int ds2_block_frames_held(const uint8_t *buf, int size, int qp7,
-                                 int *need) {
+static int ds2_block_frames_held(const uint8_t *buf, int size, int *need) {
   int frame_count = ds2_block_frames(buf), n = 0;
   int off = DS2_AUDIO_BLOCK_HEADER_SIZE + ds2_block_anchor(buf);
+  int qp7 = buf[4] == DS2_FORMAT_QP7;
 
   while (n < frame_count && off < size) {
     n++;
@@ -189,11 +192,10 @@ static int ds2_frame_dropped(AVFormatContext *s, int64_t pos, int need) {
 
 /*
  * Read the header of the block at pos, and in QP7, where the frame sizes are
- * in the payload, the rest of its len bytes. *qp7 below 0 is set from this
- * block's format.
+ * in the payload, the rest of its len bytes.
  */
 static int ds2_read_block(AVFormatContext *s, int64_t pos, uint8_t *buf,
-                          int len, int *qp7) {
+                          int len) {
   AVIOContext *pb = ((DS2DemuxContext *)s->priv_data)->pb;
 
   if (len < DS2_AUDIO_BLOCK_HEADER_SIZE ||
@@ -201,10 +203,9 @@ static int ds2_read_block(AVFormatContext *s, int64_t pos, uint8_t *buf,
       avio_read(pb, buf, DS2_AUDIO_BLOCK_HEADER_SIZE) !=
           DS2_AUDIO_BLOCK_HEADER_SIZE)
     return AVERROR_EOF;
-  if (*qp7 < 0)
-    *qp7 = buf[4] == DS2_FORMAT_QP7;
   len -= DS2_AUDIO_BLOCK_HEADER_SIZE;
-  if (*qp7 && avio_read(pb, buf + DS2_AUDIO_BLOCK_HEADER_SIZE, len) != len)
+  if (buf[4] == DS2_FORMAT_QP7 &&
+      avio_read(pb, buf + DS2_AUDIO_BLOCK_HEADER_SIZE, len) != len)
     return AVERROR_EOF;
   return 0;
 }
@@ -214,8 +215,8 @@ static int ds2_read_block(AVFormatContext *s, int64_t pos, uint8_t *buf,
  * the size bytes the file has.
  */
 static int ds2_block_frames_read(AVFormatContext *s, int64_t pos,
-                                 const uint8_t *buf, int size, int qp7) {
-  int need, n = ds2_block_frames_held(buf, size, qp7, &need);
+                                 const uint8_t *buf, int size) {
+  int need, n = ds2_block_frames_held(buf, size, &need);
 
   if (need && ds2_frame_dropped(s, pos, need))
     n--;
@@ -227,7 +228,7 @@ static int64_t ds2_count_total_frames(AVFormatContext *s) {
   int header_size = ((DS2DemuxContext *)s->priv_data)->header_size;
   int64_t size = avio_size(pb), total = 0, pos;
   uint8_t buf[DS2_BLOCK_SIZE];
-  int len, qp7 = -1;
+  int len;
 
   if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
     return 0;
@@ -236,12 +237,42 @@ static int64_t ds2_count_total_frames(AVFormatContext *s) {
 
   for (pos = header_size; pos < size; pos += DS2_BLOCK_SIZE) {
     len = FFMIN(size - pos, DS2_BLOCK_SIZE);
-    if (ds2_read_block(s, pos, buf, len, &qp7) < 0)
+    if (ds2_read_block(s, pos, buf, len) < 0)
       break;
-    total += ds2_block_frames_read(s, pos, buf, len, qp7);
+    total += ds2_block_frames_read(s, pos, buf, len);
   }
 
   return total;
+}
+
+static int ds2_first_format(AVFormatContext *s) {
+  DS2DemuxContext *ctx = s->priv_data;
+  AVIOContext *pb = ctx->pb;
+  uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
+  int64_t pos = ctx->header_size, end = INT64_MAX;
+  int ret;
+
+  if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+    end = pos + FFMAX(FFMIN(s->probesize, INT_MAX / 2),
+                      DS2_FORMAT_SCAN_BLOCKS * DS2_BLOCK_SIZE);
+    if (avio_seek(pb, 0, SEEK_SET) < 0)
+      return DS2_FORMAT_QP;
+    if ((ret = ffio_ensure_seekback(pb, end)) < 0)
+      return ret;
+  }
+
+  for (; pos < end; pos += DS2_BLOCK_SIZE) {
+    if (avio_seek(pb, pos, SEEK_SET) < 0)
+      break;
+    ret = avio_read(pb, hdr, sizeof(hdr));
+    if (ret < 0 && ret != AVERROR_EOF)
+      return ret;
+    if (ret != sizeof(hdr))
+      break;
+    if (ds2_block_frames(hdr))
+      return hdr[4];
+  }
+  return DS2_FORMAT_QP;
 }
 
 static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
@@ -313,7 +344,6 @@ static int ds2_read_header(AVFormatContext *s) {
   DS2DemuxContext *ctx = s->priv_data;
   AVIOContext *pb = s->pb;
   AVStream *st;
-  uint8_t block_header[DS2_AUDIO_BLOCK_HEADER_SIZE];
   uint8_t file_magic[DS2_BLOCK_SIZE + 4];
   int ret, samples_per_frame;
   int64_t ret64, out_frames;
@@ -351,14 +381,10 @@ static int ds2_read_header(AVFormatContext *s) {
     return (int)ret64;
   ctx->total_frames = ret64;
 
-  if ((ret64 = avio_seek(pb, ctx->header_size, SEEK_SET)) < 0)
-    return (int)ret64;
-
-  ret = avio_read(pb, block_header, DS2_AUDIO_BLOCK_HEADER_SIZE);
-  if (ret < DS2_AUDIO_BLOCK_HEADER_SIZE)
-    return ret < 0 ? ret : AVERROR_EOF;
-
-  ctx->format_type = block_header[4];
+  ret = ds2_first_format(s);
+  if (ret < 0)
+    return ret;
+  ctx->format_type = ret;
 
   st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
   st->codecpar->codec_id = AV_CODEC_ID_DS2;
@@ -540,7 +566,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   int64_t ret, seekto, target = timestamp / DS2_QP_SAMPLES_PER_FRAME, frames = 0;
   int64_t last = -1, last_frames = 0, size = avio_size(ctx->pb);
   uint8_t buf[DS2_BLOCK_SIZE];
-  int frame_count, len, qp7 = ctx->format_type == DS2_FORMAT_QP7;
+  int frame_count, len;
 
   if (target < 0)
     target = 0;
@@ -563,7 +589,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
    * last block that holds frames. */
   for (seekto = ctx->header_size; ; seekto += DS2_BLOCK_SIZE) {
     len = FFMIN(size - seekto, DS2_BLOCK_SIZE);
-    ret = ds2_read_block(s, seekto, buf, len, &qp7);
+    ret = ds2_read_block(s, seekto, buf, len);
     if (ret < 0) {
       if (last < 0)
         return ret;
@@ -571,7 +597,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
       frames = last_frames;
       break;
     }
-    frame_count = ds2_block_frames_read(s, seekto, buf, len, qp7);
+    frame_count = ds2_block_frames_read(s, seekto, buf, len);
     if (frames + frame_count > target)
       break;
     if (frame_count) {
