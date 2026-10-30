@@ -947,6 +947,9 @@ static int g723_1_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     int16_t *out;
     int bad_frame = 0, i, j, ret;
 
+    if (av_packet_get_side_data(avpkt, AV_PKT_DATA_DECODER_RESET, NULL))
+        g723_1_reset(avctx);
+
     if (buf_size < frame_size[dec_mode] * channels) {
         if (buf_size)
             av_log(avctx, AV_LOG_WARNING,
