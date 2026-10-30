@@ -53,6 +53,7 @@
 #include "get_bits.h"
 
 #define GRUNDIG_FRAME_BYTES   41
+#define GRUNDIG_SHORT_BYTES   9
 #define GRUNDIG_SUBFRAMES     4
 #define GRUNDIG_SUBLEN        72
 #define GRUNDIG_SAMPLES       (GRUNDIG_SUBFRAMES * GRUNDIG_SUBLEN) /* 288 */
@@ -269,7 +270,22 @@ static const uint8_t grundig_widths[GRUNDIG_ORDER] = {
     5, 5, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3,
 };
 
+/* From Olympus DssDecoder.dll 1.1.1.0 */
+static const double grundig_vr_refl13[4] = {
+    -0x1.fe5eb80000000p-3, -0x1.2e71f00000000p-4,
+     0x1.f33c9e0000001p-5,  0x1.a30cf00000000p-3,
+};
+
+/* In 1/32768, from the same DLL */
+static const uint16_t grundig_vr_noise_gain[32] = {
+      0,   5,  10,  15,  21,  28,  35,  42,  50,  59,  69,  79,  90, 102,
+    115, 129, 144, 160, 178, 197, 218, 240, 264, 290, 318, 348, 381, 417,
+    455, 496, 541, 589,
+};
+
 typedef struct GrundigSPContext {
+    int variable_rate;
+    uint16_t seed;
     double hist[GRUNDIG_HIST + 1]; /* excitation history; base read index 187 */
     double syn[16];                /* lattice b-state (order 14, +slack)      */
     double deemph;                 /* de-emphasis memory                      */
@@ -279,12 +295,16 @@ typedef struct GrundigSPContext {
 static void grundig_sp_reset(AVCodecContext *avctx)
 {
     GrundigSPContext *p = avctx->priv_data;
+    int variable_rate = p->variable_rate;
 
     memset(p, 0, sizeof(*p));
+    p->variable_rate = variable_rate;
 }
 
 static av_cold int grundig_sp_decode_init(AVCodecContext *avctx)
 {
+    GrundigSPContext *p = avctx->priv_data;
+
     av_channel_layout_uninit(&avctx->ch_layout);
     avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avctx->sample_fmt     = AV_SAMPLE_FMT_S16;
@@ -292,6 +312,7 @@ static av_cold int grundig_sp_decode_init(AVCodecContext *avctx)
         avctx->sample_rate = 12000;
 
     grundig_sp_reset(avctx);
+    p->variable_rate = avctx->extradata_size >= 1 && avctx->extradata[0] == 1;
     return 0;
 }
 
@@ -382,8 +403,33 @@ static void grundig_deemph(GrundigSPContext *p, int16_t *out, const double *synt
     p->deemph = prev;
 }
 
+/* The noise stays out of the excitation history. */
+static void grundig_decode_noise_frame(GrundigSPContext *p, int16_t *out,
+                                       GetBitContext *gb, const double *refl)
+{
+    const uint16_t *tab = grundig_vr_noise_gain;
+    double synth[GRUNDIG_SAMPLES];
+    int gains[GRUNDIG_SUBFRAMES];
+    int i, sf;
+
+    for (sf = 0; sf < GRUNDIG_SUBFRAMES; sf++)
+        gains[sf] = get_bits(gb, 5);
+
+    for (sf = 0; sf < GRUNDIG_SUBFRAMES; sf++) {
+        double exc[GRUNDIG_SUBLEN];
+
+        for (i = 0; i < GRUNDIG_SUBLEN; i++) {
+            p->seed = p->seed * 0x209 + 0x103;
+            exc[i]  = (int16_t)p->seed * tab[gains[sf]] * M_SQRT2 / 32768.0;
+        }
+        grundig_lattice(p, synth + sf * GRUNDIG_SUBLEN, exc, refl);
+    }
+
+    grundig_deemph(p, out, synth, GRUNDIG_SAMPLES);
+}
+
 static void grundig_decode_one_frame(GrundigSPContext *p, int16_t *out,
-                                     GetBitContext *gb)
+                                     GetBitContext *gb, int noise)
 {
     int i, sf;
     int lsf[GRUNDIG_ORDER];
@@ -397,8 +443,19 @@ static void grundig_decode_one_frame(GrundigSPContext *p, int16_t *out,
     uint32_t v;
 
     /* 14 reflection-coefficient indices. */
-    for (i = 0; i < GRUNDIG_ORDER; i++)
+    for (i = 0; i < GRUNDIG_ORDER - 1; i++)
         lsf[i] = get_bits(gb, grundig_widths[i]);
+    lsf[i] = get_bits(gb, p->variable_rate ? 2 : grundig_widths[i]);
+
+    for (i = 0; i < GRUNDIG_ORDER - 1; i++)
+        refl[i] = grundig_lpc0[lsf[i] + 32 * i];
+    refl[i] = p->variable_rate ? grundig_vr_refl13[lsf[i]] :
+                                 grundig_lpc0[lsf[i] + 32 * i];
+
+    if (noise) {
+        grundig_decode_noise_frame(p, out, gb, refl);
+        return;
+    }
 
     for (sf = 0; sf < GRUNDIG_SUBFRAMES; sf++) {
         gains[sf]     = get_bits(gb, 5);
@@ -414,9 +471,6 @@ static void grundig_decode_one_frame(GrundigSPContext *p, int16_t *out,
     for (i = 1; i < 4; i++) {
         pit[i] = v % 0x30; v /= 0x30;
     }
-
-    for (i = 0; i < GRUNDIG_ORDER; i++)
-        refl[i] = grundig_lpc0[lsf[i] + 32 * i];
 
     prev_lag = 0;
     for (sf = 0; sf < GRUNDIG_SUBFRAMES; sf++) {
@@ -448,29 +502,36 @@ static int grundig_sp_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     GrundigSPContext *p = avctx->priv_data;
     GetBitContext gb;
     int16_t *out;
-    int ret;
+    int ret, noise, size = GRUNDIG_FRAME_BYTES;
 
-    if (avpkt->size < GRUNDIG_FRAME_BYTES) {
+    /* In variable rate SP a clear first bit marks a short frame. */
+    noise = p->variable_rate && avpkt->size && !(avpkt->data[0] & 0x80);
+    if (noise)
+        size = GRUNDIG_SHORT_BYTES;
+
+    if (avpkt->size < size) {
         if (avpkt->size)
             av_log(avctx, AV_LOG_WARNING,
                    "Expected %d bytes, got %d - skipping packet.\n",
-                   GRUNDIG_FRAME_BYTES, avpkt->size);
+                   size, avpkt->size);
         *got_frame_ptr = 0;
         return AVERROR_INVALIDDATA;
     }
 
-    if ((ret = init_get_bits8(&gb, avpkt->data, GRUNDIG_FRAME_BYTES)) < 0)
+    if ((ret = init_get_bits8(&gb, avpkt->data, size)) < 0)
         return ret;
+    if (p->variable_rate)
+        skip_bits1(&gb);
 
     frame->nb_samples = GRUNDIG_SAMPLES;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
 
     out = (int16_t *)frame->data[0];
-    grundig_decode_one_frame(p, out, &gb);
+    grundig_decode_one_frame(p, out, &gb, noise);
 
     *got_frame_ptr = 1;
-    return GRUNDIG_FRAME_BYTES;
+    return size;
 }
 
 const FFCodec ff_grundig_sp_decoder = {
