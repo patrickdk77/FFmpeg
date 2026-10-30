@@ -57,6 +57,13 @@ FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP, PIPE_PROTOCOL) += fate-dss-form
 fate-dss-format1-noswap-prev-empty60-pipe: CMD = cat $(SAMPLES)/dss/olympus-format1-noswap-prev-empty60.dss | framecrc -blocksize 7 -i pipe:0
 fate-dss-format1-noswap-prev-empty60-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-format1-noswap-prev-empty60
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-format1-hdr6-empty52
+fate-dss-format1-hdr6-empty52: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-format1-hdr6-empty52.dss
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP, PIPE_PROTOCOL) += fate-dss-format1-hdr6-empty52-pipe
+fate-dss-format1-hdr6-empty52-pipe: CMD = cat $(SAMPLES)/dss/olympus-format1-hdr6-empty52.dss | framecrc -blocksize 7 -i pipe:0
+fate-dss-format1-hdr6-empty52-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-format1-hdr6-empty52
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-grundig-sp
 fate-dss-grundig-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/grundig-sp.dss
 

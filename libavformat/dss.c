@@ -19,7 +19,6 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <limits.h>
 #include <string.h>
 
 #include "libavutil/channel_layout.h"
@@ -74,11 +73,11 @@ typedef struct DSSDemuxContext {
 
     int dss_header_size;
 
-    /* Grundig variant: pre-extracted continuous 41-byte frame stream */
+    /* Grundig variant: the frames run through the block payloads as one bit
+     * stream of little-endian 16-bit words, read MSB first. */
     int      grundig;
-    uint8_t *grundig_frames;
-    int      grundig_nb_frames;
-    int      grundig_pos;
+    unsigned grundig_word;  /* payload word being read */
+    int      grundig_bits;  /* bits of it still to read */
 } DSSDemuxContext;
 
 /* Frames that start in an audio block: byte 2 when it is not 0, otherwise
@@ -89,6 +88,21 @@ static int dss_block_frames(const uint8_t *header)
     if (header[2] || header[5] == 0xff)
         return header[2];
     return header[5];
+}
+
+/* Frames that start in an audio block of the file being read. A Grundig block
+ * states them in byte 2 only. */
+static int dss_frames_in_block(const DSSDemuxContext *ctx,
+                               const uint8_t *header)
+{
+    return ctx->grundig ? header[2] : dss_block_frames(header);
+}
+
+static int dss_frame_samples(const DSSDemuxContext *ctx)
+{
+    if (ctx->grundig)
+        return DSS_GRUNDIG_SAMPLES_PER_FRAME;
+    return ctx->audio_codec == DSS_ACODEC_G723_1 ? 240 : 264;
 }
 
 /* Header size of a DS2 file from the first byte, in 512-byte blocks. Philips
@@ -178,104 +192,6 @@ static int dss_read_metadata_string(AVFormatContext *s, unsigned int offset,
     }
 
     return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
-}
-
-/* Read one bit from a 506-byte block payload that is stored as a sequence of
- * little-endian 16-bit words, MSB first within each word. */
-static inline int grundig_get_bit(const uint8_t *payload, int payload_size,
-                                  int bit)
-{
-    int wi  = bit >> 4;
-    int sub = bit & 15;
-    int idx = wi * 2;
-    unsigned w;
-
-    if (idx + 1 >= payload_size)
-        return 0;
-    w = (payload[idx + 1] << 8) | payload[idx];
-    return (w >> (15 - sub)) & 1;
-}
-
-/* Extract the continuous 41-byte CELP frame stream from the Grundig audio
- * blocks.  Each 512-byte block starts with a 6-byte header
- *   [b0][b1][b2] ff 00 ff
- * where b2 = number of frames that start in this block and
- * (b1<<8|b0)>>4 encodes the bit offset of the first whole frame in the block.
- * Frames are a continuous 328-bit stream that spans block boundaries; on a
- * boundary the next block's payload continues at bit 0 (after its 6-byte
- * header).  Each extracted frame is repacked as 41 plain MSB-first bytes for
- * the decoder. */
-static int grundig_extract_frames(AVFormatContext *s, const uint8_t *audio,
-                                  int audio_size)
-{
-    DSSDemuxContext *ctx = s->priv_data;
-    int nb_blocks = audio_size / DSS_BLOCK_SIZE;
-    int blockbits = (DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE) * 8; /* 506*8 */
-    const int payload_size = DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE;
-    int total_frames = 0;
-    int bi, cap, count;
-    uint8_t *out;
-
-    for (bi = 0; bi < nb_blocks; bi++)
-        total_frames += audio[bi * DSS_BLOCK_SIZE + 2];
-
-    if (total_frames <= 0)
-        return AVERROR_INVALIDDATA;
-
-    out = av_malloc_array(total_frames, DSS_GRUNDIG_FRAME_SIZE);
-    if (!out)
-        return AVERROR(ENOMEM);
-
-    cap   = total_frames;
-    count = 0;
-    for (bi = 0; bi < nb_blocks; bi++) {
-        const uint8_t *blk = audio + bi * DSS_BLOCK_SIZE;
-        int w0       = (blk[1] << 8) | blk[0];
-        int f421     = w0 >> 4;
-        int fc       = blk[2];
-        int word_off = (f421 >> 4) - 3;
-        int avail    = 0x10 - (f421 & 0xf);
-        int pos      = word_off * 16 + (16 - avail);
-        int fi;
-
-        for (fi = 0; fi < fc && count < cap; fi++) {
-            uint8_t *dst = out + count * DSS_GRUNDIG_FRAME_SIZE;
-            int need = DSS_GRUNDIG_FRAME_BITS;
-            int p    = pos;
-            int cb   = bi;
-            int bitn = 0;
-
-            memset(dst, 0, DSS_GRUNDIG_FRAME_SIZE);
-            while (need > 0) {
-                const uint8_t *cpl = audio + cb * DSS_BLOCK_SIZE +
-                                     DSS_AUDIO_BLOCK_HEADER_SIZE;
-                int take = FFMIN(need, blockbits - p);
-                int k;
-
-                for (k = 0; k < take; k++) {
-                    int bit = grundig_get_bit(cpl, payload_size, p + k);
-                    if (bit)
-                        dst[bitn >> 3] |= 0x80 >> (bitn & 7);
-                    bitn++;
-                }
-                need -= take;
-                p    += take;
-                if (need > 0) {
-                    cb++;
-                    if (cb >= nb_blocks)
-                        break;
-                    p = 0;
-                }
-            }
-            count++;
-            pos = p;
-        }
-    }
-
-    ctx->grundig_frames    = out;
-    ctx->grundig_nb_frames = count;
-    ctx->grundig_pos       = 0;
-    return 0;
 }
 
 static int dss_read_packet(AVFormatContext *s, AVPacket *pkt);
@@ -392,50 +308,6 @@ static int dss_read_header(AVFormatContext *s)
         av_log(s, AV_LOG_WARNING, "Failed to read comment metadata\n");
     }
 
-    if (version == DSS_GRUNDIG_VERSION && !is_ds2) {
-        uint8_t *audio;
-        int64_t total_size, audio_size;
-
-        ctx->grundig = 1;
-        st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
-        st->codecpar->codec_id       = AV_CODEC_ID_GRUNDIG_SP;
-        st->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
-        st->codecpar->sample_rate    = DSS_GRUNDIG_SAMPLE_RATE;
-        avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
-        st->start_time = 0;
-
-        total_size = avio_size(pb);
-        if (total_size < 0)
-            return total_size;
-        if (total_size <= ctx->dss_header_size)
-            return AVERROR_INVALIDDATA;
-        audio_size = total_size - ctx->dss_header_size;
-        audio_size -= audio_size % DSS_BLOCK_SIZE;
-        if (audio_size <= 0 || audio_size > INT_MAX)
-            return AVERROR_INVALIDDATA;
-
-        if ((ret64 = avio_seek(pb, ctx->dss_header_size, SEEK_SET)) < 0)
-            return (int)ret64;
-
-        audio = av_malloc(audio_size);
-        if (!audio)
-            return AVERROR(ENOMEM);
-        ret = avio_read(pb, audio, audio_size);
-        if (ret < audio_size) {
-            av_free(audio);
-            return ret < 0 ? ret : AVERROR_EOF;
-        }
-
-        ret = grundig_extract_frames(s, audio, audio_size);
-        av_free(audio);
-        if (ret < 0)
-            return ret;
-
-        s->bit_rate = 8LL * DSS_GRUNDIG_FRAME_SIZE * st->codecpar->sample_rate
-                          / DSS_GRUNDIG_SAMPLES_PER_FRAME;
-        return 0;
-    }
-
     /* DS2 leaves the DSS codec field unset; each block header states it. */
     if (is_ds2) {
         format = dss_first_format(s);
@@ -447,8 +319,12 @@ static int dss_read_header(AVFormatContext *s)
         ctx->audio_codec = avio_r8(pb);
     }
 
-    if (ctx->audio_codec == DSS_ACODEC_DSS_SP ||
-        ctx->audio_codec == DSS_ACODEC_DSS_SP_VR) {
+    if (version == DSS_GRUNDIG_VERSION && !is_ds2) {
+        ctx->grundig = 1;
+        st->codecpar->codec_id    = AV_CODEC_ID_GRUNDIG_SP;
+        st->codecpar->sample_rate = DSS_GRUNDIG_SAMPLE_RATE;
+    } else if (ctx->audio_codec == DSS_ACODEC_DSS_SP ||
+               ctx->audio_codec == DSS_ACODEC_DSS_SP_VR) {
         st->codecpar->codec_id    = AV_CODEC_ID_DSS_SP;
         /* The decoder reads the format to tell variable rate SP apart. */
         if ((ret = ff_alloc_extradata(st->codecpar, 1)) < 0)
@@ -478,7 +354,7 @@ static int dss_read_header(AVFormatContext *s)
         return (int)frames;
     if (frames > 0) {
         st->nb_frames = frames;
-        st->duration  = frames * (ctx->audio_codec == DSS_ACODEC_G723_1 ? 240 : 264);
+        st->duration  = frames * dss_frame_samples(ctx);
     }
 
     /* Jump over header */
@@ -747,26 +623,94 @@ static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
+/* Move to the next audio block of a Grundig file that has frames, and set the
+ * bit reader to the first of them. Byte 1 of the block header is its offset
+ * from the start of the block in 16-bit words, and the top 4 bits of byte 0
+ * the bit in that word. An offset into the block header is taken as 0, as
+ * dss_next_block() takes it. */
+static int dss_grundig_next_block(AVFormatContext *s)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = s->pb;
+    uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE], word[2];
+    int64_t block_pos = ctx->block_pos;
+    int start, ret;
+
+    for (;;) {
+        ctx->block_pos += DSS_BLOCK_SIZE;
+        if ((ret = dss_seek_block(s, ctx->block_pos)) < 0)
+            goto fail;
+        ret = avio_read(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+        if (ret < 0 && ret != AVERROR_EOF)
+            goto fail;
+        if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE) {
+            ret = AVERROR_EOF;
+            goto fail;
+        }
+
+        ctx->frames_left = dss_frames_in_block(ctx, header);
+        if (!ctx->frames_left)
+            continue;
+
+        start = (header[1] - DSS_AUDIO_BLOCK_HEADER_SIZE / 2) * 16 +
+                (header[0] >> 4);
+        if (start < 0)
+            start = 0;
+        if (avio_seek(pb, ctx->block_pos + DSS_AUDIO_BLOCK_HEADER_SIZE +
+                      start / 16 * 2, SEEK_SET) < 0 ||
+            ffio_read_size(pb, word, 2) < 0) {
+            ret = AVERROR_EOF;
+            goto fail;
+        }
+        ctx->grundig_word = AV_RL16(word);
+        ctx->grundig_bits = 16 - start % 16;
+        return 0;
+    }
+
+fail:
+    ctx->block_pos   = block_pos;
+    ctx->frames_left = 0;
+    return ret;
+}
+
 static int dss_grundig_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    int ret;
+    uint8_t word[2];
+    int64_t pos;
+    int i, ret;
 
-    if (ctx->grundig_pos >= ctx->grundig_nb_frames)
-        return AVERROR_EOF;
+    if (ctx->frames_left <= 0) {
+        ret = dss_grundig_next_block(s);
+        if (ret < 0)
+            return ret;
+    }
+    /* The offset of the word that holds the first bit of the frame. */
+    pos = ctx->grundig_bits ? avio_tell(s->pb) - 2 : dss_frame_pos(s);
 
     if ((ret = av_new_packet(pkt, DSS_GRUNDIG_FRAME_SIZE)) < 0)
         return ret;
+    memset(pkt->data, 0, DSS_GRUNDIG_FRAME_SIZE);
 
-    memcpy(pkt->data,
-           ctx->grundig_frames + ctx->grundig_pos * DSS_GRUNDIG_FRAME_SIZE,
-           DSS_GRUNDIG_FRAME_SIZE);
+    for (i = 0; i < DSS_GRUNDIG_FRAME_BITS; i++) {
+        if (!ctx->grundig_bits) {
+            if (dss_read_payload(s, word, 2) < 0)
+                return AVERROR_EOF; /* no whole frame left */
+            ctx->grundig_word = AV_RL16(word);
+            ctx->grundig_bits = 16;
+        }
+        ctx->grundig_bits--;
+        if ((ctx->grundig_word >> ctx->grundig_bits) & 1)
+            pkt->data[i >> 3] |= 0x80 >> (i & 7);
+    }
+
+    ctx->frames_left--;
 
     pkt->stream_index = 0;
-    pkt->pts          = (int64_t)ctx->grundig_pos * DSS_GRUNDIG_SAMPLES_PER_FRAME;
+    pkt->pts          = ctx->frames_read++ * DSS_GRUNDIG_SAMPLES_PER_FRAME;
     pkt->duration     = DSS_GRUNDIG_SAMPLES_PER_FRAME;
+    pkt->pos          = pos;
     pkt->flags       |= AV_PKT_FLAG_KEY;
-    ctx->grundig_pos++;
 
     return 0;
 }
@@ -783,33 +727,14 @@ static int dss_read_packet(AVFormatContext *s, AVPacket *pkt)
         return dss_723_1_read_packet(s, pkt);
 }
 
-static int dss_read_close(AVFormatContext *s)
-{
-    DSSDemuxContext *ctx = s->priv_data;
-
-    av_freep(&ctx->grundig_frames);
-    return 0;
-}
-
 static int dss_read_seek(AVFormatContext *s, int stream_index,
                          int64_t timestamp, int flags)
 {
     DSSDemuxContext *ctx = s->priv_data;
-    int samples = ctx->audio_codec == DSS_ACODEC_G723_1 ? 240 : 264;
+    int samples = dss_frame_samples(ctx);
     int64_t ret, seekto, target = timestamp / samples, frames = 0;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int count;
-
-    if (ctx->grundig) {
-        int64_t idx = timestamp / DSS_GRUNDIG_SAMPLES_PER_FRAME;
-
-        if (idx < 0)
-            idx = 0;
-        if (idx > ctx->grundig_nb_frames)
-            idx = ctx->grundig_nb_frames;
-        ctx->grundig_pos = idx;
-        return 0;
-    }
 
     /* Frame sizes vary, and a block can hold fewer frames than would fit, so
      * find the block from the per-block frame counts, taken as in
@@ -827,7 +752,7 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
             seekto = ctx->dss_header_size - DSS_BLOCK_SIZE;
             continue;
         }
-        count = dss_block_frames(header);
+        count = dss_frames_in_block(ctx, header);
         if (frames + count > target)
             break;
         frames += count;
@@ -851,6 +776,5 @@ const FFInputFormat ff_dss_demuxer = {
     .read_probe     = dss_probe,
     .read_header    = dss_read_header,
     .read_packet    = dss_read_packet,
-    .read_close     = dss_read_close,
     .read_seek      = dss_read_seek,
 };
