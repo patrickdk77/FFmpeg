@@ -43,12 +43,23 @@
 #define DS2_QP_SAMPLE_RATE 16000
 #define DS2_QP7_NOISE_FRAME_SIZE 12
 
+#define DS2_FORMATS_DSS (1 << DS2_FORMAT_SP | 1 << DS2_FORMAT_SP_VR | \
+                         1 << DS2_FORMAT_LP | 1 << DS2_FORMAT_LP_ALT)
+#define DS2_FORMATS_KNOWN (DS2_FORMATS_DSS | 1 << DS2_FORMAT_QP | \
+                           1 << DS2_FORMAT_QP7)
+
 #define DS2_FORMAT_SCAN_BLOCKS 64
 
 typedef struct DS2DemuxContext {
   AVClass *class;
   int header_size;      /* in bytes, from ds2_header_size() */
   int format_type;      /* format of the first block that holds frames */
+  int formats;
+  int accept;
+  int mixed;            /* packets lead with the format byte */
+  int block_format;
+  int frame_format;
+  int format_warned;
   int counter;          /* bytes remaining in current block payload */
   int64_t total_frames; /* total frame count from block headers */
   int64_t frames_read;  /* frames read so far */
@@ -59,6 +70,7 @@ typedef struct DS2DemuxContext {
   AVIOContext *decrypt_pb;
   char *password;
   int extract;          /* DS2ExtractMode */
+  AVFormatContext *dss;
   int64_t frames_out;   /* frames returned so far */
   DS2Annotations annotations;
 } DS2DemuxContext;
@@ -98,6 +110,19 @@ static int ds2_block_frames(const uint8_t *hdr) {
   return hdr[5];
 }
 
+static int ds2_format_known(const uint8_t *hdr) {
+  return hdr[3] == 0xff && hdr[4] < 8 && DS2_FORMATS_KNOWN & 1 << hdr[4];
+}
+
+static void ds2_block_format(int *format, uint8_t *hdr) {
+  if (!ds2_format_known(hdr)) {
+    if (*format >= 0)
+      hdr[4] = *format;
+  } else if (ds2_block_frames(hdr)) {
+    *format = hdr[4];
+  }
+}
+
 static int ds2_probe_format(const uint8_t *buf, int size, int pos) {
   int copy;
 
@@ -107,7 +132,7 @@ static int ds2_probe_format(const uint8_t *buf, int size, int pos) {
       pos += copy * DS2_BLOCK_SIZE;
       continue;
     }
-    if (ds2_block_frames(buf + pos))
+    if (ds2_block_frames(buf + pos) && ds2_format_known(buf + pos))
       return buf[pos + 4];
     pos += DS2_BLOCK_SIZE;
   }
@@ -157,6 +182,14 @@ static int ds2_block_anchor(const uint8_t *hdr) {
                  0, DS2_BLOCK_PAYLOAD_SIZE);
 }
 
+static int ds2_block_qp_frames(const DS2DemuxContext *ctx,
+                               const uint8_t *hdr) {
+  if ((hdr[4] != DS2_FORMAT_QP && hdr[4] != DS2_FORMAT_QP7) ||
+      !(ctx->accept & 1 << hdr[4]))
+    return 0;
+  return ds2_block_frames(hdr);
+}
+
 /*
  * Frames that start in a block, from its header and the size bytes of it the
  * file holds, as the reader takes them: from the anchor on, up to the stated
@@ -166,8 +199,9 @@ static int ds2_block_anchor(const uint8_t *hdr) {
  * zero-filled. *need is set to the bytes the last frame of a whole block takes
  * from the blocks after it.
  */
-static int ds2_block_frames_held(const uint8_t *buf, int size, int *need) {
-  int frame_count = ds2_block_frames(buf), n = 0;
+static int ds2_block_frames_held(const DS2DemuxContext *ctx,
+                                 const uint8_t *buf, int size, int *need) {
+  int frame_count = ds2_block_qp_frames(ctx, buf), n = 0;
   int off = DS2_AUDIO_BLOCK_HEADER_SIZE + ds2_block_anchor(buf);
   int qp7 = buf[4] == DS2_FORMAT_QP7;
 
@@ -189,8 +223,10 @@ static int ds2_block_frames_held(const uint8_t *buf, int size, int *need) {
  * A block that states no frames passes up to its anchor's worth on to the
  * block after it. Where the file ends, the reader keeps the frame.
  */
-static int ds2_frame_dropped(AVFormatContext *s, int64_t pos, int need) {
-  AVIOContext *pb = ((DS2DemuxContext *)s->priv_data)->pb;
+static int ds2_frame_dropped(AVFormatContext *s, int64_t pos, int format,
+                             int need) {
+  DS2DemuxContext *ctx = s->priv_data;
+  AVIOContext *pb = ctx->pb;
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
   int copy;
 
@@ -203,7 +239,8 @@ static int ds2_frame_dropped(AVFormatContext *s, int64_t pos, int need) {
       pos += (copy - 1) * DS2_BLOCK_SIZE;
       continue;
     }
-    if (ds2_block_frames(hdr))
+    ds2_block_format(&format, hdr);
+    if (ds2_block_qp_frames(ctx, hdr))
       return ds2_block_anchor(hdr) != need;
     need -= ds2_block_anchor(hdr);
   }
@@ -215,7 +252,7 @@ static int ds2_frame_dropped(AVFormatContext *s, int64_t pos, int need) {
  * in the payload, the rest of its len bytes.
  */
 static int ds2_read_block(AVFormatContext *s, int64_t pos, uint8_t *buf,
-                          int len) {
+                          int len, int *format) {
   AVIOContext *pb = ((DS2DemuxContext *)s->priv_data)->pb;
 
   if (len < DS2_AUDIO_BLOCK_HEADER_SIZE ||
@@ -224,7 +261,10 @@ static int ds2_read_block(AVFormatContext *s, int64_t pos, uint8_t *buf,
           DS2_AUDIO_BLOCK_HEADER_SIZE)
     return AVERROR_EOF;
   len -= DS2_AUDIO_BLOCK_HEADER_SIZE;
-  if (buf[4] == DS2_FORMAT_QP7 && !ds2_header_copy_blocks(buf) &&
+  if (ds2_header_copy_blocks(buf))
+    return 0;
+  ds2_block_format(format, buf);
+  if (buf[4] == DS2_FORMAT_QP7 &&
       avio_read(pb, buf + DS2_AUDIO_BLOCK_HEADER_SIZE, len) != len)
     return AVERROR_EOF;
   return 0;
@@ -236,34 +276,37 @@ static int ds2_read_block(AVFormatContext *s, int64_t pos, uint8_t *buf,
  */
 static int ds2_block_frames_read(AVFormatContext *s, int64_t pos,
                                  const uint8_t *buf, int size) {
-  int need, n = ds2_block_frames_held(buf, size, &need);
+  int need, n = ds2_block_frames_held(s->priv_data, buf, size, &need);
 
-  if (need && ds2_frame_dropped(s, pos, need))
+  if (need && ds2_frame_dropped(s, pos, buf[4], need))
     n--;
   return n;
 }
 
 static int64_t ds2_count_total_frames(AVFormatContext *s) {
-  AVIOContext *pb = ((DS2DemuxContext *)s->priv_data)->pb;
-  int header_size = ((DS2DemuxContext *)s->priv_data)->header_size;
+  DS2DemuxContext *ctx = s->priv_data;
+  AVIOContext *pb = ctx->pb;
   int64_t size = avio_size(pb), total = 0, pos;
   uint8_t buf[DS2_BLOCK_SIZE];
-  int copy, len;
+  int copy, len, n, format = ctx->format_type;
 
   if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
     return 0;
-  if (size < header_size)
+  if (size < ctx->header_size)
     return AVERROR_INVALIDDATA;
 
-  for (pos = header_size; pos < size; pos += DS2_BLOCK_SIZE) {
+  for (pos = ctx->header_size; pos < size; pos += DS2_BLOCK_SIZE) {
     len = FFMIN(size - pos, DS2_BLOCK_SIZE);
-    if (ds2_read_block(s, pos, buf, len) < 0)
+    if (ds2_read_block(s, pos, buf, len, &format) < 0)
       break;
     if ((copy = ds2_header_copy_blocks(buf))) {
       pos += (copy - 1) * DS2_BLOCK_SIZE;
       continue;
     }
-    total += ds2_block_frames_read(s, pos, buf, len);
+    n = ds2_block_frames_read(s, pos, buf, len);
+    if (n > 0 || (buf[4] < 8 && ds2_block_frames(buf)))
+      ctx->formats |= 1 << buf[4];
+    total += n;
   }
 
   return total;
@@ -274,7 +317,7 @@ static int ds2_first_format(AVFormatContext *s) {
   AVIOContext *pb = ctx->pb;
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
   int64_t pos = ctx->header_size, end = INT64_MAX;
-  int copy, ret;
+  int copy, ret, first = -1, held = 0;
 
   if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
     end = pos + FFMAX(FFMIN(s->probesize, INT_MAX / 2),
@@ -296,10 +339,17 @@ static int ds2_first_format(AVFormatContext *s) {
     copy = ds2_header_copy_blocks(hdr);
     if (copy)
       pos += (copy - 1) * DS2_BLOCK_SIZE;
-    else if (ds2_block_frames(hdr))
-      return hdr[4];
+    else if (ds2_block_frames(hdr)) {
+      if (ds2_format_known(hdr))
+        return hdr[4];
+      if (first < 0 && hdr[3] == 0xff)
+        first = hdr[4];
+      held = 1;
+    }
   }
-  return DS2_FORMAT_QP;
+  if (first >= 0)
+    return first;
+  return held ? AVERROR_INVALIDDATA : DS2_FORMAT_QP;
 }
 
 static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
@@ -321,8 +371,14 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
       return AVERROR_EOF;
   }
 
-  frame_count = ds2_block_frames(hdr);
+  ds2_block_format(&ctx->block_format, hdr);
+  frame_count = ds2_block_qp_frames(ctx, hdr);
   anchor      = ds2_block_anchor(hdr);
+  if (!frame_count && ds2_block_frames(hdr) && !ctx->format_warned) {
+    av_log(s, AV_LOG_WARNING, "Skipping blocks of format %d in a file of "
+           "format %d\n", hdr[4], ctx->format_type);
+    ctx->format_warned = 1;
+  }
 
   ctx->blk_frames  = frame_count;
 
@@ -373,6 +429,54 @@ static int ds2_next_block(AVFormatContext *s, int in_frame_offset) {
   return ds2_load_block(s, in_frame_offset);
 }
 
+static int ds2_open_dss(AVFormatContext *s) {
+  extern const FFInputFormat ff_dss_demuxer;
+  DS2DemuxContext *ctx = s->priv_data;
+  AVStream *st = s->streams[0], *in;
+  AVDictionary *opts = NULL;
+  int64_t ret64;
+  int ret;
+
+  ff_ds2_decrypt_close(&ctx->decrypt_pb);
+  ctx->pb = s->pb;
+  if ((ret64 = avio_seek(s->pb, 0, SEEK_SET)) < 0)
+    return (int)ret64;
+
+  if (!(ctx->dss = avformat_alloc_context()))
+    return AVERROR(ENOMEM);
+  if ((ret = ff_copy_whiteblacklists(ctx->dss, s)) < 0) {
+    avformat_free_context(ctx->dss);
+    ctx->dss = NULL;
+    return ret;
+  }
+  ctx->dss->pb = s->pb;
+  ctx->dss->interrupt_callback = s->interrupt_callback;
+  ctx->dss->io_open = NULL;
+
+  ret = av_dict_set_int(&opts, "extract", ctx->extract, 0);
+  if (ret >= 0 && ctx->password)
+    ret = av_dict_set(&opts, "password", ctx->password, 0);
+  if (ret >= 0)
+    ret = avformat_open_input(&ctx->dss, "", &ff_dss_demuxer.p, &opts);
+  av_dict_free(&opts);
+  if (ret < 0)
+    return ret;
+  if (ctx->dss->nb_streams != 1)
+    return AVERROR_BUG;
+
+  in = ctx->dss->streams[0];
+  if ((ret = avcodec_parameters_copy(st->codecpar, in->codecpar)) < 0)
+    return ret;
+  avpriv_set_pts_info(st, 64, in->time_base.num, in->time_base.den);
+  st->start_time = in->start_time;
+  st->duration   = in->duration;
+  st->nb_frames  = in->nb_frames;
+  s->duration    = ctx->dss->duration;
+  s->bit_rate    = ctx->dss->bit_rate;
+  return av_dict_copy(&s->metadata, ctx->dss->metadata,
+                      AV_DICT_DONT_OVERWRITE);
+}
+
 static int ds2_read_header(AVFormatContext *s) {
   DS2DemuxContext *ctx = s->priv_data;
   AVIOContext *pb = s->pb;
@@ -390,6 +494,12 @@ static int ds2_read_header(AVFormatContext *s) {
                           AV_RL32(file_magic) != DS2_ENCRYPTED_MAGIC))
     return AVERROR_INVALIDDATA;
   ctx->header_size = ds2_header_size(file_magic, ret);
+
+  if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+    if (!avformat_new_stream(s, NULL))
+      return AVERROR(ENOMEM);
+    return ds2_open_dss(s);
+  }
 
   ctx->pb = s->pb;
   if (AV_RL32(file_magic) == DS2_ENCRYPTED_MAGIC) {
@@ -409,19 +519,28 @@ static int ds2_read_header(AVFormatContext *s) {
   if (ret < 0)
     av_log(s, AV_LOG_WARNING, "Failed to read DS2 metadata\n");
 
-  ret64 = ds2_count_total_frames(s);
-  if (ret64 < 0)
-    return (int)ret64;
-  ctx->total_frames = ret64;
-
   ret = ds2_first_format(s);
   if (ret < 0)
     return ret;
   ctx->format_type = ret;
 
+  ctx->accept = 1 << DS2_FORMAT_QP | 1 << DS2_FORMAT_QP7;
+  ctx->block_format = ctx->format_type;
+  ret64 = ds2_count_total_frames(s);
+  if (ret64 < 0)
+    return (int)ret64;
+  ctx->total_frames = ret64;
+
+  if (ctx->formats & DS2_FORMATS_DSS)
+    return ds2_open_dss(s);
+
+  ctx->mixed = ctx->formats == (1 << DS2_FORMAT_QP | 1 << DS2_FORMAT_QP7);
+  if (!ctx->mixed && ctx->format_type >= 0 && ctx->format_type < 8)
+    ctx->accept = 1 << ctx->format_type;
+
   st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-  st->codecpar->codec_id = AV_CODEC_ID_DS2;
-  st->codecpar->codec_tag = ctx->format_type;
+  st->codecpar->codec_id = ctx->mixed ? AV_CODEC_ID_DSS_MIXED : AV_CODEC_ID_DS2;
+  st->codecpar->codec_tag = ctx->mixed ? 0 : ctx->format_type;
   st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
   if (ctx->format_type == DS2_FORMAT_SP ||
@@ -527,8 +646,10 @@ static int ds2_qp_read_frame(AVFormatContext *s, AVPacket *pkt) {
         continue;
     }
 
+    if (!offset)
+      ctx->frame_format = ctx->block_format;
     /* QP7: the type bit in the first 16-bit word gives the frame size */
-    if (ctx->format_type == DS2_FORMAT_QP7 && !offset)
+    if (ctx->frame_format == DS2_FORMAT_QP7 && !offset)
       to_read = FFMIN(to_read, 2);
 
     if (!offset)
@@ -546,7 +667,7 @@ static int ds2_qp_read_frame(AVFormatContext *s, AVPacket *pkt) {
 
     if (!offset) {
       ctx->blk_frames--;
-      if (ctx->format_type == DS2_FORMAT_QP7 && !(pkt->data[1] & 0x80))
+      if (ctx->frame_format == DS2_FORMAT_QP7 && !(pkt->data[1] & 0x80))
         ctx->frame_size = DS2_QP7_NOISE_FRAME_SIZE;
     }
     offset += to_read;
@@ -574,6 +695,9 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
   DS2DemuxContext *ctx = s->priv_data;
   int ret, skipped = 0;
 
+  if (ctx->dss)
+    return av_read_frame(ctx->dss, pkt);
+
   for (;;) {
     ret = ds2_qp_read_frame(s, pkt);
     if (ret < 0)
@@ -585,6 +709,13 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
       if (skipped &&
           !av_packet_new_side_data(pkt, AV_PKT_DATA_DECODER_RESET, 0))
         return AVERROR(ENOMEM);
+      if (ctx->mixed) {
+        if ((ret = av_grow_packet(pkt, 1)) < 0)
+          return ret;
+        memmove(pkt->data + 1, pkt->data, pkt->size - 1);
+        pkt->data[0] = ctx->frame_format == DS2_FORMAT_QP7 ? DS2_FORMAT_QP7
+                                                           : DS2_FORMAT_QP;
+      }
       return 0;
     }
 
@@ -599,7 +730,10 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   int64_t ret, seekto, target = timestamp / DS2_QP_SAMPLES_PER_FRAME, frames = 0;
   int64_t last = -1, last_frames = 0, size = avio_size(ctx->pb);
   uint8_t buf[DS2_BLOCK_SIZE];
-  int copy, frame_count, len;
+  int copy, frame_count, len, format = ctx->format_type, last_format = -1;
+
+  if (ctx->dss)
+    return av_seek_frame(ctx->dss, 0, timestamp, flags);
 
   if (target < 0)
     target = 0;
@@ -622,12 +756,13 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
    * last block that holds frames. */
   for (seekto = ctx->header_size; ; seekto += DS2_BLOCK_SIZE) {
     len = FFMIN(size - seekto, DS2_BLOCK_SIZE);
-    ret = ds2_read_block(s, seekto, buf, len);
+    ret = ds2_read_block(s, seekto, buf, len, &format);
     if (ret < 0) {
       if (last < 0)
         return ret;
       seekto = last;
       frames = last_frames;
+      format = last_format;
       break;
     }
     if ((copy = ds2_header_copy_blocks(buf))) {
@@ -640,6 +775,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
     if (frame_count) {
       last        = seekto;
       last_frames = frames;
+      last_format = format;
     }
     frames += frame_count;
   }
@@ -656,6 +792,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
                                                  ctx->extract, frames);
   ctx->counter     = 0;
   ctx->blk_frames  = 0;
+  ctx->block_format = format;
 
   return 0;
 }
@@ -664,6 +801,7 @@ static int ds2_read_close(AVFormatContext *s) {
   DS2DemuxContext *ctx = s->priv_data;
 
   ff_ds2_decrypt_close(&ctx->decrypt_pb);
+  avformat_close_input(&ctx->dss);
   return 0;
 }
 

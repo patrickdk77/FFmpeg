@@ -192,6 +192,7 @@ FATE_SEEK_EXTRA-$(CONFIG_WAV_DEMUXER)       += fate-seek-bad-avg-byterate
 FATE_SEEK_EXTRA-$(CONFIG_DSS_DEMUXER)       += fate-seek-dss-sp
 FATE_SEEK_EXTRA-$(CONFIG_DS2_DEMUXER)       += fate-seek-ds2-qp
 FATE_SEEK_EXTRA-$(CONFIG_DSS_DEMUXER)       += fate-seek-ds2-sp-qp-resync
+FATE_SEEK_EXTRA-$(CONFIG_DSS_DEMUXER)       += fate-seek-ds2-sp-qp-format3-first
 
 fate-seek-extra-mp3:  CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/gapless/gapless.mp3 -fastseek 1
 fate-seek-bad-avg-byterate: CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/wav/wrong-avg-byterate.wav -seekback 500 -stream_id 0
@@ -204,6 +205,7 @@ fate-seek-mkv-codec-delay:   CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_
 fate-seek-dss-sp:     CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/dss/sp.dss -duration 10
 fate-seek-ds2-qp:     CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/ds2/sample-qp.ds2 -duration 45
 fate-seek-ds2-sp-qp-resync: CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/ds2/olympus-sp-qp-resync.ds2 -duration 7
+fate-seek-ds2-sp-qp-format3-first: CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/ds2/olympus-sp-qp-format3-first.ds2 -duration 7
 
 # A master playlist with separate audio and video media playlists with different DTS.
 tests/data/hls-seek.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
