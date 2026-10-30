@@ -142,9 +142,26 @@ static int dss_ds2_header_size(const uint8_t *buf, int size)
     return buf[0] * DSS_BLOCK_SIZE;
 }
 
+/* Olympus DssWriter can leave a copy of the file header in the audio area */
+static int dss_header_copy_blocks(const uint8_t *header)
+{
+    if ((header[1] == 'd' && header[2] == 's' &&
+         (header[3] == 's' || header[3] == '2')) ||
+        (header[1] == 'e' && header[2] == 'n' && header[3] == 'c'))
+        return FFMAX(header[0], 1);
+    return 0;
+}
+
 static int dss_probe_format(const uint8_t *buf, int size, int pos)
 {
+    int copy;
+
     while (pos + DSS_AUDIO_BLOCK_HEADER_SIZE <= size) {
+        copy = dss_header_copy_blocks(buf + pos);
+        if (copy) {
+            pos += copy * DSS_BLOCK_SIZE;
+            continue;
+        }
         if (dss_block_frames(buf + pos))
             return buf[pos + 4];
         pos += DSS_BLOCK_SIZE;
@@ -269,7 +286,7 @@ static int dss_first_format(AVFormatContext *s)
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int64_t pos = ctx->dss_header_size, end = INT64_MAX;
-    int ret, first = -1, held = 0;
+    int copy, ret, first = -1, held = 0;
 
     if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         end = pos + FFMAX(FFMIN(s->probesize, INT_MAX / 2),
@@ -288,7 +305,10 @@ static int dss_first_format(AVFormatContext *s)
             return ret;
         if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE)
             break;
-        if (dss_block_frames(header)) {
+        copy = dss_header_copy_blocks(header);
+        if (copy)
+            pos += (copy - 1) * DSS_BLOCK_SIZE;
+        else if (dss_block_frames(header)) {
             if (dss_format_known(header))
                 return header[4];
             if (first < 0 && header[3] == 0xff)
@@ -325,7 +345,7 @@ static int dss_read_header(AVFormatContext *s)
     version = buf[0];
     is_ds2  = magic >> 24 == '2' || magic == DS2_ENCRYPTED_MAGIC;
     ctx->dss_header_size = is_ds2 ? dss_ds2_header_size(buf, ret)
-                                  : FFMAX(version, 1) * DSS_BLOCK_SIZE;
+                                  : version * DSS_BLOCK_SIZE;
 
     ctx->pb = s->pb;
     if (magic == DS2_ENCRYPTED_MAGIC) {
@@ -494,7 +514,7 @@ static int dss_next_block(AVFormatContext *s)
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int64_t block_pos = ctx->block_pos;
-    int cont, ret;
+    int cont, copy, ret;
 
     for (;;) {
         ctx->block_pos += DSS_BLOCK_SIZE;
@@ -506,6 +526,10 @@ static int dss_next_block(AVFormatContext *s)
         if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE) {
             ret = AVERROR_EOF;
             goto fail;
+        }
+        if ((copy = dss_header_copy_blocks(header))) {
+            ctx->block_pos += (copy - 1) * DSS_BLOCK_SIZE;
+            continue;
         }
 
         ctx->swap = !!(header[0] & 0x80);
@@ -696,7 +720,7 @@ static int dss_grundig_next_block(AVFormatContext *s)
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE], word[2];
     int64_t block_pos = ctx->block_pos;
-    int start, ret;
+    int start, copy, ret;
 
     for (;;) {
         ctx->block_pos += DSS_BLOCK_SIZE;
@@ -708,6 +732,10 @@ static int dss_grundig_next_block(AVFormatContext *s)
         if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE) {
             ret = AVERROR_EOF;
             goto fail;
+        }
+        if ((copy = dss_header_copy_blocks(header))) {
+            ctx->block_pos += (copy - 1) * DSS_BLOCK_SIZE;
+            continue;
         }
 
         ctx->frames_left = dss_frames_in_block(ctx, header);
@@ -824,7 +852,7 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
     int samples = dss_frame_samples(ctx);
     int64_t ret, seekto, target = timestamp / samples, frames = 0;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
-    int count;
+    int copy, count;
 
     /* With extract, timestamps count the frames returned: find the frame of
      * the file that the target is, or past the end the last one returned. */
@@ -855,6 +883,10 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
             target = frames - 1;
             frames = 0;
             seekto = ctx->dss_header_size - DSS_BLOCK_SIZE;
+            continue;
+        }
+        if ((copy = dss_header_copy_blocks(header))) {
+            seekto += (copy - 1) * DSS_BLOCK_SIZE;
             continue;
         }
         count = dss_frames_in_block(ctx, header);
