@@ -6,11 +6,11 @@
  * @file
  * DS2 (DSS Pro) CELP audio decoder
  *
- * Supports two modes:
- *   - SP mode: 12000 Hz, 14 reflection coefficients, 4x72-sample subframes,
- *              C(72,7) combinatorial codebook, 328-bit frames
+ * Supports one mode:
  *   - QP mode: 16000 Hz, 16 reflection coefficients, 4x64-sample subframes,
  *              C(64,11) combinatorial codebook, 448-bit frames
+ *
+ * The DSS demuxer reads DS2 SP and LP files, which dss_sp and g723_1 decode.
  *
  * Based on technical documentation from FFmpeg trac ticket #6091.
  *
@@ -31,22 +31,6 @@
 
 #define DS2_SUBFRAMES 4
 
-/* SP mode */
-#define DS2_SP_FORMAT 0
-#define DS2_SP_SAMPLE_RATE 12000
-#define DS2_SP_SUBFRAME_SIZE 72
-#define DS2_SP_FRAME_SAMPLES (DS2_SP_SUBFRAME_SIZE * DS2_SUBFRAMES) /* 288 */
-#define DS2_SP_FRAME_SIZE 42 /* bytes per packet from demuxer */
-#define DS2_SP_FRAME_BITS 328
-#define DS2_SP_NUM_REFL 14
-#define DS2_SP_NUM_PULSES 7
-#define DS2_SP_COMB_N 72
-#define DS2_SP_COMB_BITS 31
-#define DS2_SP_PITCH_MIN 36
-#define DS2_SP_PITCH_MAX 186
-#define DS2_SP_PITCH_RANGE (DS2_SP_PITCH_MAX - DS2_SP_PITCH_MIN + 1) /* 151 */
-#define DS2_SP_DELTA_RANGE 48
-
 /* QP mode */
 #define DS2_QP_FORMAT 6
 #define DS2_QP_SAMPLE_RATE 16000
@@ -61,145 +45,7 @@
 #define DS2_QP_PITCH_MIN 45
 #define DS2_QP_PITCH_MAX 300
 
-/* Maximum values across both modes */
-#define DS2_MAX_REFL 16
-#define DS2_MAX_PULSES 11
-#define DS2_MAX_SUBFRAME 72
-#define DS2_MAX_FRAME_SIZE 56
-#define DS2_MAX_FRAME_SAMPLES 288
-#define DS2_MAX_PITCH 300
-
 /* ---- Quantization tables (from DssDecoder.dll via hirparak/dss-codec) ---- */
-
-static const int ds2_sp_refl_cb_sizes[DS2_SP_NUM_REFL] = {
-    32, 32, 16, 16, 16, 16, 16, 16, 8, 8, 8, 8, 8, 8};
-
-static const int ds2_sp_refl_bits[DS2_SP_NUM_REFL] = {5, 5, 4, 4, 4, 4, 4,
-                                                      4, 3, 3, 3, 3, 3, 3};
-
-static const double ds2_sp_refl_cb[DS2_SP_NUM_REFL][32] = {
-    /* codebook 0: 32 entries (5 bits) */
-    {
-        -0.99648964405059803, -0.99447482824325584, -0.99227356910705555, -0.98992311954498302, -0.98697859048843384, -0.98315560817718517, -0.97845703363418579, -0.97294515371322621,
-        -0.96634370088577259, -0.95818209648132324, -0.94849675893783558, -0.93762117624282837, -0.92465364933013916, -0.90982383489608765, -0.89258062839508068, -0.87193638086318981,
-        -0.84453809261322021, -0.80686670541763317, -0.75273650884628285, -0.68559271097183228, -0.59305882453918457, -0.49232661724090582, -0.37286660075187678, -0.23751889169216159,
-        -0.086492136120796204, 0.055505454540252692, 0.19970230758190161, 0.34364268183708191, 0.48980069160461431, 0.61707371473312378, 0.75603789091110229, 0.85814595222473156,
-    },
-    /* codebook 1: 32 entries (5 bits) */
-    {
-        -0.83932507038116444, -0.74795973300933838, -0.63000380992889404, -0.53394168615341187, -0.43295449018478399, -0.3441393375396728, -0.25696265697479248, -0.17073425650596619,
-        -0.091958068311214433, -0.01903900504112244, 0.052224285900592797, 0.11839313805103301, 0.1783549636602402, 0.2372541725635528, 0.29721477627754211, 0.3537668883800506,
-        0.40784212946891779, 0.45481294393539429, 0.50129133462905884, 0.54627496004104614, 0.58747237920761108, 0.62822312116622925, 0.66538763046264648, 0.70207464694976807,
-        0.73674499988555908, 0.77054357528686523, 0.80186039209365845, 0.83312779664993275, 0.86545109748840332, 0.89261031150817871, 0.91912198066711415, 0.95161986351013184,
-    },
-    /* codebook 2: 16 entries (4 bits) */
-    {
-        -0.84921908378601074, -0.73877352476119995, -0.63912802934646606, -0.54262864589691162, -0.45297536253929138, -0.3615634143352508, -0.27665784955024719, -0.19215719401836401,
-        -0.11169989407062531, -0.027783248573541641, 0.058547001332044601, 0.15334524214267731, 0.2509396076202392, 0.35548952221870422, 0.46040034294128418, 0.56222474575042725,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 3: 16 entries (4 bits) */
-    {
-        -0.52269363403320312, -0.36544269323348999, -0.25236579775810242, -0.15633958578109741, -0.07006382942199707, 0.0055901305750012398, 0.076400011777877808, 0.14364670217037201,
-        0.20745196938514709, 0.27296623587608337, 0.33706799149513239, 0.40401595830917358, 0.47386428713798517, 0.55689501762390137, 0.64437347650527954, 0.75637841224670421,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 4: 16 entries (4 bits) */
-    {
-        -0.65786665678024292, -0.52734905481338501, -0.43598625063896179, -0.35534065961837769, -0.2828319370746612, -0.21628239750862119, -0.1507202535867691, -0.086402863264083862,
-        -0.021073304116725922, 0.042924325913190842, 0.1079228147864342, 0.17459326982498169, 0.24794331192970279, 0.3258441686630249, 0.41871780157089239, 0.54112184047698975,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 5: 16 entries (4 bits) */
-    {
-        -0.45868462324142462, -0.31666889786720281, -0.21466732025146479, -0.1320578008890152, -0.057968448847532272, 0.011117092333734041, 0.07500755786895752, 0.13579472899436951,
-        0.19598525762557981, 0.25554856657981878, 0.31658980250358582, 0.38104432821273798, 0.4490235447883606, 0.51869291067123413, 0.59894853830337524, 0.70050925016403198,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 6: 16 entries (4 bits) */
-    {
-        -0.49301117658615112, -0.377254158258438, -0.29594677686691279, -0.2276585698127746, -0.16046103835105899, -0.1025154292583466, -0.04720701277256012, 0.0066750943660736084,
-        0.058477573096752167, 0.10982513427734381, 0.1617173552513122, 0.2134320139884949, 0.27353012561798101, 0.34258392453193659, 0.41858315467834478, 0.51824533939361572,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 7: 16 entries (4 bits) */
-    {
-        -0.4498798251152038, -0.30053246021270752, -0.21120646595954901, -0.14185220003128049, -0.08451630175113678, -0.032514404505491257, 0.015219650231301779, 0.063579551875591278,
-        0.1108667626976967, 0.159284308552742, 0.20926699042320249, 0.26185598969459539, 0.31769314408302302, 0.3867107629776001, 0.47488671541213989, 0.61343812942504883,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 8: 8 entries (3 bits) */
-    {
-        -0.338720053434372, -0.21406418085098269, -0.1176334917545318, -0.031277228146791458, 0.051259458065032959, 0.1386592239141464, 0.23825997114181521, 0.36414420604705811,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 9: 8 entries (3 bits) */
-    {
-        -0.27650067210197449, -0.13947468996047971, -0.04215158894658088, 0.043295945972204208, 0.1231211572885514, 0.20533031225204471, 0.30106264352798462, 0.43178015947341919,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 10: 8 entries (3 bits) */
-    {
-        -0.37994620203971857, -0.2436934560537338, -0.14026482403278351, -0.05290689691901207, 0.02932893484830856, 0.11075615882873539, 0.2094983905553818, 0.34002029895782471,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 11: 8 entries (3 bits) */
-    {
-        -0.3610396683216095, -0.22593986988067619, -0.12237259745597839, -0.0334545485675335, 0.049011610448360443, 0.13094682991504669, 0.22538869082927701, 0.35039502382278442,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 12: 8 entries (3 bits) */
-    {
-        -0.40906670689582819, -0.28227350115776062, -0.1829423904418945, -0.1010773405432701, -0.027164401486515999, 0.048644959926605218, 0.13624019920825961, 0.25018396973609919,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-    /* codebook 13: 8 entries (3 bits) */
-    {
-        -0.342987060546875, -0.2203369140625, -0.123291015625, -0.04290771484375, 0.029632568359375, 0.101348876953125, 0.18328857421875, 0.295928955078125,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    },
-};
-
-static const double ds2_sp_pitch_gain[32] = {
-    0.049805, 0.112793, 0.175781, 0.238281, 0.301270, 0.364258, 0.427246, 0.490234,
-    0.553223, 0.615723, 0.678711, 0.741699, 0.804688, 0.867676, 0.930176, 0.993164,
-    1.056152, 1.119141, 1.182129, 1.245117, 1.307617, 1.370605, 1.433594, 1.496582,
-    1.559570, 1.622559, 1.685059, 1.748047, 1.811035, 1.874023, 1.937012, 2.000000,
-};
-
-/* SP excitation gain: 64 entries (6-bit) at VA 0x1004DF80 */
-static const double ds2_sp_exc_gain[64] = {
-        0,     4,     8,    13,    17,    22,    26,    31,    35,    40,
-       44,    48,    53,    58,    63,    69,    76,    83,    91,    99,
-      109,   119,   130,   142,   155,   170,   185,   203,   222,   242,
-      265,   290,   317,   346,   378,   414,   452,   494,   540,   591,
-      646,   706,   771,   843,   922,  1007,  1101,  1204,  1316,  1438,
-     1572,  1719,  1879,  2053,  2244,  2453,  2682,  2931,  3204,  3502,
-     3828,  4184,  4574,  5000,
-};
-
-/* SP pulse amplitude: 8 entries (3-bit) at VA 0x1004EF70 */
-static const double ds2_sp_pulse_amp[8] = {
-    -0.951599, -0.679718, -0.407837, -0.135956, 0.135956, 0.407837, 0.679718, 0.951599,
-};
 
 static const int ds2_qp_refl_cb_sizes[DS2_QP_NUM_REFL] = {
     128, 128, 64, 64, 32, 32, 32, 32, 32, 16, 16, 16, 16, 8, 8, 8};
@@ -593,39 +439,32 @@ typedef struct DS2Subframe {
   int pitch_lag;
   double exc_gain;
   uint64_t cb_index; /* combinatorial codebook index */
-  int pulse_positions[DS2_MAX_PULSES];
-  int pulse_indices[DS2_MAX_PULSES]; /* indices into pulse_amp table */
+  int pulse_positions[DS2_QP_NUM_PULSES];
+  int pulse_indices[DS2_QP_NUM_PULSES]; /* indices into pulse_amp table */
 } DS2Subframe;
 
 typedef struct DS2Context {
   AVCodecContext *avctx;
-  int mode;          /* DS2_SP_FORMAT or DS2_QP_FORMAT */
-  int num_refl;      /* 14 (SP) or 16 (QP) */
-  int subframe_size; /* 72 (SP) or 64 (QP) */
-  int frame_samples; /* 288 (SP) or 256 (QP) */
-  int num_pulses;    /* 7 (SP) or 11 (QP) */
-  int comb_n;        /* 72 (SP) or 64 (QP) */
-  int frame_size;    /* bytes: 42 (SP) or 56 (QP) */
 
   /* Per-frame decoded parameters */
-  double refl_coeffs[DS2_MAX_REFL];
+  double refl_coeffs[DS2_QP_NUM_REFL];
   DS2Subframe sf[DS2_SUBFRAMES];
 
   /* Persistent state */
-  double lattice_state[DS2_MAX_REFL]; /* lattice filter state */
-  double pitch_memory[DS2_MAX_PITCH + DS2_MAX_SUBFRAME];
+  double lattice_state[DS2_QP_NUM_REFL]; /* lattice filter state */
+  double pitch_memory[DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE];
   int pitch_mem_len;
   double deemph_state; /* QP de-emphasis */
 
   /* Working buffers */
-  double excitation[DS2_MAX_SUBFRAME];
-  double fixed_exc[DS2_MAX_SUBFRAME];
-  double adaptive_exc[DS2_MAX_SUBFRAME];
-  double synth_out[DS2_MAX_SUBFRAME];
-  double frame_buf[DS2_MAX_FRAME_SAMPLES];
+  double excitation[DS2_QP_SUBFRAME_SIZE];
+  double fixed_exc[DS2_QP_SUBFRAME_SIZE];
+  double adaptive_exc[DS2_QP_SUBFRAME_SIZE];
+  double synth_out[DS2_QP_SUBFRAME_SIZE];
+  double frame_buf[DS2_QP_FRAME_SAMPLES];
 
   DECLARE_ALIGNED(16, uint8_t, bits)
-  [DS2_MAX_FRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE];
+  [DS2_QP_FRAME_SIZE + AV_INPUT_BUFFER_PADDING_SIZE];
 } DS2Context;
 
 /* ---- Bitstream unpacking ---- */
@@ -642,74 +481,6 @@ static void ds2_swap_bytes(DS2Context *p, const uint8_t *src, int size) {
   }
   if (size & 1)
     p->bits[size - 1] = src[size - 1];
-}
-
-static void ds2_sp_unpack_frame(DS2Context *p, const uint8_t *src) {
-  GetBitContext gb;
-  int i, sf_idx;
-  uint32_t combined_pitch;
-
-  ds2_swap_bytes(p, src, DS2_SP_FRAME_SIZE);
-  init_get_bits(&gb, p->bits, DS2_SP_FRAME_BITS);
-
-  /* Reflection coefficients */
-  for (i = 0; i < DS2_SP_NUM_REFL; i++) {
-    int idx = get_bits(&gb, ds2_sp_refl_bits[i]);
-    p->refl_coeffs[i] = ds2_sp_refl_cb[i][idx];
-  }
-
-  /* Per-subframe parameters */
-  for (sf_idx = 0; sf_idx < DS2_SUBFRAMES; sf_idx++) {
-    DS2Subframe *sf = &p->sf[sf_idx];
-    int pg_idx, eg_idx;
-
-    pg_idx = get_bits(&gb, 5);
-    sf->cb_index = get_bits_long(&gb, DS2_SP_COMB_BITS);
-    eg_idx = get_bits(&gb, 6);
-
-    sf->pitch_gain = ds2_sp_pitch_gain[pg_idx];
-    sf->exc_gain = ds2_sp_exc_gain[eg_idx];
-
-    for (i = 0; i < DS2_SP_NUM_PULSES; i++)
-      sf->pulse_indices[i] = get_bits(&gb, 3);
-
-    /* Decode combinatorial pulse positions */
-    ds2_decode_combinatorial(sf->cb_index, DS2_SP_COMB_N, DS2_SP_NUM_PULSES,
-                             sf->pulse_positions);
-  }
-
-  /* Combined pitch: 24 bits encoding 4 pitch lags */
-  combined_pitch = get_bits_long(&gb, 24);
-
-  p->sf[0].pitch_lag = (combined_pitch % DS2_SP_PITCH_RANGE) + DS2_SP_PITCH_MIN;
-  combined_pitch /= DS2_SP_PITCH_RANGE;
-
-  for (i = 1; i < DS2_SUBFRAMES - 1; i++) {
-    p->sf[i].pitch_lag = combined_pitch % DS2_SP_DELTA_RANGE;
-    combined_pitch /= DS2_SP_DELTA_RANGE;
-  }
-  if (combined_pitch > DS2_SP_DELTA_RANGE - 1)
-    combined_pitch = 0;
-  p->sf[DS2_SUBFRAMES - 1].pitch_lag = combined_pitch;
-
-  /* Convert delta pitch lags to absolute */
-  {
-    int prev_pitch = p->sf[0].pitch_lag;
-    int half_delta = DS2_SP_DELTA_RANGE / 2 - 1; /* 23 */
-
-    for (i = 1; i < DS2_SUBFRAMES; i++) {
-      int base;
-      if (prev_pitch > DS2_SP_PITCH_MAX - half_delta)
-        base = DS2_SP_PITCH_MAX - half_delta - half_delta;
-      else if (prev_pitch >= DS2_SP_PITCH_MIN + half_delta)
-        base = prev_pitch - half_delta;
-      else
-        base = DS2_SP_PITCH_MIN;
-
-      p->sf[i].pitch_lag += base;
-      prev_pitch = p->sf[i].pitch_lag;
-    }
-  }
 }
 
 static void ds2_qp_unpack_frame(DS2Context *p, const uint8_t *src) {
@@ -773,23 +544,13 @@ static void ds2_gen_adaptive_exc(DS2Context *p, int pitch_lag,
 static void ds2_gen_fixed_exc(DS2Context *p, int sf_idx, int subframe_size) {
   int i;
   DS2Subframe *sf = &p->sf[sf_idx];
-  const double *pulse_amp;
-  int num_pulses;
-
-  if (p->mode == DS2_SP_FORMAT) {
-    pulse_amp = ds2_sp_pulse_amp;
-    num_pulses = DS2_SP_NUM_PULSES;
-  } else {
-    pulse_amp = ds2_qp_pulse_amp;
-    num_pulses = DS2_QP_NUM_PULSES;
-  }
 
   memset(p->fixed_exc, 0, sizeof(double) * subframe_size);
 
-  for (i = 0; i < num_pulses; i++) {
+  for (i = 0; i < DS2_QP_NUM_PULSES; i++) {
     int pos = sf->pulse_positions[i];
     if (pos >= 0 && pos < subframe_size)
-      p->fixed_exc[pos] += pulse_amp[sf->pulse_indices[i]] * sf->exc_gain;
+      p->fixed_exc[pos] += ds2_qp_pulse_amp[sf->pulse_indices[i]] * sf->exc_gain;
   }
 }
 
@@ -810,7 +571,7 @@ static void ds2_gen_excitation(DS2Context *p, int sf_idx, int subframe_size) {
  */
 static void ds2_lattice_filter(DS2Context *p, int subframe_size) {
   int n, k;
-  int num_refl = p->num_refl;
+  int num_refl = DS2_QP_NUM_REFL;
 
   for (n = 0; n < subframe_size; n++) {
     double acc = p->excitation[n] -
@@ -830,8 +591,7 @@ static void ds2_lattice_filter(DS2Context *p, int subframe_size) {
  * Update pitch memory with new excitation.
  */
 static void ds2_update_pitch_memory(DS2Context *p, int subframe_size) {
-  int max_pitch =
-      (p->mode == DS2_SP_FORMAT) ? DS2_SP_PITCH_MAX : DS2_QP_PITCH_MAX;
+  int max_pitch = DS2_QP_PITCH_MAX;
   int total = max_pitch + subframe_size;
   int i;
 
@@ -873,33 +633,18 @@ static av_cold int ds2_decode_init(AVCodecContext *avctx) {
   av_channel_layout_uninit(&avctx->ch_layout);
   avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
-  /* Determine mode from codec_tag set by demuxer */
-  if (avctx->codec_tag == DS2_QP_FORMAT) {
-    p->mode = DS2_QP_FORMAT;
-    p->num_refl = DS2_QP_NUM_REFL;
-    p->subframe_size = DS2_QP_SUBFRAME_SIZE;
-    p->frame_samples = DS2_QP_FRAME_SAMPLES;
-    p->num_pulses = DS2_QP_NUM_PULSES;
-    p->comb_n = DS2_QP_COMB_N;
-    p->frame_size = DS2_QP_FRAME_SIZE;
-    avctx->sample_rate = DS2_QP_SAMPLE_RATE;
-  } else {
-    /* Default to SP */
-    p->mode = DS2_SP_FORMAT;
-    p->num_refl = DS2_SP_NUM_REFL;
-    p->subframe_size = DS2_SP_SUBFRAME_SIZE;
-    p->frame_samples = DS2_SP_FRAME_SAMPLES;
-    p->num_pulses = DS2_SP_NUM_PULSES;
-    p->comb_n = DS2_SP_COMB_N;
-    p->frame_size = DS2_SP_FRAME_SIZE;
-    avctx->sample_rate = DS2_SP_SAMPLE_RATE;
+  /* The demuxer passes the block format in codec_tag. This decoder takes
+   * QP only. */
+  if (avctx->codec_tag != DS2_QP_FORMAT) {
+    avpriv_request_sample(avctx, "DS2 format %u", avctx->codec_tag);
+    return AVERROR_PATCHWELCOME;
   }
+
+  avctx->sample_rate = DS2_QP_SAMPLE_RATE;
 
   /* Initialize pitch memory */
   memset(p->pitch_memory, 0, sizeof(p->pitch_memory));
-  p->pitch_mem_len = (p->mode == DS2_SP_FORMAT)
-                         ? DS2_SP_PITCH_MAX + DS2_SP_SUBFRAME_SIZE
-                         : DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE;
+  p->pitch_mem_len = DS2_QP_PITCH_MAX + DS2_QP_SUBFRAME_SIZE;
 
   memset(p->lattice_state, 0, sizeof(p->lattice_state));
   p->deemph_state = 0.0;
@@ -915,53 +660,49 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   int16_t *out;
   int ret, j, i;
 
-  if (buf_size < p->frame_size) {
+  if (buf_size < DS2_QP_FRAME_SIZE) {
     if (buf_size)
       av_log(avctx, AV_LOG_WARNING,
-             "Expected %d bytes, got %d - skipping packet.\n", p->frame_size,
+             "Expected %d bytes, got %d - skipping packet.\n", DS2_QP_FRAME_SIZE,
              buf_size);
     *got_frame_ptr = 0;
     return AVERROR_INVALIDDATA;
   }
 
-  frame->nb_samples = p->frame_samples;
+  frame->nb_samples = DS2_QP_FRAME_SAMPLES;
   if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
     return ret;
 
   out = (int16_t *)frame->data[0];
 
   /* Unpack frame parameters from bitstream */
-  if (p->mode == DS2_SP_FORMAT)
-    ds2_sp_unpack_frame(p, buf);
-  else
-    ds2_qp_unpack_frame(p, buf);
+  ds2_qp_unpack_frame(p, buf);
 
   /* Decode each subframe */
   for (j = 0; j < DS2_SUBFRAMES; j++) {
     /* Generate adaptive excitation from pitch memory */
-    ds2_gen_adaptive_exc(p, p->sf[j].pitch_lag, p->subframe_size);
+    ds2_gen_adaptive_exc(p, p->sf[j].pitch_lag, DS2_QP_SUBFRAME_SIZE);
 
     /* Generate fixed excitation from pulse codebook */
-    ds2_gen_fixed_exc(p, j, p->subframe_size);
+    ds2_gen_fixed_exc(p, j, DS2_QP_SUBFRAME_SIZE);
 
     /* Combine: excitation = pitch_gain * adaptive + fixed */
-    ds2_gen_excitation(p, j, p->subframe_size);
+    ds2_gen_excitation(p, j, DS2_QP_SUBFRAME_SIZE);
 
     /* Update pitch memory */
-    ds2_update_pitch_memory(p, p->subframe_size);
+    ds2_update_pitch_memory(p, DS2_QP_SUBFRAME_SIZE);
 
     /* Lattice synthesis filter */
-    ds2_lattice_filter(p, p->subframe_size);
+    ds2_lattice_filter(p, DS2_QP_SUBFRAME_SIZE);
 
-    for (i = 0; i < p->subframe_size; i++)
-      p->frame_buf[j * p->subframe_size + i] = p->synth_out[i];
+    for (i = 0; i < DS2_QP_SUBFRAME_SIZE; i++)
+      p->frame_buf[j * DS2_QP_SUBFRAME_SIZE + i] = p->synth_out[i];
   }
 
-  if (p->mode == DS2_QP_FORMAT)
-    ds2_qp_deemphasis_frame(p, p->frame_buf, p->frame_samples);
+  ds2_qp_deemphasis_frame(p, p->frame_buf, DS2_QP_FRAME_SAMPLES);
 
   /* Convert to int16 (truncate toward zero, matching ds2decode.py / DLL) */
-  for (i = 0; i < p->frame_samples; i++) {
+  for (i = 0; i < DS2_QP_FRAME_SAMPLES; i++) {
     double sample = p->frame_buf[i];
     if (sample > 32767.0)
       sample = 32767.0;
@@ -971,7 +712,7 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   }
 
   *got_frame_ptr = 1;
-  return p->frame_size;
+  return DS2_QP_FRAME_SIZE;
 }
 
 const FFCodec ff_ds2_decoder = {

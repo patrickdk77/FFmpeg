@@ -43,6 +43,13 @@ fate-ds2-qp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/sample-qp.ds2
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-paused
 fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-empty64
+fate-ds2-lp-empty64: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp-empty64.ds2 -af aresample
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-empty64-pipe
+fate-ds2-lp-empty64-pipe: CMD = cat $(SAMPLES)/ds2/olympus-lp-empty64.ds2 | framecrc -i pipe:0 -af aresample
+fate-ds2-lp-empty64-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp-empty64
+
 FATE_SAMPLES_AUDIO-$(call PCM, DSF, DST, ARESAMPLE_FILTER) += fate-dsf-dst
 fate-dsf-dst: CMD = pcm -i $(TARGET_SAMPLES)/dst/dst-64fs44-2ch.dff
 fate-dsf-dst: CMP = oneoff
