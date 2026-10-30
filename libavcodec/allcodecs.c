@@ -467,6 +467,7 @@ extern const FFCodec ff_dsd_msbf_decoder;
 extern const FFCodec ff_dsd_lsbf_planar_decoder;
 extern const FFCodec ff_dsd_msbf_planar_decoder;
 extern const FFCodec ff_dsicinaudio_decoder;
+extern const FFCodec ff_dss_mixed_decoder;
 extern const FFCodec ff_dss_sp_decoder;
 extern const FFCodec ff_dst_decoder;
 extern const FFCodec ff_eac3_encoder;
