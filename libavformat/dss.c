@@ -29,6 +29,7 @@
 #include "demux.h"
 #include "internal.h"
 #include "avio_internal.h"
+#include "dss_metadata.h"
 
 #define DSS_HEAD_OFFSET_AUTHOR        0xc
 #define DSS_AUTHOR_SIZE               16
@@ -186,9 +187,15 @@ static int dss_read_metadata_string(AVFormatContext *s, unsigned int offset,
         return AVERROR(ENOMEM);
 
     ret = avio_read(s->pb, value, size);
-    if (ret < size) {
+    if (ret != size) {
         av_free(value);
         return ret < 0 ? ret : AVERROR_EOF;
+    }
+
+    ff_dss_trim_string(value, size);
+    if (!value[0]) {
+        av_free(value);
+        return 0;
     }
 
     return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
@@ -284,28 +291,25 @@ static int dss_read_header(AVFormatContext *s)
 
     /* A DS2 header can leave the recording date zeroed, which does not
      * parse. The audio does not depend on these fields, so in a DS2 file a
-     * field that does not parse only warns. */
-    ret = dss_read_metadata_string(s, DSS_HEAD_OFFSET_AUTHOR,
-                                   DSS_AUTHOR_SIZE, "author");
-    if (ret) {
-        if (!is_ds2)
+     * field that does not parse is left out. */
+    if (is_ds2) {
+        ret = ff_dss_read_ds2_metadata(s);
+        if (ret < 0)
+            av_log(s, AV_LOG_WARNING, "Failed to read DS2 metadata\n");
+    } else {
+        ret = dss_read_metadata_string(s, DSS_HEAD_OFFSET_AUTHOR,
+                                       DSS_AUTHOR_SIZE, "author");
+        if (ret)
             return ret;
-        av_log(s, AV_LOG_WARNING, "Failed to read author metadata\n");
-    }
 
-    ret = dss_read_metadata_date(s, DSS_HEAD_OFFSET_END_TIME, "date");
-    if (ret) {
-        if (!is_ds2)
+        ret = dss_read_metadata_date(s, DSS_HEAD_OFFSET_END_TIME, "date");
+        if (ret)
             return ret;
-        av_log(s, AV_LOG_WARNING, "Failed to read date metadata\n");
-    }
 
-    ret = dss_read_metadata_string(s, DSS_HEAD_OFFSET_COMMENT,
-                                   DSS_COMMENT_SIZE, "comment");
-    if (ret) {
-        if (!is_ds2)
+        ret = dss_read_metadata_string(s, DSS_HEAD_OFFSET_COMMENT,
+                                       DSS_COMMENT_SIZE, "comment");
+        if (ret)
             return ret;
-        av_log(s, AV_LOG_WARNING, "Failed to read comment metadata\n");
     }
 
     /* DS2 leaves the DSS codec field unset; each block header states it. */
