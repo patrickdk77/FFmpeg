@@ -250,7 +250,7 @@ static void lpec_pitch_weights(int pw[3], int pitch_val, int scale)
             pw[i] = 0;
 }
 
-/* sort route entries by val descending */
+/* sort route entries by val ascending */
 static void lpec_route_sort(LPECRouteEntry *ent, int n)
 {
     LPECRouteEntry key, tmp;
