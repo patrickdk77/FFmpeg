@@ -74,6 +74,7 @@
 #define DSS_FORMAT_SCAN_BLOCKS        64
 #define DSS_FRAME_SIZE                42
 #define DSS_SP_SHORT_FRAME_SIZE       9
+#define DSS_BLOCK_MAX_FRAMES          13
 
 static const uint8_t frame_size[4] = { 24, 20, 4, 1 };
 
@@ -120,12 +121,29 @@ typedef struct DSSDemuxContext {
 /* Frames that start in an audio block: byte 2, or byte 5 when byte 2 is 0 or
  * 0xff, and none when that is 0xff. A recorder writes the second form where
  * it pauses or stops, and Olympus's and Philips's decoders play those
- * frames. */
+ * frames. Philips's decoder takes a block that states more than 13 as empty,
+ * which drops the DS-2600's splice blocks that state 19. So does this
+ * demuxer, except where the block's format counts, 0xff in byte 3, and is
+ * variable rate SP, LP or QP7, whose frames can be short enough for more to
+ * start in a block. */
 static int dss_block_frames(const uint8_t *header)
 {
     int n = header[2] && header[2] != 0xff ? header[2] : header[5];
 
-    return n == 0xff ? 0 : n;
+    if (n == 0xff)
+        return 0;
+    if (n > DSS_BLOCK_MAX_FRAMES) {
+        if (header[3] != 0xff)
+            return 0;
+        switch (header[4]) {
+        case DSS_ACODEC_DSS_SP_VR: case DSS_ACODEC_G723_1:
+        case DSS_ACODEC_G723_1_ALT: case DSS_ACODEC_QP7:
+            break;
+        default:
+            return 0;
+        }
+    }
+    return n;
 }
 
 /* Where the first frame that starts in an audio block starts, in bits from

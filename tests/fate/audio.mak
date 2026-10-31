@@ -121,6 +121,9 @@ FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-sp-byte2-ff
 fate-dss-sp-byte2-ff: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-byte2-ff.dss
 fate-dss-sp-byte2-ff: REF = $(SRC_PATH)/tests/ref/fate/dss-sp-philips-pause
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-sp-count19
+fate-dss-sp-count19: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-count19.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, GRUNDIG_SP) += fate-dss-sp-byte3-none
 fate-dss-sp-byte3-none: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-byte3-none.dss
 
@@ -337,6 +340,17 @@ fate-ds2-qp-philips-pause: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-ph
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DSS_MIXED, PIPE_PROTOCOL) += fate-ds2-qp-philips-pause-pipe
 fate-ds2-qp-philips-pause-pipe: CMD = cat $(SAMPLES)/ds2/olympus-qp-philips-pause.ds2 | framecrc -i pipe:0
 fate-ds2-qp-philips-pause-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp-philips-pause
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-count19
+fate-ds2-qp-count19: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-count19.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-count19-byte3
+fate-ds2-qp-count19-byte3: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-count19-byte3.ds2
+fate-ds2-qp-count19-byte3: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp-count19
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DSS_MIXED, PIPE_PROTOCOL) += fate-ds2-qp-count19-byte3-pipe
+fate-ds2-qp-count19-byte3-pipe: CMD = cat $(SAMPLES)/ds2/olympus-qp-count19-byte3.ds2 | framecrc -i pipe:0
+fate-ds2-qp-count19-byte3-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-qp-count19
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-empty64
 fate-ds2-lp-empty64: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp-empty64.ds2 -af aresample

@@ -47,6 +47,9 @@
                          1 << DS2_FORMAT_LP | 1 << DS2_FORMAT_LP_ALT)
 #define DS2_FORMATS_KNOWN (DS2_FORMATS_DSS | 1 << DS2_FORMAT_QP | \
                            1 << DS2_FORMAT_QP7)
+#define DS2_FORMATS_SHORT (1 << DS2_FORMAT_SP_VR | 1 << DS2_FORMAT_LP | \
+                           1 << DS2_FORMAT_LP_ALT | 1 << DS2_FORMAT_QP7)
+#define DS2_BLOCK_MAX_FRAMES 13
 
 #define DS2_FORMAT_SCAN_BLOCKS 64
 
@@ -103,22 +106,35 @@ static int ds2_header_copy_blocks(const uint8_t *hdr) {
  * Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff,
  * and none when that is 0xff. A recorder writes the second form where it
  * pauses or stops, and Olympus's and Philips's decoders play those frames.
+ * Philips's decoder takes a block that states more than 13 as empty, which
+ * drops the DS-2600's splice blocks that state 19. So does this demuxer,
+ * except where the block's format counts, 0xff in byte 3, and is variable
+ * rate SP, LP or QP7, whose frames can be short enough for more to start in
+ * a block.
  */
 static int ds2_block_frames(const uint8_t *hdr) {
   int n = hdr[2] && hdr[2] != 0xff ? hdr[2] : hdr[5];
 
-  return n == 0xff ? 0 : n;
+  if (n == 0xff || (n > DS2_BLOCK_MAX_FRAMES &&
+                    !(hdr[3] == 0xff && hdr[4] < 8 &&
+                      DS2_FORMATS_SHORT & 1 << hdr[4])))
+    return 0;
+  return n;
 }
 
 static int ds2_format_known(const uint8_t *hdr) {
   return hdr[3] == 0xff && hdr[4] < 8 && DS2_FORMATS_KNOWN & 1 << hdr[4];
 }
 
+/* A block without frames keeps its byte 4, so that a block the frame limit
+ * empties does not take a format that would let it hold frames. */
 static void ds2_block_format(int *format, uint8_t *hdr) {
+  if (!ds2_block_frames(hdr))
+    return;
   if (!ds2_format_known(hdr)) {
     if (*format >= 0)
       hdr[4] = *format;
-  } else if (ds2_block_frames(hdr)) {
+  } else {
     *format = hdr[4];
   }
 }
