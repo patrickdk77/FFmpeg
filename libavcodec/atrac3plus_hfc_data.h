@@ -1,5 +1,5 @@
 /*
- * Sony AT-X HFC tables, as built by lcstde.ax at decoder setup.
+ * Sony AT-X HFC tables.
  *
  * This file is part of FFmpeg.
  *

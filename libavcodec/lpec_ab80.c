@@ -1,6 +1,5 @@
 /*
- * LPEC QMF synthesis filterbank (cosine-modulated), reverse-engineered from
- * the Sony LPEC decoder.
+ * LPEC QMF synthesis filterbank (cosine-modulated).
  *
  * Copyright (c) 2026 Patrick Domack
  *
@@ -33,11 +32,11 @@
 #define LPEC_COS1536_WI_OFF 384 /* wi table: same index as wr, phase +768 sin indices */
 
 /*
- * The reference tables use truncated pi constants and an extended-precision
+ * The tables use truncated pi constants and an extended-precision
  * sine rounded to double.
  */
 
-/* fills (2048 entries). */
+/* dst[i] = sin(i * 2 pi / n) for i < n, one full period; n is 2048. */
 static void lpec_qmf_fill_cos2048(double *dst, int n)
 {
     int i;
@@ -47,7 +46,7 @@ static void lpec_qmf_fill_cos2048(double *dst, int n)
         dst[i] = (double) sinl((double) i * step);
 }
 
-/* fills (1536 entries, even indices). */
+/* dst[i] = sin(2i * pi / n) for i < n, one full period; n is 1536. */
 static void lpec_qmf_fill_cos1536(double *dst, int n)
 {
     int i;
@@ -104,7 +103,6 @@ static void lpec_qmf_permute012c0(double *a, double *b, int n)
 
 /*
  * Pass1 modulation bin count (pairs fill lo/hi[0..mod_n)).
- * Empirically flen/4 matches the reference decoder; the decompiler labels as (flen*3/4)/4.
  */
 static int lpec_ab80_mod_n(int flen)
 {
@@ -116,7 +114,7 @@ static int lpec_cos_period(int flen)
     return flen % 3 ? 2048 : 1536;
 }
 
-/* Pass1/2 walk cos pointers backward; reference decoder table is periodic sin steps. */
+/* Pass1/2 walk cos pointers backward; the table is periodic sin steps. */
 static double lpec_cos_at(const double *cos, int idx, int period)
 {
     idx %= period;
@@ -125,7 +123,9 @@ static double lpec_cos_at(const double *cos, int idx, int period)
     return cos[idx];
 }
 
-/* (cos2048) / twiddles (cos1536: wr @ i, wi @ i+384). */
+/* Radix-2 stages until 4-point blocks remain. The twiddles come from the
+ * sine table: wr at the twiddle index, wi a quarter period on (512 in
+ * cos2048, 384 in cos1536). */
 static void lpec_qmf_fft01430(double *a, double *b, int n, const double *cos,
                               int tw_base)
 {
@@ -214,9 +214,8 @@ static void lpec_qmf_shuffle01590(double *buf, int n)
 }
 
 /*
- * Radix-3 first pass of the reference transform for n = 3 * 2^k. The
- * reference runs the x87 at 53-bit precision, so plain double arithmetic in
- * the same order reproduces it exactly.
+ * Radix-3 first pass of the transform for n = 3 * 2^k, in double
+ * arithmetic. Reordering the operations changes the output.
  */
 static void lpec_qmf_pre01590_ref(double *re, double *im, int n, const double *cos)
 {
@@ -277,7 +276,8 @@ static void lpec_qmf_fft01590(double *lo, double *hi, int n, const double *cos15
 
 }
 
-/* /: FFT + radix-4 + bit-reverse. */
+/* Length-n FFT: the 3 * 2^k transform for the cos1536 table; otherwise the
+ * radix-2 stages, the last radix-4 stage and bit reversal. */
 static void lpec_qmf_stage1530(double *lo, double *hi, int n, const double *cos,
                                int tw_base, const double *cos2048)
 {
@@ -303,7 +303,7 @@ static void lpec_ab80_core(double *inout, int seg_len, const LPECQmfDesc *desc,
     int half  = flen >> 1;
     int mod_n = lpec_ab80_mod_n(flen);
     int fft_n = flen >> 1;             /* FFT + synthesis length */
-    /* cos1536 table is 1536 entries; reference decoder uses 6144/n but different layout. */
+    /* cos1536 table is 1536 entries. */
     int tw_base = flen % 3 ? 2048 : 1536;
     int i9 = 0;
     const double *pd_in = inout;

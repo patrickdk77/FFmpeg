@@ -32,10 +32,9 @@
 
 /*
  * The postfilter works in one scratch ring holding three staggered bands of
- * the subframe, mirroring the reference decoder's in-place buffer reuse:
- * the formant-filtered signal, the tilt-compensated signal written ten
- * samples behind it, and the final (AGC scaled) output taken from the tilt
- * band.
+ * the subframe: the formant-filtered signal, the tilt-compensated signal
+ * written ten samples behind it, and the final (AGC scaled) output taken
+ * from the tilt band.
  */
 #define TRC_PF_PCM_LEAD     20
 #define TRC_PF_FORMANT_LEAD (TRC_PF_PCM_LEAD - 4)
@@ -78,8 +77,8 @@ static inline int16_t trc_agc_smooth(int16_t agc, int16_t g_tgt)
 
     /*
      * The smoothed term rounds half-up before the target is added
-     * (verified against the reference decoder's settle-from-below fixed
-     * point: 4089 for g=256; truncation would give 4081).
+     * (the settle-from-below fixed point is 4089 for g=256; truncation
+     * would give 4081).
      */
     acc = (int64_t)agc * 0x7800 * 2;
     acc += 0x8000;

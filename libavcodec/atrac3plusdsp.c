@@ -139,14 +139,14 @@ av_cold void ff_atrac3p_init_dsp_static(void)
     float amp_base[4] = { 0.5f };
     int i;
 
-    /* The reference tables use 2 * pi rounded to float as the angle step. */
+    /* The tables use 2 * pi rounded to float as the angle step. */
     for (i = 0; i < 2048; i++)
         sine_table[i] = sin(i * (double)(float)(TWOPI / 2048));
 
     for (i = 0; i < 256; i++)
         hann_window[i] = (1.0 - cos(i / 256.0 * (double)(float)TWOPI)) * 0.5;
 
-    /* 2^((i - 3) / 4) built from Q15 quarter steps, as in the reference */
+    /* 2^((i - 3) / 4) built from Q15 quarter steps */
     for (i = 1; i < 4; i++)
         amp_base[i] = floor(exp2(-(4 - i) / 4.0) * 32768 + 0.5) / 32768;
     for (i = 0; i < 64; i++)
@@ -161,7 +161,7 @@ static const int32_t amp_idx_tab[16] = {
      77968,  86632,  95292, 103956, 112620, 121284, 129944, 138608,
 };
 
-/* steep Hann fade, quantized as in the reference decoder */
+/* quantized steep Hann fade */
 static const float steep_fade[4] = { 0.0f, 0.14642334f, 0.5f, 0.85357666f };
 
 /* sample position of the envelope start/end within the 256-sample window */
@@ -460,7 +460,7 @@ void ff_atrac3p_power_compensation(Atrac3pChanUnitCtx *ctx, AVFloatDSPContext *f
         if (ctx->channels[ch_index].qu_wordlen[qu] <= 0)
             continue;
 
-        /* level and noise mix are rounded once, as in the reference decoder */
+        /* level and noise mix are rounded once */
         qu_lev = (double)ff_atrac3p_sf_tab[ctx->channels[ch_index].qu_sf_idx[qu]] *
                  ff_atrac3p_mant_tab[ctx->channels[ch_index].qu_wordlen[qu]] *
                  grp_lev / (1 << ctx->channels[ch_index].qu_wordlen[qu]);
@@ -474,9 +474,8 @@ void ff_atrac3p_power_compensation(Atrac3pChanUnitCtx *ctx, AVFloatDSPContext *f
 }
 
 /*
- * The rounding follows the reference decoder: products are exact, each
- * stored value is rounded once, and the butterfly differences are kept at
- * double precision until they are rotated.
+ * Products are exact, each stored value is rounded once, and the butterfly
+ * differences are kept at double precision until they are rotated.
  */
 void ff_atrac3p_imdct(const float *in, float *out, int wind_id, int sb)
 {
@@ -608,11 +607,10 @@ void ff_atrac3p_gain_compensation(float *in, float *prev,
 }
 
 /*
- * Subband synthesis in the factored form of the reference decoder: a fast
- * 16-point DCT per time slot, then a polyphase filter over a history with
- * three phases. Values stay at 16-bit sample scale until the final scaling.
- * Products and stores round to float as in the reference, and the DCT sums
- * stay at double precision between stores.
+ * Subband synthesis in factored form: a fast 16-point DCT per time slot,
+ * then a polyphase filter over a history with three phases. Values stay at
+ * 16-bit sample scale until the final scaling. Products and stores round
+ * to float, and the DCT sums stay at double precision between stores.
  */
 static const float ipqf_pre[16] = {
     1.9975909f, 1.97835302f, 1.94006252f, 1.88308811f,

@@ -333,9 +333,9 @@ static const int16_t trc_coef_table[288] = {
 
 /* trc_gain_quant: 32 x int16_t */
 /*
- * Indices 26..31 are reachable from the 5-bit noise-gain field; the
- * reference decoder reads past its 26-entry table there, and these are the
- * values it finds.
+ * Entries 0..25 are 2^((i + 1) / 2) rounded, a ladder in steps of sqrt(2).
+ * Indices 26..31 are reachable from the 5-bit noise-gain field and take
+ * these values, which break the ladder on purpose. Do not extend it to them.
  */
 static const int16_t trc_gain_quant[32] = {
     1, 2, 3, 4, 6, 8, 11, 16, 23, 32,

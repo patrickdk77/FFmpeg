@@ -146,7 +146,7 @@ static void trc_build_excitation(TRCContext *s, const TRCFrameParams *fp)
     /*
      * Long-term pitch postfilter: applied to the excitation used for
      * synthesis, AFTER the adaptive-codebook history has been saved (the
-     * saved history stays pre-filter, matching the reference decoder).
+     * saved history stays pre-filter).
      */
     ff_trc_lt_pitch_filter(s->exc_buf, fp);
 }
@@ -199,7 +199,7 @@ static int trc_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     dst = (int16_t *)frame->data[0];
     trc_synthesize_frame(s, &s->cur, dst);
 
-    /* Output scaling used by the reference decoder / WAV output. */
+    /* Output scaling. */
     for (i = 0; i < TRC_FRAME_SAMPLES; i++)
         dst[i] = trc_clip_int16((int32_t)dst[i] * 16);
 

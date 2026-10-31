@@ -19,11 +19,10 @@
  */
 
 /*
- * This code reproduces the reference decoder bit for bit. Where the
- * reference keeps a value in an x87 register at 53-bit precision, this code
- * uses a double. Where it stores a value to memory, this code uses a float.
- * The order of operations is the same. Fused multiply-add would change the
- * results. GCC does not contract in ISO C mode, and clang needs the pragma.
+ * Intermediate results are doubles, stored values are floats, and the
+ * order of operations is fixed. The output must not change by a single
+ * bit, so keep all three. Fused multiply-add would change the results. GCC
+ * does not contract in ISO C mode, and clang needs the pragma.
  */
 #ifdef __clang__
 #pragma STDC FP_CONTRACT OFF

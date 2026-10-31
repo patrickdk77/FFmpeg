@@ -1,5 +1,5 @@
 /*
- * Sony MSV ADPCM decoder core (the reference decoder, bit-exact)
+ * Sony MSV ADPCM decoder core
  *
  * Copyright (c) 2026 Patrick Domack
  *
@@ -258,7 +258,7 @@ static int msv_adapt_pred_cmp(int sum)
     return (int)('\x01' - (0x51ff < sum - 0x8000U));
 }
 
-/* Delay-line magnitude + tap scale; must match asm bit-exact. */
+/* Delay-line magnitude + tap scale; the result must stay bit-exact. */
 static uint32_t msv_norm_mag_13bit(uint32_t word, int *exp_shift)
 {
     uint32_t mag;

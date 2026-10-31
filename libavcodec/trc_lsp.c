@@ -31,7 +31,7 @@
 
 #define TRC_ORDER 10
 /*
- * The reference accumulator constant 0x1800000 is Q16 (short << 16), so
+ * The accumulator constant 0x1800000 is Q16 (short << 16), so
  * the stored short minimum is 0x1800000 >> 16 = 0x180 = 384.
  */
 #define TRC_LSF_MIN 0x180
@@ -49,7 +49,7 @@ static int16_t trc_lsf_cos_to_lsp(int16_t lsf)
     acc >>= 8;
     idx = (int16_t)(trc_sat32(acc) >> 16);
     /* A failed stability pass can leave lsf[0] negative; stay inside the
-     * table (the reference decoder reads whatever precedes it). */
+     * table. */
     if (idx < 0)
         idx = 0;
     acc -= (int64_t)idx << 16;
@@ -70,7 +70,7 @@ static int16_t trc_lsf_cos_to_lsp(int16_t lsf)
     return (int16_t)(trc_sat32(acc) >> 16);
 }
 
-/* 32x16 Q15 multiply using the reference decoder's high/low split. */
+/* 32x16 Q15 multiply with a high/low split. */
 static int64_t trc_mpy_32_16(int32_t x, int16_t l)
 {
     return (int64_t)((x >> 16) * l) * 2 + (((x & 0xffff) * l) >> 15);

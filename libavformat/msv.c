@@ -208,7 +208,7 @@ static int msv_read_metadata_string(AVFormatContext *s, unsigned int offset,
     return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
 }
 
-/* Binary local recording time, as Sony's readers take it; a weekday follows. */
+/* Binary local recording time; a weekday follows. */
 static int msv_read_metadata_date(AVFormatContext *s, unsigned int offset,
                                   const char *key)
 {
@@ -256,8 +256,8 @@ static int msv_set_latin1(AVFormatContext *s, const char *key, char *str,
 
 /*
  * Chunk text: a BE16 character set code, then the string. 0x8400 is
- * UTF-16LE; Sony's readers hand every other code to the ANSI code page,
- * which the file does not name, so those bytes are taken as Latin-1.
+ * UTF-16LE; every other code means the ANSI code page, which the file
+ * does not name, so those bytes are taken as Latin-1.
  */
 static int msv_read_chunk_string(AVFormatContext *s, int64_t offset,
                                  int size, const char *key)
@@ -474,10 +474,10 @@ static int msv_chunk_table_size(AVIOContext *pb, int max)
 /*
  * Chunk table at 0x50: 8-byte entries (type byte, ..., BE32 size) laid out
  * back to back from file offset 0. Type 4 chunks (0x400, 0x403) hold audio.
- * As in Sony's LPEC reader, the type byte of the first entry does not
- * count, chunk 0x02 bounds the table wherever it stands, and every entry
- * within that bound counts. Returns the number of audio chunks; the table
- * is kept only if there is one.
+ * The type byte of the first entry does not count, chunk 0x02 bounds the
+ * table wherever it stands, and every entry within that bound counts.
+ * Returns the number of audio chunks; the table is kept only if there is
+ * one.
  */
 static int msv_parse_chunks(AVIOContext *pb, MSVDemuxContext *ctx)
 {
@@ -538,9 +538,9 @@ static int64_t msv_chunk_rb32(AVIOContext *pb, int type)
 }
 
 /*
- * Message chunks, named as Sony's DirectShow splitter shows them: 0x05
- * Title, 0x07 Author (DVE: "User/Artist Name"), 0x0a Bookmark (payload
- * bytes, -1 if unset), 0x0b Priority (0 to 3 stars), 0x0e Usage Frame.
+ * Message chunks: 0x05 Title, 0x07 Author (DVE: "User/Artist Name"), 0x0a
+ * Bookmark (payload bytes, -1 if unset), 0x0b Priority (0 to 3 stars),
+ * 0x0e Usage Frame.
  * The usage frame is IcdYsys security data: byte 2 is the security level
  * minus one and the user name it binds the file to follows at byte 12.
  */
@@ -635,10 +635,10 @@ static int msv_lpec_read_index(AVIOContext *pb, int64_t sec, uint8_t *idx)
 }
 
 /*
- * LPEC frames, walked the way the reference reader does: sectors are 0x400
- * from the audio chunk start; a sector index gives the first frame offset
- * (used when a sector is entered fresh), the offset where a straddling
- * frame continues, and the end of valid payload in that sector.
+ * LPEC frames. Sectors are 0x400 from the audio chunk start; a sector
+ * index gives the first frame offset (used when a sector is entered
+ * fresh), the offset where a straddling frame continues, and the end of
+ * valid payload in that sector.
  */
 static int msv_read_lpec_packet(AVFormatContext *s, AVPacket *pkt)
 {
@@ -754,7 +754,7 @@ static int64_t msv_sector_data_end(AVIOContext *pb, int64_t data_offset)
 /*
  * LCST/AT-X frame size by quality: [3-byte MSV frame header][ATRAC3+ payload].
  * The payloads are the standard ATRAC3+ frame sizes for 256/128/96/64/48/24/16
- * kbps stereo at 44.1 kHz (reference decoder parameter table).
+ * kbps stereo at 44.1 kHz.
  */
 static int msv_lcst_frame_size(int quality)
 {
@@ -770,7 +770,7 @@ static int msv_lcst_frame_size(int quality)
     }
 }
 
-/* Codec bit rate by quality, from the parameter table in Sony's readers. */
+/* Codec bit rate by quality. */
 static int msv_codec_bit_rate(int quality)
 {
     switch (quality) {
@@ -840,7 +840,7 @@ static int msv_trc_packet_size(uint8_t byte0)
     return sizes[rate];
 }
 
-/* TRC reference decoder output rate (WAV rate). */
+/* TRC output rate. */
 static int msv_trc_output_rate(int quality)
 {
     switch (quality) {
@@ -854,7 +854,7 @@ static int msv_trc_output_rate(int quality)
     }
 }
 
-/* the reference decoder output rate (WAV rate). */
+/* LPEC output rate. */
 static int msv_lpec_output_rate(int quality)
 {
     switch (quality) {
@@ -899,8 +899,8 @@ static int msv_pick_codec_id(enum MSVCodecType type)
     case MSV_CODEC_TRC:
         return AV_CODEC_ID_TRC;
     case MSV_CODEC_LCST:
-        /* LCST = Sony "AT-X" = ATRAC3+ (byte-identical tables) in an MSV
-         * container; decode with FFmpeg's ATRAC3+ decoder. */
+        /* LCST = Sony "AT-X" = ATRAC3+ in an MSV container; decode with
+         * FFmpeg's ATRAC3+ decoder. */
         return AV_CODEC_ID_ATRAC3P;
     case MSV_CODEC_LPEC:
         return AV_CODEC_ID_LPEC;
@@ -939,7 +939,7 @@ static int64_t msv_count_packets(AVFormatContext *s)
         }
         n++;
         av_packet_unref(pkt);
-        /* Sony's reader stops after the recorded frames */
+        /* the stream ends after the recorded frames */
         if (n == ctx->lcst_frames) {
             ctx->lcst_end = pos;
             break;
@@ -1028,7 +1028,7 @@ static int msv_read_header(AVFormatContext *s)
 
     avio_seek(pb, MSV_HEAD_OFFSET_PERIOD, SEEK_SET);
     ctx->adpcm_frame_size = avio_rb16(pb);
-    /* MSV ADPCM uses 48-byte frames (the reference decoder); period 0x0010 on LP clips is not frame size */
+    /* MSV ADPCM uses 48-byte frames; period 0x0010 on LP clips is not frame size */
     if (ctx->codec == MSV_CODEC_ADPCM)
         ctx->adpcm_frame_size = 48;
     else if (ctx->adpcm_frame_size < 16)
@@ -1058,8 +1058,8 @@ static int msv_read_header(AVFormatContext *s)
         /*
          * The chunk-table sum lands mid-frame (it ignores the interleaved
          * sector indices); the audio actually starts at the first data byte
-         * of the sector containing that offset. Verified bit-exact against
-         * the reference decoder. TRC sector geometry is absolute to the file.
+         * of the sector containing that offset. TRC sector geometry is
+         * absolute to the file.
          */
         int64_t base = (pos / MSV_SECTOR_SIZE) * MSV_SECTOR_SIZE;
         unsigned plen;
@@ -1358,8 +1358,7 @@ static int msv_read_raw_packet(AVFormatContext *s, AVPacket *pkt)
 
             /* ADPCM payload is one contiguous run of 48-byte frames from
              * data_offset (no per-sector index). Every frame is fed to the
-             * decoder, including all-0x00/0xff "quiet" frames, matching the
-             * reference decoder's silent output for them. */
+             * decoder, including all-0x00/0xff "quiet" frames. */
             pos = avio_tell(pb);
             if (pos + fs > ctx->data_offset + ctx->data_size) {
                 /* Sony's writer ends LP streams on a 16-byte unit */

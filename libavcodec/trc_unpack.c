@@ -66,7 +66,7 @@ static void trc_decode_lags(GetBitContext *gb, TRCFrameParams *fp, int rate)
          * the upper byte; fine bits are added below. */
         fp->sf[0].signs2 = (v / 209) << 8;
         fp->sf[1].signs2 = (rem / 11) << 8;
-        /* The reference decoder applies no lag clamp here. */
+        /* No lag clamp here. */
         fp->sf[1].lag  = fp->base_lag - rem % 11 + 5;
         return;
     }

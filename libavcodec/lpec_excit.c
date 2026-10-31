@@ -68,8 +68,8 @@ static int lpec_excit_half_slot(int mode, int half)
 }
 
 /*
- * The pitch gain is the int16 at pitch_ptr[2] / 32768; pitch_ptr comes from
- * the 05280 index (inner, 6), not from the 6-bit lag offset alone.
+ * The pitch gain is the centre tap of the lag's triple, pitch_tbl[1], in
+ * Q15. For Xaudio LP the triple is int16, from lpec_xa_8k_pitch_i16.
  */
 static double lpec_pitch_energy_excit(const LPECExcitState *st, int pitch_win,
                                       int lag_off, int voiced,
@@ -83,7 +83,7 @@ static double lpec_pitch_energy_excit(const LPECExcitState *st, int pitch_win,
         return 0.0;
 
     if (!st->is_xaudio_lp) {
-        /* the reference reads the Q15 copy of the centre tap */
+        /* read the Q15 copy of the centre tap */
         if (!pitch_tbl)
             return 0.0;
         return (double) (int16_t) floor(pitch_tbl[1] * 32768.0 + 0.5) * (1.0 / 32768.0);
@@ -156,13 +156,13 @@ void ff_lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
     st->pitch_mult  = pitch_mult;
     st->pitch_scale = st->band_width;
 
-    /* the reference decoder InitCodec: pitch_ref from
-     * one table (6000 bps) or another (other LP rates); LPEC uses two others. */
+    /* Xaudio LP at 8 kHz: pitch_ref_base is 180 when a coded rate other
+     * than 6000 Hz is set, else 112. Otherwise 432 from 11026 Hz up, else 128. */
     if (is_xaudio_lp && sample_rate < 8001) {
         if (codec_rate_in > 0 && codec_rate_in != 6000)
-            pitch_ref_base = 180; /* the reference decoder, InitCodec rate != 0x1770 */
+            pitch_ref_base = 180; /* coded rate != 6000 */
         else
-            pitch_ref_base = 112; /* the reference decoder, InitCodec rate == 0x1770 */
+            pitch_ref_base = 112; /* coded rate == 6000 */
     } else if (sample_rate >= 11026) {
         pitch_ref_base = 432;
     } else {
@@ -217,7 +217,7 @@ void ff_lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
         st->route_excit_start[i] = uvar5;
         st->route_tail_start[i]  = i6 * num_bands + uvar5;
 
-        /* Second init loop: via (4194304/(i6*num_bands)+0.5). */
+        /* 4194304 / (i6 * num_bands), rounded. */
         st->pitch_mult_route[i] = lpec_f8e0(4194304.0 / ((double) i6 * (double) num_bands) + 0.5);
         if (st->pitch_mult_route[i] < 1)
             st->pitch_mult_route[i] = 1;
@@ -278,7 +278,7 @@ static void lpec_route_sort_b110(LPECRouteEntry *ent, int n)
         lpec_route_sort_b110(ent + j + 1, n - j - 1);
 }
 
-/* ascending quicksort (the reference decoder). */
+/* ascending quicksort. */
 static void lpec_route_sort_a610(LPECRouteEntry *ent, int n)
 {
     LPECRouteEntry key, tmp;
@@ -334,7 +334,6 @@ static void lpec_noise_fill_f4e0(double *exc, const LPECRouteEntry *route,
 
         pos++;
         idx = pos & 1023;
-        /* term order as in the reference decoder. */
         {
             double v1 = lpec_f4e0_noise_a[idx] * lpec_f4e0_mix_b * mix +
                         lpec_f4e0_noise_b[idx] * inv_mix * lpec_f4e0_mix_a;
@@ -377,8 +376,7 @@ static int lpec_bits_to_limit(GetBitContext *gb, int bits_limit)
 }
 
 /*
- * Per-band voiced targets for 16 kHz / 10 bands / totals 26+88+168 (matches the reference
- * on ICD-BPx50 sine frame 3 half 1).
+ * Per-band voiced targets for 16 kHz / 10 bands / totals 26+88+168.
  */
 static const int lpec_route_voiced_tpl[30] = {
     15,  6,  3,  1,  1,  0,  0,  0,  0,  0,
@@ -386,28 +384,28 @@ static const int lpec_route_voiced_tpl[30] = {
      4, 13, 17, 20, 18, 21, 19, 18, 18, 20,
 };
 
-/* 16 kHz lower voiced budget (the reference ICD-BPx50 sine f3 half 2, totals 26+88+160). */
+/* 16 kHz lower voiced budget (totals 26+88+160). */
 static const int lpec_route_voiced_tpl_lo[30] = {
     16,  6,  2,  1,  1,  0,  0,  0,  0,  0,
     27, 20, 12,  7,  5,  4,  4,  3,  3,  3,
      0, 14, 18, 19, 17, 20, 18, 18, 18, 18,
 };
 
-/* 16 kHz totals 26+92+168 (the reference ICD-BPx50 sine f0 half 1). */
+/* 16 kHz totals 26+92+168. */
 static const int lpec_route_voiced_tpl_92[30] = {
     17,  6,  2,  1,  0,  0,  0,  0,  0,  0,
     27, 20, 11,  7,  7,  4,  4,  4,  4,  4,
      2, 12, 20, 20, 18, 20, 19, 19, 19, 19,
 };
 
-/* 16 kHz totals 28+92+168 (the reference ICD-BPx50 sine f1/f2, rem >= 470). */
+/* 16 kHz totals 28+92+168 (rem >= 470). */
 static const int lpec_route_voiced_tpl_28[30] = {
     17,  6,  3,  1,  1,  0,  0,  0,  0,  0,
     25, 19, 12,  8,  6,  6,  4,  4,  4,  4,
      6, 14, 16, 20, 17, 17, 20, 20, 19, 19,
 };
 
-/* 16 kHz totals 28+92+168 (the reference ICD-BPx50 sine f4/f5, rem 464). */
+/* 16 kHz totals 28+92+168 (rem 464). */
 static const int lpec_route_voiced_tpl_28b[30] = {
     16,  7,  3,  1,  1,  0,  0,  0,  0,  0,
     26, 20, 11,  7,  5,  7,  4,  4,  4,  4,
@@ -762,7 +760,7 @@ static int lpec_xa_excit_zero_slot(const LPECExcitState *st, int mode,
     return half_slot & 3;
 }
 
-/* band_stack (054f0-05524): full band_step per band, no subfr_len clamp. */
+/* band_stack: full band_step per band, no subfr_len clamp. */
 static void lpec_xa_build_band_stack(LPECExcitState *st, LPECRouteEntry *rtbl,
                                      int half_slot, int route_tbl_idx, int band_slot,
                                      int lpc_order, int num_lsf_cb, const int *lsf_idx,
@@ -894,7 +892,7 @@ static void lpec_excit_group_060e0(LPECExcitState *st, double *excit,
 }
 
 /*
- * The 0x19 excitation path of the reference decoder.
+ * The excitation path of quality 0x19.
  *
  * For quality 0x19 in mode 1, ff_lpec_generate_excitation() gets the route
  * counts from lpec_route_decode_03920(), which splits each band with
@@ -903,15 +901,15 @@ static void lpec_excit_group_060e0(LPECExcitState *st, double *excit,
  * lpec_build_route_vals(). lpec_excit_decode_060e0() runs for every quality.
  */
 
-/* 32-bit truncating multiply (matches x86 imul low-32 semantics). */
+/* 32-bit truncating multiply (low 32 bits of the product). */
 static inline int lpec_imul32(int a, int b)
 {
     return (int) ((uint32_t) a * (uint32_t) b);
 }
 
-/*range-coder probability split. Given interval params (p,q),
+/* Range-coder probability split. Given interval params (p,q),
  * fills out[0..2] with the three sub-interval sizes. Pure integer arithmetic
- * with x86 arithmetic-right-shift semantics. */
+ * with arithmetic right shifts. */
 static void lpec_rc_split_03250(int out[3], int p, int q)
 {
     int a, b, esi, edi, bx, di;
@@ -944,7 +942,7 @@ static void lpec_rc_split_03250(int out[3], int p, int q)
     }
 }
 
-/* per-band arithmetic route-count decoder (the reference decoder). */
+/* per-band arithmetic route-count decoder. */
 static void lpec_route_decode_03920(int route[40], int route_idx, int rem_bits,
                                     int pitch_param, int f[4],
                                     const int16_t *rtable, int num_bands,
@@ -1170,7 +1168,7 @@ static void lpec_excit_decode_060e0(LPECExcitState *st, GetBitContext *gb,
 
 }
 
-/* Zero head/tail only (the reference decoder); band gain is separate. */
+/* Zero head/tail only; band gain is separate. */
 static void lpec_excit_zero_head_tail(LPECExcitState *st, double *excit,
                                       int subfr_len, int mode, int half_slot,
                                       int route_tbl_idx)
@@ -1238,7 +1236,7 @@ static void lpec_excit_finish_05d50(LPECExcitState *st, double *excit,
     }
 }
 
-/* the reference decoder: half=2, mode=1 -> band_step. */
+/* Band slot for Xaudio LP in mode 1 (route_tbl_idx), else -1. */
 static int lpec_xa_mode1_band_slot(const LPECExcitState *st, int mode, int route_tbl_idx)
 {
     if (st->is_xaudio_lp && mode == 1)
@@ -1300,7 +1298,7 @@ int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
             bit_budget = bits_limit - pos;
     }
 
-    /* the reference: no full-buffer memset before 060e0. lpec_excit_finish_05d50
+    /* No full-buffer memset before 060e0. lpec_excit_finish_05d50
      * zeros head/tail only. Clearing excit_work bytes here destroys ab80 tail state
      * in excit_src[seg:flen) (e.g. mode 1 excit_work=384 vs QMF desc768 flen=768). */
     if (st->num_bands == 10)

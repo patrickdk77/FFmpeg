@@ -1,5 +1,5 @@
 /*
- * Sony MSV ADPCM decoder (the reference decoder)
+ * Sony MSV ADPCM decoder
  *
  * Copyright (c) 2026 Patrick Domack
  *
@@ -40,7 +40,7 @@ typedef struct MSVADPCMBitstream {
     int sym_max;
 } MSVADPCMBitstream;
 
-/* Persistent decoder state (globals in the reference decoder). */
+/* Persistent decoder state. */
 typedef struct MSVADPCMState {
     uint32_t sym_acc;     /* symbol / synthesis accumulator */
     uint32_t adapt_ctrl;  /* adaptation control */
@@ -74,8 +74,8 @@ int ff_msv_adpcm_samples_per_frame(int mode);
  * size: block bytes; MSV_ADPCM_FRAME_SIZE, or less for the final block of
  * an LP stream, which ends on a 16-byte unit.
  * decode_first: initialise the state and then decode the stream's first
- * symbol (DVE reader); otherwise the first symbol only initialises the
- * state and yields 0 (plug-in).
+ * symbol (variant dve); otherwise the first symbol only initialises the
+ * state and yields 0 (variant plugin).
  */
 int ff_msv_adpcm_decode_block(const uint8_t *buf, int size, int16_t *out, int mode,
                            int *need_init, int decode_first,

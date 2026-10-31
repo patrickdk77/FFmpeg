@@ -1,5 +1,5 @@
 /*
- * LPEC route / LSF int16 tables from the reference decoder
+ * LPEC route / LSF int16 tables
  *
  * Copyright (c) 2026 Patrick Domack
  *

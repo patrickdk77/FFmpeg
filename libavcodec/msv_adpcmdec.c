@@ -1,6 +1,6 @@
 /*
  * Sony Memory Stick Voice ADPCM decoder
- * Reverse-engineered from the reference decoder (3-bit symbols, 48-byte frames).
+ * 3-bit symbols, 48-byte frames.
  * Not PlayStation/XA ADPCM.
  *
  * Copyright (c) 2026 Patrick Domack
@@ -83,7 +83,7 @@ static int msv_adpcm_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     if (block_align < MSV_ADPCM_FRAME_SIZE)
         return AVERROR_INVALIDDATA;
 
-    /* final LP block of whole 16-byte units; the plug-in drops it */
+    /* final LP block of whole 16-byte units; variant plugin drops it */
     if (buf_size < block_align) {
         if (s->mode != 2 || buf_size % 16 || s->variant != MSV_ADPCM_VARIANT_DVE)
             return buf_size;

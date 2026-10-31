@@ -27,7 +27,7 @@
 #include <stdint.h>
 
 /* ---- lpecdata.h ---- */
-/* LPEC codec tables extracted from the reference decoder */
+/* LPEC codec tables */
 /* 8kHz mode: LPC order=10, 3 LSF codebooks, 64 entries each */
 
 /* LSF VQ Codebook 1: 64 entries x 10 doubles */
@@ -1169,7 +1169,7 @@ static const double lpec_8k_pitch_cb[1024] = {
     0.47877035797174217, 0.5963627518007618, 1.400446521099524, 2.04038132657255,
 };
 
-/* 16 kHz tables from the reference decoder */
+/* 16 kHz tables */
 
 /* lpec_16k_lsf_quant_1: 1024 doubles */
 static const double lpec_16k_lsf_quant_1[1024] = {

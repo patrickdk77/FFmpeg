@@ -26,8 +26,6 @@
  * @file
  * Sony LPEC audio decoder
  *
- * Reverse-engineered from the Sony LPEC decoder.
- *
  * Bitstream is MSB-first (big-endian bit order).
  *
  * Frame structure (all modes output LPEC_FRAME_OUT = 512 samples):
@@ -53,7 +51,7 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "decode.h"
-/* NOTE: NO BITSTREAM_READER_LE -- reference decoder uses MSB-first (standard get_bits) */
+/* NOTE: NO BITSTREAM_READER_LE, the bitstream is MSB-first (standard get_bits) */
 #include "get_bits.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/log.h"
@@ -74,10 +72,10 @@
 /* ---- Constants ---- */
 #define LPEC_LPC_ORDER_MAX  16      /* 10 @ 8kHz, 16 @ 16kHz */
 #define LPEC_LSF_MAX        (LPEC_LPC_ORDER_MAX + 1) /* lsf[0]=0, lsf[1..order] */
-#define LPEC_NUM_LSF_CB_MAX 4       /* 3 @ 8kHz, 4 @ 16kHz (ctx+0xb0 in the reference decoder) */
+#define LPEC_NUM_LSF_CB_MAX 4       /* 3 @ 8kHz, 4 @ 16kHz */
 #define LPEC_LSF_BITS       6
 /*
- * Frame size as the reference decoder sets it up: 512 samples at 8 kHz,
+ * Frame size: 512 samples at 8 kHz,
  * 1024 (two 512-sample halves) at 16 kHz. The bit budgets follow the frame
  * size, not fixed 128/432.
  */
@@ -85,7 +83,7 @@
 #define LPEC_FRAME_16K    1024
 #define LPEC_SUBFR_8K     256
 #define LPEC_SUBFR_16K    512
-#define LPEC_NUM_BANDS_MAX  10      /* 8 @ 8kHz, 10 @ 16kHz (ctx+0x2c in the reference decoder) */
+#define LPEC_NUM_BANDS_MAX  10      /* 8 @ 8kHz, 10 @ 16kHz */
 #define LPEC_NUM_SEGMENTS 4         /* LPC interpolation segments per frame */
 #define LPEC_MAX_FRAME    1024
 #define LPEC_EXCIT_SRC_MAX (LPEC_MAX_FRAME * 2)
@@ -98,7 +96,6 @@
 /*
  * Pitch lag (mode 1/2/3): lag = base + 6-bit-offset.
  * The 6-bit offset indexes into a table via lag = base_lag + offset * step.
- * base_lag is encoded in the context at offset 0xd0.
  * Mode 0: 7-bit index into lpec_8k_pitch_cb (128 entries).
  */
 #define LPEC_PITCH_LAG_BASE  20     /* smallest allowed pitch lag (mode 1/2/3) */
@@ -145,7 +142,7 @@ typedef struct LPECContext {
     int    pending_frame_mode;        /* mode byte for padding on resync */
     int    pad_pending_start;         /* decoded frame awaiting mode padding */
     int    pad_pending_mode;
-    /* MSV packet tail + chunk stream (the reference: decode then drop chunk). */
+    /* MSV payload not yet moved to stream_buf as whole chunks. */
     uint8_t carry_buf[LPEC_CARRY_BUF_BYTES + 80 + 4];
     int    chunk_carry_len;
     uint8_t stream_buf[LPEC_CARRY_BUF_BYTES + 80 + 4];
@@ -163,10 +160,10 @@ typedef struct LPECContext {
     double pitch_shape[LPEC_MAX_FRAME];
     double pitch_weight[LPEC_MAX_FRAME];
     double f640_shape_m3[LPEC_F640_SHAPE_M3];
-    double pitch_cb_aux[LPEC_SUBFR_16K]; /* the reference decoder: dc80/03e30 OLA hist */
+    double pitch_cb_aux[LPEC_SUBFR_16K]; /* OLA hist */
     double mode0_shaped_tail[LPEC_SUBFR_16K]; /* cross-frame carry */
     LPECQmfState qmf;
-    int    prev_half2_pitch_cb;         /* 0x138: prior frame half-2 CB flag */
+    int    prev_half2_pitch_cb;         /* prior frame half-2 CB flag */
     int    prev_half2_pitch_cb_idx;     /* prior frame half-2 CB index */
     int    pitch_cb_flag_h1;            /* mode-0 half-1 pitch CB bit */
     int    pitch_cb_flag_h2;            /* mode-0 half-2 pitch CB bit */
@@ -178,7 +175,7 @@ typedef struct LPECContext {
     int    next_frame_mode_peek;        /* show_bits(gb,2) at next frame; -1 unknown */
     int    eof_flush_done;              /* one-shot trailing frame at EOF */
     int    eof_draining;                /* avpkt flush: relax padding lookahead */
-    int    is_xaudio_lp;                /* codec_tag == 0x19 (the reference decoder) */
+    int    is_xaudio_lp;                /* codec_tag == 0x19 */
     int    qmf_seg_m2_h1;               /* mode-2 h1 ab80 len */
 } LPECContext;
 
@@ -263,7 +260,7 @@ static const double lpec_16k_f430_coef[192] = {
     0.056998823685529158, 0.26997752802043051, 0.224761970892077,
     0.11156547038317294, 0.11686665850784031, 0.10520788955080092,
 };
-/* 8 kHz Xaudio OLA pitch taps (64 triples); the Q15 copy is lpec_xa_8k_pitch_i16. */
+/* 8 kHz Xaudio pitch filter taps (64 triples); the Q15 copy is lpec_xa_8k_pitch_i16. */
 static const double lpec_xa_8k_f430_coef[192] = {
     0.012849134604929847, 0.2936397061490345, 0.05226251984983754,
     0.021634311713913713, 0.5125102893474466, 0.1753466613476382,
@@ -332,7 +329,7 @@ static const double lpec_xa_8k_f430_coef[192] = {
 };
 
 /*
- * The reference raised-cosine: 2*pi is the 12-digit constant 6.28318530718,
+ * The raised cosine takes 2*pi as the 12-digit constant 6.28318530718,
  * the cosine is taken in extended precision and 1 - cos is rounded to double.
  */
 static double lpec_raised_cos(int i, int n)
@@ -358,7 +355,7 @@ static void lpec_init_pitch_windows(LPECContext *s)
 /* sqrt raised-cosine for modes 1/3. */
 static void lpec_init_f640_shape_m3(LPECContext *s)
 {
-    /* the reference decoder: sqrt raised-cosine over overlap=frame_size needs phase 0..pi,
+    /* sqrt raised-cosine over overlap=frame_size needs phase 0..pi,
      * so table period n = 2*frame_size (2048 @ 16 kHz, 1024 @ 8 kHz). */
     int n = 2 * s->frame_size;
 
@@ -366,7 +363,7 @@ static void lpec_init_f640_shape_m3(LPECContext *s)
         s->f640_shape_m3[i] = sqrt(lpec_raised_cos(i, n));
 }
 
-/* mode 2 uses the b400 shape; modes 1/3 use b380. */
+/* mode 2 uses pitch_shape; modes 1/3 use f640_shape_m3. */
 static const double *lpec_f640_window(const LPECContext *s, int mode)
 {
     if (mode == 1 || mode == 3)
@@ -380,7 +377,7 @@ static int lpec_frame_bit_base(const LPECContext *s)
     int rate_out = s->avctx->sample_rate;
     int rate_in  = s->codec_rate_in;
 
-    /* Dual-rate LP (InitCodec 8000/6000): scales with rate_in/rate_out. */
+    /* Dual-rate LP (6000 Hz in, 8000 Hz out): scales with rate_in/rate_out. */
     if (rate_in > 0 && rate_in < 0x1771 && rate_out > 0 && rate_in != rate_out)
         l1c = (l1c * rate_in + rate_out / 2) / rate_out;
     return l1c;
@@ -452,7 +449,7 @@ static int lpec_finish_frame(LPECContext *s, GetBitContext *gb, int mode,
 /* LSF decoding */
 /* --------------------------------------------------------------- */
 
-/* the reference decoder: sort + min spacing only (no endpoint clamp loops). */
+/* sort + min spacing only (no endpoint clamp loops). */
 static void lpec_xa_stabilize_lsf_once(double *lsf, int order)
 {
     lsf[0] = 0.0;
@@ -485,7 +482,7 @@ static void lpec_xa_stabilize_lsf_once(double *lsf, int order)
     lsf[0] = 0.0;
 }
 
-/* the reference decoder: single sort + min-spacing pass (no multi-pass loop). */
+/* single sort + min-spacing pass (no multi-pass loop). */
 static void lpec_xa_stabilize_lsf(double *lsf, int order)
 {
     lpec_xa_stabilize_lsf_once(lsf, order);
@@ -542,7 +539,7 @@ static void lpec_stabilize_lsf(double *lsf, int order)
     lsf[0] = 0.0;
 }
 
-/* refresh (Sony param 1 -> slot1, 2 -> slot2). */
+/* refresh (sony_half 1 -> slot1, 2 -> slot2). */
 static void lpec_refresh_half_lsf_i16(LPECContext *s, int sony_half)
 {
     if ((unsigned) sony_half < 1 || sony_half > 2)
@@ -555,7 +552,7 @@ static void lpec_refresh_half_lsf_i16(LPECContext *s, int sony_half)
                                 s->half_lsf_idx[sony_half], s->half_lsf_i16[sony_half]);
 }
 
-/* flag==0: average slot0 (0x2e8) and slot2 (0x32c) into slot1 (0x30a). */
+/* flag==0: average slot0 and slot2 into slot1. */
 static void lpec_avg_half_lsf_i16(LPECContext *s)
 {
     int i, order = s->lpc_order;
@@ -577,7 +574,7 @@ static void decode_lsf(LPECContext *s, const int *idx, double *lsf)
     const int order = s->lpc_order;
     const int cb    = s->num_lsf_cb;
 
-    lsf[0] = 0.0; /* /: line 0 unused */
+    lsf[0] = 0.0; /* unused; the LSFs are lsf[1..order] */
     for (int i = 0; i < order; i++) {
         lsf[i + 1] = 0;
         if (order == 16) {
@@ -631,7 +628,7 @@ static void lsf_to_lpc(const double *lsf, double *lpc, int order)
         P[k] = 0.0;
         Q[k] = 0.0;
     }
-    /* cos on lsf[1..order]; the reference uses pi = 3.14159265359 and an
+    /* cos on lsf[1..order] with pi = 3.14159265359 and an
      * extended-precision cosine rounded to double. */
     for (k = 1; k <= order; k++)
         cosv[k + 1] = (double) cosl(lsf[k] * 3.14159265359 * 2.0);
@@ -761,7 +758,7 @@ static int lpec_lpc_segments_full(const LPECContext *s)
 
 static void lpec_roll_excit_work(LPECContext *s);
 
-/* the reference decoder (not LPEC) holds excit OLA / 03e30 aux. */
+/* Xaudio LP keeps the excitation OLA history in pitch_cb_aux. */
 static double *lpec_ola_hist(LPECContext *s)
 {
     return s->is_xaudio_lp ? s->pitch_cb_aux : s->excit_ola_hist;
@@ -818,12 +815,12 @@ static void lpec_qmf_mode2_process(LPECContext *s, double *buf, int off,
 {
     const LPECQmfDesc *desc = lpec_qmf_mode2_desc(s, half_idx);
 
-    /* the reference zeros excit_src[seg:flen) before mode-2 h2 ab80 only. */
+    /* zero excit_src[seg:flen) before mode-2 h2 ab80 only. */
     if (half_idx == 2 && seg_len < desc->len &&
         off + desc->len <= LPEC_EXCIT_SRC_MAX)
         memset(buf + off + seg_len, 0, (desc->len - seg_len) * sizeof(double));
 
-    /* In-place when buf spans desc->len (the reference path). Scratch tmp is only
+    /* In-place when buf spans desc->len. Scratch tmp is only
      * LPEC_QMF_MAX; desc1536+seg1024 needs 1536 samples -- must not scratch. */
     if (off + desc->len <= LPEC_EXCIT_SRC_MAX)
         ff_lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
@@ -846,11 +843,11 @@ static void lpec_qmf_mode13_process(LPECContext *s, int mode, double *buf, int o
 {
     const LPECQmfDesc *desc = lpec_qmf_mode13_desc(s, mode);
 
-    /* the reference zeros excit_src[seg:flen) before ab80 when desc spans more than seg. */
+    /* zero excit_src[seg:flen) before ab80 when desc spans more than seg. */
     if (desc->len > seg_len && off + desc->len <= LPEC_EXCIT_SRC_MAX)
         memset(buf + off + seg_len, 0, (desc->len - seg_len) * sizeof(double));
 
-    /* In-place when excit_src spans desc->len (the reference path); scratch tmp is only
+    /* In-place when excit_src spans desc->len; scratch tmp is only
      * LPEC_QMF_MAX wide, so prefer in-place for the large 2048-tap descriptor. */
     if (off + desc->len <= LPEC_EXCIT_SRC_MAX)
         ff_lpec_qmf_process_seg(&s->qmf, buf + off, seg_len, desc);
@@ -874,13 +871,13 @@ static const double *lpec_f430_pitch_table(const LPECContext *s)
 {
     if (s->num_bands == 10)
         return lpec_16k_f430_coef;
-    /* at 8 kHz the reference decoder uses pitch_cb here, not the LPEC 8 kHz pitch_gain */
+    /* not reached for Xaudio LP: lpec_pitch_f430_tbl() returns first */
     if (s->is_xaudio_lp)
         return lpec_xa_8k_pitch_cb;
     return lpec_8k_pitch_gain;
 }
 
-/* unvoiced: *(ctx+half*4+0x368) = & (identity triple). */
+/* unvoiced: identity triple. */
 static const double lpec_f430_unvoiced_tbl[3] = { 1.0, 1.0, 1.0 };
 
 static const double *lpec_pitch_f430_tbl(LPECContext *s, int lag_off, int voiced)
@@ -896,7 +893,6 @@ static const double *lpec_pitch_f430_tbl(LPECContext *s, int lag_off, int voiced
     return lpec_f430_pitch_table(s) + lag_off * 3;
 }
 
-/* the reference decoder's f8e0 is floor() */
 static double lpec_f8e0_floor(double x)
 {
     if (!isfinite(x))
@@ -941,7 +937,7 @@ static int lpec_e330(int n, const double *diag, double *mat, double *tmp, double
     return 0;
 }
 
-/* pitch triple for voiced OLA. */
+/* pitch triple for the voiced pitch filter. */
 static void lpec_e4a0_coefs(const double *tbl, int pitch_win, double out[3])
 {
     int n, pw = pitch_win;
@@ -971,7 +967,7 @@ static void lpec_e4a0_coefs(const double *tbl, int pitch_win, double out[3])
     tmp = mat + sz;
     upd = tmp + sz;
 
-    /* 1 - c0 z^-(pw-1) - c1 z^-pw - c2 z^-(pw+1), the taps the OLA applies */
+    /* 1 - c0 z^-(pw-1) - c1 z^-pw - c2 z^-(pw+1), the pitch filter's taps */
     memset(diag, 0, sz * sizeof(double));
     diag[0]      = 1.0;
     diag[pw - 1] = -tbl[0];
@@ -991,9 +987,9 @@ static void lpec_e4a0_coefs(const double *tbl, int pitch_win, double out[3])
 }
 
 /*
- * Copy or voiced OLA-filter into the synthesis work buffer. pitch_win is the
- * lookback distance into work; when it exceeds len, early samples tap only
- * from work_base (the slack area).
+ * Copy into the synthesis work buffer, or run the voiced pitch filter into
+ * it. pitch_win is the lookback distance into work; when it exceeds len,
+ * early samples tap only from work_base (the slack area).
  */
 static void lpec_excit_ola_f430(LPECContext *s, int seg, double *work, const double *src,
                                 int len, int pitch_win, const double *lag_tbl)
@@ -1003,8 +999,9 @@ static void lpec_excit_ola_f430(LPECContext *s, int seg, double *work, const dou
     double xa_tbl[3];
     int w;
 
-    /* the reference decoder voiced 3-tap OLA: identical recurrence to the LPEC path
-     * below; the lag coefs come from xa_pitch_f430 (i16/32768). Off-switch for A/B. */
+    /* Xaudio voiced 3-tap filter: the same recurrence as the LPEC path
+     * below. The taps come from lpec_xa_8k_f430_coef at the index of the
+     * stored Q15 triple. */
 
     if (pitch_win == 0) {
         memcpy(work, src, len * sizeof(double));
@@ -1015,7 +1012,7 @@ static void lpec_excit_ola_f430(LPECContext *s, int seg, double *work, const dou
         lag_tbl = lpec_f430_unvoiced_tbl;
 
     /* The stored Xaudio pointer is the Q15 triple used by the excitation
-     * generator; the OLA taps come from the matching double table. */
+     * generator; the filter taps come from the matching double table. */
     if (s->is_xaudio_lp && lag_tbl != lpec_f430_unvoiced_tbl) {
         int idx = (const int16_t *)lag_tbl - lpec_xa_8k_pitch_i16;
 
@@ -1057,7 +1054,7 @@ static int lpec_mode1_ab80_len(const LPECContext *s)
     return s->qmf_seg_m2_h1;
 }
 
-/* pitch_cb_aux is the dc80 OLA history only (lpec_ola_hist for xaudio). */
+/* pitch_cb_aux is the OLA history only (lpec_ola_hist for xaudio). */
 static double *lpec_shaped_excit_dst(LPECContext *s, int mode, double *dst)
 {
     if (s->is_xaudio_lp && s->frame_size < LPEC_FRAME_16K && (mode == 1 || mode == 3))
@@ -1117,8 +1114,8 @@ static const double *lpec_prepare_synth_excit(LPECContext *s, int mode,
         return work;
     }
 
-    /* Mode 0: pitch-CB output in src; three f430 segments (no f640 in reference decoder).
-     * fo/sf/fo layout (128/256/128 @ 8 kHz) in both reference decoders. */
+    /* Mode 0: pitch-CB output in src; three f430 segments, no f640.
+     * fo/sf/fo layout (128/256/128 @ 8 kHz) for both LPEC and Xaudio LP. */
     lpec_excit_ola_f430(s, 0, work, src, fo, s->pitch_win_prev, s->pitch_tbl_prev);
     lpec_excit_ola_f430(s, 1, work + fo, src + fo, sf, s->pitch_win_half1,
                         s->pitch_tbl_half1);
@@ -1209,12 +1206,7 @@ static void lpec_apply_pitch_cb_mode0(LPECContext *s, double *dst_half,
 /* Excitation generation */
 /* --------------------------------------------------------------- */
 
-/**
- * Per-half pitch codebook select (loop at 0x13c):
- * 1 bit; if set, 7-bit index scaled to lpec_*_pitch_cb (idx * 0x40 + base).
- * Returns CB index 0..127, or -1 if unvoiced.
- */
-/* pitch table idx = *(ctx + half*4 + 0x140); if <0 use +0x144. */
+/* pitch table idx = half_lsf_cb0[route - 1]; if <0 use the next entry. */
 static int lpec_pitch_route_arg(LPECContext *s, int mode, int half)
 {
     int route = ff_lpec_excit_route_idx(mode, half);
@@ -1232,6 +1224,11 @@ static int lpec_pitch_route_arg(LPECContext *s, int mode, int half)
     return v >= 0 ? v : 0;
 }
 
+/**
+ * Per-half pitch codebook select:
+ * 1 bit; if set, a 7-bit index into lpec_*_pitch_cb, 8 values per entry.
+ * Returns CB index 0..127, or -1 if unvoiced.
+ */
 static int read_pitch_cb_half(GetBitContext *gb)
 {
     if (get_bits_left(gb) < 1)
@@ -1344,7 +1341,7 @@ static int lpec_excit_bit_budget(LPECContext *s, GetBitContext *gb,
 static void lpec_postprocess_excit(LPECContext *s, int mode, double *buf, int off,
                                    int len, int half_idx)
 {
-    /* QMF on excit_src; seg len/desc vary by mode (the reference decoder). */
+    /* QMF on excit_src; seg len/desc vary by mode. */
     if (mode == 0 || mode == 2) {
         int qmf_len;
         int desc_idx = 0;
@@ -1366,7 +1363,7 @@ static void lpec_postprocess_excit(LPECContext *s, int mode, double *buf, int of
                 const LPECQmfDesc *desc = lpec_qmf_mode2_desc(s, 2);
                 int ext = desc->len - qmf_len;
 
-                /* the reference leaves excit_src[len:flen) zero before h2 ab80. */
+                /* zero excit_src[len:flen) before h2 ab80. */
                 if (ext > 0 && off + qmf_len + ext <= LPEC_EXCIT_SRC_MAX)
                     memset(buf + off + qmf_len, 0, ext * sizeof(double));
             }
@@ -1407,7 +1404,7 @@ static void lpec_postprocess_excit(LPECContext *s, int mode, double *buf, int of
 /* Initialiser / close */
 /* --------------------------------------------------------------- */
 
-/* the reference decoder profile rates (d430 in, d598 out). */
+/* Coded (in) and output rates by quality code. */
 static int lpec_rates_from_quality(int quality, int *rate_in, int *rate_out)
 {
     switch (quality) {
@@ -1464,7 +1461,8 @@ static void lpec_stream_consume_bits(LPECContext *s, int bits)
     s->stream_bit_off = s->stream_len ? new_off : 0;
 }
 
-/* Feed 48-byte LPEC chunks from carry_buf (the reference Decode chunk size). */
+/* Move whole chunks from carry_buf to stream_buf; lpec_chunk_bytes() gives
+ * each chunk's size. */
 static void lpec_feed_chunks(LPECContext *s)
 {
     while (s->chunk_carry_len > 0) {
@@ -1545,7 +1543,7 @@ static void lpec_reset(AVCodecContext *avctx)
     s->codec_rate_in = codec_rate_in;
     s->is_xaudio_lp  = avctx->codec_tag == 0x19;
 
-    /* Parameters from the reference decoder's init. */
+    /* Parameters by output rate. */
     if (avctx->sample_rate >= 8001) {
         int cap = avctx->sample_rate >= 22051 ? 4096 : 2048;
 
@@ -1673,7 +1671,7 @@ static double lpec_xa_output_gain(const LPECContext *s)
 
     if (!s->is_xaudio_lp || rate_in != 6000 || rate_in >= rate_out)
         return 1.0;
-    /* the reference output gain when the codec runs at 6000 Hz */
+    /* output gain when the codec runs at 6000 Hz */
     return 1.487732;
 }
 
@@ -1823,7 +1821,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
             {
 
             }
-            /* half 0: flags /0x13c, tbl /0x360 */
+            /* half 0: pitch CB flags and table indices */
             lpec_apply_pitch_cb_mode0(s, s->frame_excit, s->excit_src, s->excit_src,
                                       subfr_size, NULL, s->prev_half2_pitch_cb,
                                       s->pitch_cb_flag_h1, s->pitch_cb_tbl_prev_idx,
@@ -1855,7 +1853,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
         } else {
             int nseg = lpec_lpc_segments_half(s);
 
-            /* flag==1: f1c0 lsf1->half1, half1->lsf2. */
+            /* flag==1: interpolated synthesis lsf1->half1, half1->lsf2. */
             interpolated_lpc_synthesis(s->lsf1, cur_lsf1,
                                        synth_excit, pcm, 0, s->lpc_order,
                                        subfr_size, nseg);
@@ -1989,7 +1987,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
             const double *synth_excit = lpec_prepare_synth_excit(s, mode, s->excit_src,
                                                                  s->frame_excit);
 
-            /* full-frame f1c0 for modes 1/3 */
+            /* full-frame interpolated synthesis for modes 1/3 */
             interpolated_lpc_synthesis(cur_lsf1, cur_lsf2, synth_excit, pcm,
                                        0, s->lpc_order, frame_size,
                                        lpec_lpc_segments_full(s));
@@ -2007,7 +2005,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
     } else if (mode == 3) {
         /*
          * Mode 3: second subframe only (route 2/3).
-         * As in the reference decoder, read_pitch() for half 2 runs before the excitation.
+         * read_pitch() for half 2 runs before the excitation.
          */
         if (get_bits_left(gb) < s->num_lsf_cb * LPEC_LSF_BITS)
             return AVERROR(EAGAIN);
@@ -2038,7 +2036,7 @@ static int decode_one_lpec_frame(LPECContext *s, GetBitContext *gb,
             const double *synth_excit = lpec_prepare_synth_excit(s, mode, s->excit_src,
                                                                  s->frame_excit);
 
-            /* full-frame f1c0 for modes 1/3 */
+            /* full-frame interpolated synthesis for modes 1/3 */
             interpolated_lpc_synthesis(cur_lsf1, cur_lsf2, synth_excit, pcm, 0,
                                        s->lpc_order, frame_size,
                                        lpec_lpc_segments_full(s));

@@ -536,8 +536,8 @@ static int16_t trc_lt_gain(int16_t norm_in, int16_t norm_enh,
     den = trc_lt_den(norm_in, norm_enh, norm_cross);
     num = (int32_t)norm_in * 16384;
 
-    /* Any division the reference decoder cannot do falls back to the
-     * full-scale ratio; the root itself is not limited. */
+    /* A division with den <= 0, num < 0 or an overflowing quotient falls
+     * back to the full-scale ratio; the root itself is not limited. */
     if (den <= 0 || num < 0 || num >= (int64_t)den * 65536) {
         g_raw = 0x7fff;
     } else {

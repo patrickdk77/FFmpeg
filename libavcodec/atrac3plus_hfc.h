@@ -95,7 +95,7 @@ typedef struct Atrac3pHfcContext {
 void ff_atrac3p_hfc_init_static(void);
 
 /**
- * Set up the state the way the reference decoder does for a stream.
+ * Set up the state for a stream.
  *
  * @param nch     number of channels in the block (1 or 2)
  * @param base    lowest source subband
@@ -112,8 +112,7 @@ void ff_atrac3p_hfc_reset(Atrac3pHfcContext *s);
  * Parse one HFC payload (the bytes of a type 0 extension unit).
  *
  * @param buf  payload followed by AV_INPUT_BUFFER_PADDING_SIZE zero bytes
- * @return 0 or a negative error code; the state is then partially updated,
- *         as in the reference decoder
+ * @return 0 or a negative error code; the state is then partially updated
  */
 int ff_atrac3p_hfc_parse(Atrac3pHfcContext *s, const uint8_t *buf, int len);
 

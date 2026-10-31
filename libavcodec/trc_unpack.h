@@ -30,7 +30,7 @@
 #define TRC_MAX_SUBFRAMES 4
 #define TRC_FRAME_SAMPLES 160
 
-/* Per-subframe parameter block (8 shorts, reference decoder layout). */
+/* Per-subframe parameter block (8 shorts). */
 typedef struct TRCSubParams {
     int16_t lag;          /* [0] pitch lag (only sf0 uses base_lag at frame level) */
     int16_t pitch_idx;    /* [1] 5-bit pitch-filter VQ index */

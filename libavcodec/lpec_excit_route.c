@@ -265,8 +265,9 @@ static void lpec_a110_phase1_stack(uint8_t *stk, const int16_t *lsf_in, int orde
     if (order < 0)
         return;
 
-    /* Phase1 writes rt-interp AS words at stk+edx*2+0x90. For even order the
-     * paired loop ends at order-2; k=order/2 reads stk+order*2+0x90 (e.g. @b0). */
+    /* Store cos(lsf_in[i]) as int16 at byte 0x90 + 2 * i of the scratch
+     * buffer. For an even order the paired loop stops at order - 2, so
+     * lsf_in[order] is stored on its own. */
     limit = ((order + 1) & ~1) - 1;
     for (edx = 0; edx <= limit; edx += 2) {
         *(int16_t *) (stk + edx * 2 + 0x90) = lpec_rt_interp_i16(lsf_in[edx]);
@@ -285,7 +286,8 @@ static void lpec_a110_phase1_stack(uint8_t *stk, const int16_t *lsf_in, int orde
 #pragma GCC optimize("O0")
 #endif
 
-/* single 0x1a4-byte stack frame; AS/lattice/path arrays overlap like the reference decoder. */
+/* One 0x1a4-byte buffer; the two polynomials, the cosines and the two
+ * product arrays sit at fixed offsets in it. */
 int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
 {
     uint8_t stk[0x1a4];
@@ -358,7 +360,7 @@ int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
         uacc |= (uint32_t) mag;
     }
 
-    /* shift_pos in edx; test uacc, then up to three +1/shl per outer step. */
+    /* test uacc, then up to three increments and shifts per outer step. */
     shift_pos = 0;
     while (shift_pos < 0x10) {
         if (uacc & 0x40000000u)
@@ -409,7 +411,6 @@ int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
 #pragma GCC pop_options
 #endif
 
-/* the reference decoder (same algorithm, different route tables). */
 static int lpec_c680_route_tables(const int16_t *a110_out, int pitch_win, double pitch_e,
                            int32_t *route_out, int pitch_len, int order,
                            const int16_t *rt_a, const int16_t *rt_b)

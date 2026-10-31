@@ -165,8 +165,8 @@ static av_cold int set_channel_params(ATRAC3PContext *ctx,
 
 /**
  * Set up AT-X high frequency compensation for Sony IC recorder streams. The
- * MSV demuxer exports two of the reference decoder's format parameters as
- * extradata, the quality code as 16-bit LE and the engine version.
+ * MSV demuxer exports two format parameters as extradata, the quality code
+ * as 16-bit LE and the engine version.
  */
 static av_cold int hfc_init(ATRAC3PContext *ctx, AVCodecContext *avctx)
 {
@@ -399,7 +399,7 @@ static void output_block(ATRAC3PContext *ctx, AVCodecContext *avctx,
 
     if (ctx->hfc) {
         if (ctx->hfc_parsed[block] && !ctx->hfc_running[block]) {
-            /* the reference decoder starts HFC on a silent frame */
+            /* HFC starts on a silent frame */
             for (ch = 0; ch < num_channels; ch++)
                 memset(ctx->time_buf[ch], 0, sizeof(ctx->time_buf[ch]));
             ctx->hfc_running[block] = 1;
