@@ -94,7 +94,7 @@ static int ds2_header_size(const uint8_t *buf, int size) {
   return buf[0] * DS2_BLOCK_SIZE;
 }
 
-/* Olympus DssWriter can leave a copy of the file header in the audio area */
+/* Olympus software can leave a copy of the file header in the audio area */
 static int ds2_header_copy_blocks(const uint8_t *hdr) {
   if ((hdr[1] == 'd' && hdr[2] == 's' && (hdr[3] == 's' || hdr[3] == '2')) ||
       (hdr[1] == 'e' && hdr[2] == 'n' && hdr[3] == 'c'))
@@ -105,12 +105,11 @@ static int ds2_header_copy_blocks(const uint8_t *hdr) {
 /*
  * Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff,
  * and none when that is 0xff. A recorder writes the second form where it
- * pauses or stops, and Olympus's and Philips's decoders play those frames.
- * Philips's decoder takes a block that states more than 13 as empty, which
- * drops the DS-2600's splice blocks that state 19. So does this demuxer,
- * except where the block's format counts, 0xff in byte 3, and is variable
- * rate SP, LP or QP7, whose frames can be short enough for more to start in
- * a block.
+ * pauses or stops, and those frames are audio like any other. A block that
+ * states more than 13 holds none, which drops the DS-2600's splice blocks
+ * that state 19, except where the block's format counts, 0xff in byte 3,
+ * and is variable rate SP, LP or QP7, whose frames can be short enough for
+ * more to start in a block.
  */
 static int ds2_block_frames(const uint8_t *hdr) {
   int n = hdr[2] && hdr[2] != 0xff ? hdr[2] : hdr[5];
@@ -215,8 +214,9 @@ static int ds2_block_qp_frames(const DS2DemuxContext *ctx,
 /*
  * Frames that start in a block, from its header and the size bytes of it the
  * file holds, as the reader takes them: from the anchor on, up to the stated
- * count and while they start in the block. A re-sync block states more than
- * that. In QP7 the type bit gives each frame's size. In a cut file only frames
+ * count and while they start in the block. So a block whose count does not
+ * fit stops at the block end. A QP block that states more than 13 holds
+ * none. In QP7 the type bit gives each frame's size. In a cut file only frames
  * whose first byte is there count; the reader returns the last one
  * zero-filled. *need is set to the bytes the last frame of a whole block takes
  * from the blocks after it.
@@ -419,9 +419,8 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
      * correct. At a segment boundary the recorder emits a re-sync block whose
      * anchor jumps: the leading bytes are an orphaned straddle tail, the
      * partial frame in flight is stale, and framing must restart at the anchor.
-     * frame_count over-counts on these blocks (observed 19), so there the block
-     * end is the limit.
-     * Confirmed byte-for-byte against the Olympus DssParser.dll.
+     * A block whose count does not fit stops at the block end. A QP block
+     * that states more than 13 holds none.
      */
     aligned = (!in_frame_offset && !anchor) ||
               (in_frame_offset && in_frame_offset + anchor == ctx->frame_size);
@@ -708,8 +707,8 @@ static int ds2_qp_read_frame(AVFormatContext *s, AVPacket *pkt) {
   return 0;
 
 truncated:
-  /* The file ends inside a frame its block still counts. Olympus decodes
-   * that frame too, so keep it, with the missing bytes zeroed. */
+  /* The file ends inside a frame its block still counts. Return that
+   * frame, with the missing bytes zeroed. */
   memset(pkt->data + offset, 0, ctx->frame_size - offset);
   if (ctx->frame_size != DS2_QP_FRAME_SIZE)
     av_shrink_packet(pkt, ctx->frame_size);

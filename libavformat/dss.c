@@ -120,12 +120,11 @@ typedef struct DSSDemuxContext {
 
 /* Frames that start in an audio block: byte 2, or byte 5 when byte 2 is 0 or
  * 0xff, and none when that is 0xff. A recorder writes the second form where
- * it pauses or stops, and Olympus's and Philips's decoders play those
- * frames. Philips's decoder takes a block that states more than 13 as empty,
- * which drops the DS-2600's splice blocks that state 19. So does this
- * demuxer, except where the block's format counts, 0xff in byte 3, and is
- * variable rate SP, LP or QP7, whose frames can be short enough for more to
- * start in a block. */
+ * it pauses or stops, and those frames are audio like any other. A block
+ * that states more than 13 holds none, which drops the DS-2600's splice
+ * blocks that state 19, except where the block's format counts, 0xff in
+ * byte 3, and is variable rate SP, LP or QP7, whose frames can be short
+ * enough for more to start in a block. */
 static int dss_block_frames(const uint8_t *header)
 {
     int n = header[2] && header[2] != 0xff ? header[2] : header[5];
@@ -248,7 +247,7 @@ static int dss_ds2_header_size(const uint8_t *buf, int size)
     return buf[0] * DSS_BLOCK_SIZE;
 }
 
-/* Olympus DssWriter can leave a copy of the file header in the audio area */
+/* Olympus software can leave a copy of the file header in the audio area */
 static int dss_header_copy_blocks(const uint8_t *header)
 {
     if ((header[1] == 'd' && header[2] == 's' &&
