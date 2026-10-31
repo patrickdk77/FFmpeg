@@ -300,7 +300,6 @@ static void lpec_qmf_transform(double *inout, int seg_len, const LPECQmfDesc *de
     double lo[LPEC_QMF_FFT_MAX + 16];
     double hi[LPEC_QMF_FFT_MAX + 16];
     int nband = flen >> 2;
-    int half  = flen >> 1;
     int mod_n = lpec_qmf_mod_bins(flen);
     int fft_n = flen >> 1;             /* FFT + synthesis length */
     /* cos1536 table is 1536 entries. */
@@ -311,7 +310,6 @@ static void lpec_qmf_transform(double *inout, int seg_len, const LPECQmfDesc *de
     int hi_idx = scale * nband;
     int lo_idx = 0;
     int pass1_end = mod_n & ~1;
-    int unused_half = half;
 
     memset(lo, 0, fft_n * sizeof(double));
     memset(hi, 0, fft_n * sizeof(double));
@@ -420,8 +418,6 @@ static void lpec_qmf_transform(double *inout, int seg_len, const LPECQmfDesc *de
                 *dst++ = -(*src--);
         }
     }
-
-    (void) unused_half;
 }
 
 void ff_lpec_qmf_init(LPECQmfState *st)

@@ -57,8 +57,6 @@ typedef struct LPECExcitState {
     int    route_pitch_base;
     int    pitch_route_len[4];
     int    is_xaudio_lp;            /* quality 0x19 selects the Xaudio tables */
-    int    codec_rate_in;           /* coded rate (6000 -> lpec_xa_route_gain_6k) */
-    int    xa_route_pitch;          /* unused: set to 0, never read */
     int    mode0_half2_gain;        /* mode 0: 2nd header read after half 1 */
     int    mode0_half2_cb1;
     int    mode0_half2_cb2;

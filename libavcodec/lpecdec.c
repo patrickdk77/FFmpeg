@@ -871,9 +871,6 @@ static const double *lpec_pitch_coef_table(const LPECContext *s)
 {
     if (s->num_bands == 10)
         return lpec_16k_pitch_coef;
-    /* not reached for Xaudio LP: lpec_pitch_lag_coefs() returns first */
-    if (s->is_xaudio_lp)
-        return lpec_xa_8k_pitch_cb;
     return lpec_8k_pitch_coef;
 }
 

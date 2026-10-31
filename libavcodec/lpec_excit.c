@@ -137,8 +137,6 @@ void ff_lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
     else
         st->route_pitch_base = 0;
     st->is_xaudio_lp   = is_xaudio_lp;
-    st->codec_rate_in  = codec_rate_in;
-    st->xa_route_pitch = 0;
 
     {
         static const int qmf_lens[5] = { 512, 768, 1024, 1536, 2048 };
@@ -156,13 +154,10 @@ void ff_lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
     st->pitch_mult  = pitch_mult;
     st->pitch_scale = st->band_width;
 
-    /* Xaudio LP at 8 kHz: pitch_ref_base is 180 when a coded rate other
-     * than 6000 Hz is set, else 112. Otherwise 432 from 11026 Hz up, else 128. */
+    /* Xaudio LP at 8 kHz: pitch_ref_base is 112. Otherwise 432 from
+     * 11026 Hz up, else 128. */
     if (is_xaudio_lp && sample_rate < 8001) {
-        if (codec_rate_in > 0 && codec_rate_in != 6000)
-            pitch_ref_base = 180; /* coded rate != 6000 */
-        else
-            pitch_ref_base = 112; /* coded rate == 6000 */
+        pitch_ref_base = 112;
     } else if (sample_rate >= 11026) {
         pitch_ref_base = 432;
     } else {
@@ -1345,12 +1340,9 @@ int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
         if (st->is_xaudio_lp && mode == 1) {
             int hs = half_slot & 3;
             int f[4];
-            const int16_t *rtable = (st->codec_rate_in == 6000)
-                                    ? lpec_xa_route_gain_6k
-                                    : lpec_xa_route_gain_other;
 
             lpec_xa_route_alloc(route, hs, rem_bits, pitch_route_arg, f,
-                                rtable, st->num_bands,
+                                lpec_xa_route_gain_6k, st->num_bands,
                                 st->pitch_scale_route[hs],
                                 st->pitch_ref_route[hs],
                                 st->pitch_mult_route[hs]);
