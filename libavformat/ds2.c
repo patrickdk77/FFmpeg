@@ -100,14 +100,14 @@ static int ds2_header_copy_blocks(const uint8_t *hdr) {
 }
 
 /*
- * Frames that start in a block: byte 2 when it is not 0, otherwise byte 5
- * unless that is 0xff. A recorder writes the second form where it pauses or
- * stops, and Olympus's decoder plays those frames.
+ * Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff,
+ * and none when that is 0xff. A recorder writes the second form where it
+ * pauses or stops, and Olympus's and Philips's decoders play those frames.
  */
 static int ds2_block_frames(const uint8_t *hdr) {
-  if (hdr[2] || hdr[5] == 0xff)
-    return hdr[2];
-  return hdr[5];
+  int n = hdr[2] && hdr[2] != 0xff ? hdr[2] : hdr[5];
+
+  return n == 0xff ? 0 : n;
 }
 
 static int ds2_format_known(const uint8_t *hdr) {
@@ -175,10 +175,16 @@ static int64_t ds2_qp_count_output_frames(const DS2DemuxContext *ctx) {
 
 /*
  * Payload offset of the first frame that starts in a block, past the tail of
- * a frame carried over from the previous block.
+ * a frame carried over from the previous block. The header gives it in bits
+ * from the block start, in byte 1 and the top half of byte 0, or where both
+ * are 0, as in Philips's pause blocks, in the bottom half of byte 0 and byte 3.
  */
 static int ds2_block_anchor(const uint8_t *hdr) {
-  return av_clip(2 * hdr[1] + 2 * (hdr[0] >> 7) - DS2_AUDIO_BLOCK_HEADER_SIZE,
+  int bits = hdr[1] << 4 | hdr[0] >> 4;
+
+  if (!bits)
+    bits = (hdr[0] & 0x0f) << 8 | hdr[3];
+  return av_clip((bits >> 3) - DS2_AUDIO_BLOCK_HEADER_SIZE,
                  0, DS2_BLOCK_PAYLOAD_SIZE);
 }
 
@@ -317,18 +323,19 @@ static int ds2_first_format(AVFormatContext *s) {
   AVIOContext *pb = ctx->pb;
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
   int64_t pos = ctx->header_size, end = INT64_MAX;
-  int copy, ret, first = -1, held = 0;
+  int copy, ret, first = -1;
 
   if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
     end = pos + FFMAX(FFMIN(s->probesize, INT_MAX / 2),
                       DS2_FORMAT_SCAN_BLOCKS * DS2_BLOCK_SIZE);
     if (avio_seek(pb, 0, SEEK_SET) < 0)
       return DS2_FORMAT_QP;
-    if ((ret = ffio_ensure_seekback(pb, end)) < 0)
+    if ((ret = ffio_ensure_seekback(pb, end + 255 * DS2_BLOCK_SIZE +
+                                    DS2_AUDIO_BLOCK_HEADER_SIZE)) < 0)
       return ret;
   }
 
-  for (; pos < end; pos += DS2_BLOCK_SIZE) {
+  for (;; pos += DS2_BLOCK_SIZE) {
     if (avio_seek(pb, pos, SEEK_SET) < 0)
       break;
     ret = avio_read(pb, hdr, sizeof(hdr));
@@ -336,20 +343,24 @@ static int ds2_first_format(AVFormatContext *s) {
       return ret;
     if (ret != sizeof(hdr))
       break;
+    /* From a pipe the scan stops at a window. Where the input goes on past
+     * it, a block whose format counts may follow, so do not fall back to
+     * the first block with frames or to the default format. */
+    if (pos >= end)
+      return AVERROR_INVALIDDATA;
     copy = ds2_header_copy_blocks(hdr);
     if (copy)
       pos += (copy - 1) * DS2_BLOCK_SIZE;
     else if (ds2_block_frames(hdr)) {
       if (ds2_format_known(hdr))
         return hdr[4];
-      if (first < 0 && hdr[3] == 0xff)
+      if (first < 0)
         first = hdr[4];
-      held = 1;
     }
   }
-  if (first >= 0)
-    return first;
-  return held ? AVERROR_INVALIDDATA : DS2_FORMAT_QP;
+  if (pb->error < 0)
+    return pb->error;
+  return first >= 0 ? first : DS2_FORMAT_QP;
 }
 
 static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
@@ -386,8 +397,8 @@ static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
     ctx->counter = anchor;
   } else {
     /*
-     * QP frames re-anchor at payload offset 2*byte1 - 6 at every block (the
-     * swap bit is 0 in QP). On gap-free audio the anchor coincides with the
+     * QP frames re-anchor at every block, at the payload offset that
+     * ds2_block_anchor() gives. On gap-free audio the anchor coincides with the
      * straddle carried from the previous block, so a flat concatenation is
      * correct. At a segment boundary the recorder emits a re-sync block whose
      * anchor jumps: the leading bytes are an orphaned straddle tail, the
