@@ -106,9 +106,9 @@ void ff_lpec_lsf_indices_to_i16(int num_bands, int order, int num_cb,
     lpec_stabilize_lsf_i16(lsf_out, order);
 }
 
-static int lpec_autocorr_scale_c450(int *out_m, uint32_t *out_l,
-                                    int16_t *acf_out, const int16_t *lsf,
-                                    int order)
+static int lpec_autocorr_scale(int *out_m, uint32_t *out_l,
+                               int16_t *acf_out, const int16_t *lpc,
+                               int order)
 {
     uint32_t sum_l = 0;
     int sum_h = 0;
@@ -119,14 +119,14 @@ static int lpec_autocorr_scale_c450(int *out_m, uint32_t *out_l,
     uint32_t lo;
     int hi;
 
-    for (ps = lsf; ps <= lsf + order - 1; ps += 2) {
+    for (ps = lpc; ps <= lpc + order - 1; ps += 2) {
         int32_t a = (int32_t) ps[0] * ps[0];
         int32_t b = (int32_t) ps[1] * ps[1];
         sum_l += (uint32_t) a & 0x7fff;
         sum_h += (a >> 15) + (b >> 15);
         sum_l += (uint32_t) b & 0x7fff;
     }
-    for (; ps <= lsf + order; ps++) {
+    for (; ps <= lpc + order; ps++) {
         int32_t a = (int32_t) ps[0] * ps[0];
         sum_l += (uint32_t) a & 0x7fff;
         sum_h += a >> 15;
@@ -137,33 +137,33 @@ static int lpec_autocorr_scale_c450(int *out_m, uint32_t *out_l,
         mag = -mag;
 
     {
-        int i6 = 0, i11 = 0;
-        uint32_t u5 = mag;
+        int lead = 0, width = 0;
+        uint32_t probe = mag;
 
         for (;;) {
-            if (u5 & 0x40000) {
-                i11 = 0x13 - i6;
+            if (probe & 0x40000) {
+                width = 0x13 - lead;
                 break;
             }
-            if (i6 + 1 > 0x13)
+            if (lead + 1 > 0x13)
                 break;
-            if ((u5 * 2) & 0x40000) {
-                i11 = 0x13 - (i6 + 1);
-                break;
-            }
-            if (i6 + 2 > 0x13)
-                break;
-            if ((u5 * 4) & 0x40000) {
-                i11 = 0x13 - (i6 + 2);
+            if ((probe * 2) & 0x40000) {
+                width = 0x13 - (lead + 1);
                 break;
             }
-            i6 += 3;
-            u5 *= 8;
-            if (i6 >= 0x14)
+            if (lead + 2 > 0x13)
+                break;
+            if ((probe * 4) & 0x40000) {
+                width = 0x13 - (lead + 2);
+                break;
+            }
+            lead += 3;
+            probe *= 8;
+            if (lead >= 0x14)
                 break;
         }
-        shift = i11;
-        iexp = i11 - 10;
+        shift = width;
+        iexp = width - 10;
     }
     lo = sum_l & 0x7fff;
     hi = sum_h + (sum_l >> 15);
@@ -190,7 +190,7 @@ static int lpec_autocorr_scale_c450(int *out_m, uint32_t *out_l,
     for (n = 1; n <= order; n++) {
         uint32_t sl = 0;
         int sh = 0;
-        const int16_t *p = lsf;
+        const int16_t *p = lpc;
         int end = order - n;
 
         for (i = 0; i <= end; i++) {
@@ -208,28 +208,28 @@ static int lpec_autocorr_scale_c450(int *out_m, uint32_t *out_l,
 #pragma GCC optimize("O0")
 #endif
 
-static int lpec_rt_idx_from_i5(int i5)
+static int lpec_rt_cos_idx(int ipart)
 {
-    int32_t eax = i5;
-    int32_t esi = eax + 0x200;
+    int32_t v = ipart;
+    int32_t t = v + 0x200;
 
-    esi >>= 10;
-    esi = (uint32_t) esi >> 21;
-    esi = esi + eax + 0x200;
-    esi &= 0xfffff800;
-    esi = -esi + eax + 0x200;
-    return (int) esi;
+    t >>= 10;
+    t = (uint32_t) t >> 21;
+    t = t + v + 0x200;
+    t &= 0xfffff800;
+    t = -t + v + 0x200;
+    return (int) t;
 }
 
 static int16_t lpec_rt_interp_i16(int16_t in)
 {
-    int32_t u4 = (int32_t) in << 11;
-    int i5 = u4 >> 16;
-    int i8 = (u4 & 0xffff) >> 1;
-    int idx = lpec_rt_idx_from_i5(i5);
+    int32_t phase = (int32_t) in << 11;
+    int ipart = phase >> 16;
+    int frac = (phase & 0xffff) >> 1;
+    int idx = lpec_rt_cos_idx(ipart);
 
-    return (int16_t) (((0x8000 - i8) * lpec_rtable_a[idx]
-                       + lpec_rtable_a[idx + 1] * i8) >> 15);
+    return (int16_t) (((0x8000 - frac) * lpec_rtable_a[idx]
+                       + lpec_rtable_a[idx + 1] * frac) >> 15);
 }
 
 #if defined(__GNUC__)
@@ -238,29 +238,29 @@ static int16_t lpec_rt_interp_i16(int16_t in)
 
 static int lpec_fp_mul2(uint32_t a, int16_t s)
 {
-    int32_t edx = (int32_t) a >> 16;
-    int32_t ebx = (uint32_t) (a & 0xffff);
-    int32_t eax = s;
+    int32_t hi = (int32_t) a >> 16;
+    int32_t lo = (uint32_t) (a & 0xffff);
+    int32_t v = s;
 
-    ebx = ebx * eax;
-    edx = edx * eax;
-    ebx >>= 15;
-    ebx = ebx + edx * 2;
-    return ebx * 2;
+    lo = lo * v;
+    hi = hi * v;
+    lo >>= 15;
+    lo = lo + hi * 2;
+    return lo * 2;
 }
 
-static int lpec_a110_dll_half(int order)
+static int lpec_half_order(int order)
 {
-    uint32_t eax = (uint32_t) order;
+    uint32_t v = (uint32_t) order;
 
-    eax += 0x80000000u;
-    eax += 0x80000000u + (eax < 0x80000000u);
-    return (int32_t) eax >> 1;
+    v += 0x80000000u;
+    v += 0x80000000u + (v < 0x80000000u);
+    return (int32_t) v >> 1;
 }
 
-static void lpec_a110_phase1_stack(uint8_t *stk, const int16_t *lsf_in, int order)
+static void lpec_store_lsf_cos(uint8_t *scratch, const int16_t *lsf_in, int order)
 {
-    int edx, limit;
+    int idx, limit;
 
     if (order < 0)
         return;
@@ -269,16 +269,16 @@ static void lpec_a110_phase1_stack(uint8_t *stk, const int16_t *lsf_in, int orde
      * buffer. For an even order the paired loop stops at order - 2, so
      * lsf_in[order] is stored on its own. */
     limit = ((order + 1) & ~1) - 1;
-    for (edx = 0; edx <= limit; edx += 2) {
-        *(int16_t *) (stk + edx * 2 + 0x90) = lpec_rt_interp_i16(lsf_in[edx]);
-        if (edx + 1 <= order)
-            *(int16_t *) (stk + edx * 2 + 0x92) = lpec_rt_interp_i16(lsf_in[edx + 1]);
+    for (idx = 0; idx <= limit; idx += 2) {
+        *(int16_t *) (scratch + idx * 2 + 0x90) = lpec_rt_interp_i16(lsf_in[idx]);
+        if (idx + 1 <= order)
+            *(int16_t *) (scratch + idx * 2 + 0x92) = lpec_rt_interp_i16(lsf_in[idx + 1]);
     }
-    for (edx = limit + 2; edx <= order; edx++)
-        *(int16_t *) (stk + edx * 2 + 0x90) = lpec_rt_interp_i16(lsf_in[edx]);
-    /* Even order: paired loop stops at order-2; k=order/2 reads stk+order*2+0x90. */
+    for (idx = limit + 2; idx <= order; idx++)
+        *(int16_t *) (scratch + idx * 2 + 0x90) = lpec_rt_interp_i16(lsf_in[idx]);
+    /* Even order: paired loop stops at order-2; k=order/2 reads scratch+order*2+0x90. */
     if (!(order & 1))
-        *(int16_t *) (stk + order * 2 + 0x90) = lpec_rt_interp_i16(lsf_in[order]);
+        *(int16_t *) (scratch + order * 2 + 0x90) = lpec_rt_interp_i16(lsf_in[order]);
 }
 
 #if defined(__GNUC__)
@@ -288,73 +288,73 @@ static void lpec_a110_phase1_stack(uint8_t *stk, const int16_t *lsf_in, int orde
 
 /* One 0x1a4-byte buffer; the two polynomials, the cosines and the two
  * product arrays sit at fixed offsets in it. */
-int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
+int ff_lpec_lsf_to_lpc_i16(const int16_t *lsf_in, int16_t *out, int order)
 {
-    uint8_t stk[0x1a4];
-    uint32_t *local_1b4 = (uint32_t *) stk;
-    uint32_t *local_16c = (uint32_t *) (stk + 0x48);
-    int *aiStack_b8  = (int *) (stk + 0xb8);
-    int *aiStack_100 = (int *) (stk + 0x100);
-    uint32_t local_70[18];
+    uint8_t scratch[0x1a4];
+    uint32_t *q_poly = (uint32_t *) scratch;
+    uint32_t *p_poly = (uint32_t *) (scratch + 0x48);
+    int *p_prod = (int *) (scratch + 0xb8);
+    int *q_prod = (int *) (scratch + 0x100);
+    uint32_t lpc_acc[18];
     uint32_t uacc;
     int half, k, j, i, ret;
-    int shift_pos, iexp, i8, edx, half_limit;
+    int shift_pos, iexp, round_bias, idx, half_limit;
     uint32_t u;
 
     if (order < 0)
         return 0;
 
-    memset(stk, 0, sizeof(stk));
-    lpec_a110_phase1_stack(stk, lsf_in, order);
+    memset(scratch, 0, sizeof(scratch));
+    lpec_store_lsf_cos(scratch, lsf_in, order);
 
-    local_16c[1] = 0x800000;
-    local_1b4[1] = 0xff800000;
-    local_16c[0] = local_1b4[0] = 0xff800000;
+    p_poly[1] = 0x800000;
+    q_poly[1] = 0xff800000;
+    p_poly[0] = q_poly[0] = 0xff800000;
 
-    half = lpec_a110_dll_half(order);
+    half = lpec_half_order(order);
     if (half > 0) {
         for (k = 1; k <= half; k++) {
-            int16_t as_even = *(int16_t *) (stk + k * 4 + 0x90);
-            int16_t as_odd  = *(int16_t *) (stk + k * 4 + 0x8e);
+            int16_t as_even = *(int16_t *) (scratch + k * 4 + 0x90);
+            int16_t as_odd  = *(int16_t *) (scratch + k * 4 + 0x8e);
 
-            aiStack_b8[0]  = lpec_fp_mul2(local_16c[0], as_even);
-            aiStack_100[0] = lpec_fp_mul2(local_1b4[0], as_odd);
+            p_prod[0] = lpec_fp_mul2(p_poly[0], as_even);
+            q_prod[0] = lpec_fp_mul2(q_poly[0], as_odd);
 
             if (k >= 2) {
-                uint8_t *pu  = stk + 0x08;
-                uint8_t *end = stk + k * 4;
+                uint8_t *cursor = scratch + 0x08;
+                uint8_t *end    = scratch + k * 4;
 
-                while (pu <= end) {
-                    *(int *) (pu + 0xb4) =
-                        lpec_fp_mul2(*(uint32_t *) (pu + 0x44), as_even)
-                        - (int) *(uint32_t *) (pu + 0x40);
-                    *(int *) (pu + 0xfc) =
-                        lpec_fp_mul2(*(uint32_t *) (pu - 4), as_odd)
-                        - (int) *(uint32_t *) (pu - 8);
-                    pu += 4;
+                while (cursor <= end) {
+                    *(int *) (cursor + 0xb4) =
+                        lpec_fp_mul2(*(uint32_t *) (cursor + 0x44), as_even)
+                        - (int) *(uint32_t *) (cursor + 0x40);
+                    *(int *) (cursor + 0xfc) =
+                        lpec_fp_mul2(*(uint32_t *) (cursor - 4), as_odd)
+                        - (int) *(uint32_t *) (cursor - 8);
+                    cursor += 4;
                 }
             }
 
             for (j = 1; j <= k; j++) {
-                uint32_t old_b = local_16c[j];
+                uint32_t old_b = p_poly[j];
                 int mir = (k << 1) + 1 - j;
-                int sb = aiStack_b8[j - 1];
-                int s100 = aiStack_100[j - 1];
+                int p_sub = p_prod[j - 1];
+                int q_sub = q_prod[j - 1];
 
-                local_16c[j] -= sb;
-                local_1b4[j] -= s100;
-                local_16c[mir] = (uint32_t) (-(int32_t) (old_b - sb));
-                local_1b4[mir] = local_1b4[j];
+                p_poly[j] -= p_sub;
+                q_poly[j] -= q_sub;
+                p_poly[mir] = (uint32_t) (-(int32_t) (old_b - p_sub));
+                q_poly[mir] = q_poly[j];
             }
         }
     }
 
     uacc = 0;
     for (i = 0; i <= order; i++) {
-        int32_t neg_sum = -(int32_t) (local_1b4[i] + local_16c[i]);
+        int32_t neg_sum = -(int32_t) (q_poly[i] + p_poly[i]);
         int32_t mag = neg_sum;
 
-        local_70[i] = (uint32_t) neg_sum;
+        lpc_acc[i] = (uint32_t) neg_sum;
         if (mag < 0)
             mag = -mag;
         uacc |= (uint32_t) mag;
@@ -381,27 +381,27 @@ int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
         uacc <<= 1;
     }
 
-    iexp = 0x10 - shift_pos;
-    ret  = 7 - shift_pos;
-    i8   = 1 << ((0xf - shift_pos) & 31);
+    iexp       = 0x10 - shift_pos;
+    ret        = 7 - shift_pos;
+    round_bias = 1 << ((0xf - shift_pos) & 31);
 
     half_limit = ((order + 1) & ~1) - 1;
-    edx = 0;
+    idx = 0;
     if (half_limit >= 0) {
         do {
-            u = local_70[edx] + i8;
-            out[edx] = (int16_t) ((int32_t) u >> (iexp & 31));
-            local_70[edx] = u;
-            u = local_70[edx + 1] + i8;
-            out[edx + 1] = (int16_t) ((int32_t) u >> (iexp & 31));
-            local_70[edx + 1] = u;
-            edx += 2;
-        } while (edx <= half_limit);
+            u = lpc_acc[idx] + round_bias;
+            out[idx] = (int16_t) ((int32_t) u >> (iexp & 31));
+            lpc_acc[idx] = u;
+            u = lpc_acc[idx + 1] + round_bias;
+            out[idx + 1] = (int16_t) ((int32_t) u >> (iexp & 31));
+            lpc_acc[idx + 1] = u;
+            idx += 2;
+        } while (idx <= half_limit);
     }
-    for (; edx <= order; edx++) {
-        u = local_70[edx] + i8;
-        out[edx] = (int16_t) ((int32_t) u >> (iexp & 31));
-        local_70[edx] = u;
+    for (; idx <= order; idx++) {
+        u = lpc_acc[idx] + round_bias;
+        out[idx] = (int16_t) ((int32_t) u >> (iexp & 31));
+        lpc_acc[idx] = u;
     }
 
     return ret;
@@ -411,7 +411,7 @@ int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order)
 #pragma GCC pop_options
 #endif
 
-static int lpec_c680_route_tables(const int16_t *a110_out, int pitch_win, double pitch_e,
+static int lpec_envelope_route_tables(const int16_t *lpc_i16, int pitch_win, double pitch_e,
                            int32_t *route_out, int pitch_len, int order,
                            const int16_t *rt_a, const int16_t *rt_b)
 {
@@ -438,57 +438,57 @@ static int lpec_c680_route_tables(const int16_t *a110_out, int pitch_win, double
     else
         pitch_i16 = (int16_t) (pitch_e * 32768.0 - 0.5);
 
-    lpec_autocorr_scale_c450(&m, &l, acf, a110_out, order);
+    lpec_autocorr_scale(&m, &l, acf, lpc_i16, order);
 
     if (!pitch_win) {
         for (pos = 0; pos < half; pos++) {
-            int p0 = quarter + pos;
+            int phase = quarter + pos;
             uint32_t sl = l;
             int sh = m;
             int k;
 
             for (k = 1; k <= order; k++) {
-                int idx = tbl_stride * (p0 % pitch_len);
+                int idx = tbl_stride * (phase % pitch_len);
                 int32_t prod = (int32_t) acf[k] * rt[idx];
                 sl += prod & 0x7ffff;
                 sh += prod >> 19;
-                p0 += pos;
+                phase += pos;
             }
             route_out[pos] = sh * 0x2000 + (sl >> 6);
         }
     } else {
-        int local50 = pitch_i16;
-        int p28 = quarter;
-        int p24 = 0;
+        int pitch_q15 = pitch_i16;
+        int pitch_pos = quarter;
+        int step = 0;
 
         for (pos = 0; pos < half; pos++) {
-            int p4 = p24 + quarter;
+            int phase = step + quarter;
             uint32_t sl = l;
             int sh = m;
-            int k, v6;
+            int k, weight;
 
             for (k = 1; k <= order; k++) {
-                int idx = tbl_stride * (p4 % pitch_len);
+                int idx = tbl_stride * (phase % pitch_len);
                 int32_t prod = (int32_t) acf[k] * rt[idx];
                 sl += prod & 0x7ffff;
                 sh += prod >> 19;
-                p4 += p24;
+                phase += step;
             }
-            v6 = (local50 * (((local50 - 2 * rt[tbl_stride * (p28 % pitch_len)]) >> 2))
-                  + 0x10000000) >> 15;
-            v6 = (((sl & 0x7ffff) >> 4) * v6 >> 14) + (sh + (sl >> 19)) * v6 * 2;
-            route_out[pos] = v6;
-            p24++;
-            p28 += pitch_win;
+            weight = (pitch_q15 * (((pitch_q15 - 2 * rt[tbl_stride * (pitch_pos % pitch_len)]) >> 2))
+                      + 0x10000000) >> 15;
+            weight = (((sl & 0x7ffff) >> 4) * weight >> 14) + (sh + (sl >> 19)) * weight * 2;
+            route_out[pos] = weight;
+            step++;
+            pitch_pos += pitch_win;
         }
     }
     return 0;
 }
 
-int ff_lpec_c680_route(const int16_t *a110_out, int pitch_win, double pitch_e,
+int ff_lpec_envelope_route(const int16_t *lpc_i16, int pitch_win, double pitch_e,
                     int32_t *route_out, int pitch_len, int order)
 {
-    return lpec_c680_route_tables(a110_out, pitch_win, pitch_e, route_out,
-                                  pitch_len, order,
-                                  lpec_rtable_a, lpec_rtable_b);
+    return lpec_envelope_route_tables(lpc_i16, pitch_win, pitch_e, route_out,
+                                      pitch_len, order,
+                                      lpec_rtable_a, lpec_rtable_b);
 }

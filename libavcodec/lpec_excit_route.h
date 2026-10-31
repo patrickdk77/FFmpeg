@@ -850,9 +850,9 @@ static const int16_t lpec_16k_pitch_lag_tbl[384] = {
 void ff_lpec_lsf_indices_to_i16(int num_bands, int order, int num_cb,
                              const int *idx, int16_t *lsf_out);
 
-int ff_lpec_a110_route_shorts(const int16_t *lsf_in, int16_t *out, int order);
+int ff_lpec_lsf_to_lpc_i16(const int16_t *lsf_in, int16_t *out, int order);
 
-int ff_lpec_c680_route(const int16_t *a110_out, int pitch_win, double pitch_e,
+int ff_lpec_envelope_route(const int16_t *lpc_i16, int pitch_win, double pitch_e,
                     int32_t *route_out, int pitch_len, int order);
 
 #endif /* AVCODEC_LPEC_EXCIT_ROUTE_H */

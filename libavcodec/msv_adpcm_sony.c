@@ -192,19 +192,19 @@ static uint32_t msv_sym_bw_scale(uint32_t sym, int mode)
     return sym;
 }
 
-static uint32_t msv_del_e4_step(uint32_t sign_e4, uint32_t del_e4)
+static uint32_t msv_pole0_times4(uint32_t sign_pole0, uint32_t pole0)
 {
-    if (sign_e4 == 0) {
-        if (del_e4 < 0x2000)
-            return del_e4 * 4;
+    if (sign_pole0 == 0) {
+        if (pole0 < 0x2000)
+            return pole0 * 4;
         return 0x7ffc;
     }
-    if (del_e4 < 0xe001)
+    if (pole0 < 0xe001)
         return 0x18004;
-    return (del_e4 & 0x7fff) * 4;
+    return (pole0 & 0x7fff) * 4;
 }
 
-static uint32_t msv_del_e0_inc(uint32_t tmp_b, int adapt_cmp)
+static uint32_t msv_pole1_inc(uint32_t tmp_b, int adapt_cmp)
 {
     if (tmp_b >> 16 == 0)
         return adapt_cmp ? 0 : tmp_b >> 7;
@@ -213,7 +213,7 @@ static uint32_t msv_del_e0_inc(uint32_t tmp_b, int adapt_cmp)
     return (tmp_b >> 7) + 0xfc00;
 }
 
-static uint32_t msv_del_e0_saturate(uint32_t sum)
+static uint32_t msv_pole1_clamp(uint32_t sum)
 {
     if (sum >= 0x8000 && sum <= 0xd000)
         return 0xd000;
@@ -222,18 +222,18 @@ static uint32_t msv_del_e0_saturate(uint32_t sum)
     return sum;
 }
 
-static uint32_t msv_del_e4_predict(uint32_t sign_e4, uint32_t del_e4, uint32_t tap_seed,
-                                    uint32_t del_e0_sum)
+static uint32_t msv_pole0_update(uint32_t sign_pole0, uint32_t pole0, uint32_t tap_seed,
+                                    uint32_t pole1_sum)
 {
     uint32_t acc, lo, hi;
 
-    if (sign_e4)
-        acc = 0x100 - (del_e4 >> 8);
+    if (sign_pole0)
+        acc = 0x100 - (pole0 >> 8);
     else
-        acc = -(del_e4 >> 8);
-    acc = ((acc & 0xffff) + tap_seed + del_e4) & 0xffff;
-    lo = (0x3c00 - del_e0_sum) & 0xffff;
-    hi = (del_e0_sum - 0x3c00) & 0xffff;
+        acc = -(pole0 >> 8);
+    acc = ((acc & 0xffff) + tap_seed + pole0) & 0xffff;
+    lo = (0x3c00 - pole1_sum) & 0xffff;
+    hi = (pole1_sum - 0x3c00) & 0xffff;
     if ((((acc < 0x8000) || (hi < acc)) && (hi = acc, lo <= acc)) && (acc < 0x8000))
         return lo;
     return hi;
@@ -483,7 +483,8 @@ static uint32_t msv_sym_acc_mag(uint32_t quant_base, uint32_t sym_acc)
 }
 
 typedef struct {
-    uint32_t tap0, del_e8_mag, e4, e0, dc, d8, d4, d0, cc, c8;
+    uint32_t tap0, new_pr_sign0, new_pole0, new_pole1, new_zero0, new_zero1,
+             new_zero2, new_zero3, new_zero4, new_zero5;
     uint32_t adapt_ctrl, bw_scale, filt_lo, filt_hi;
 } MSVSymCommit;
 
@@ -499,15 +500,15 @@ typedef struct MSVSymbolCtx {
     uint32_t pcm_mag;
     uint32_t bc_pred;
     uint32_t adapt_sum;
-    uint32_t scl_c4_scaled;
-    uint32_t tap_c0_scaled;
-    uint32_t f0_tap_scaled;
+    uint32_t recon1_scaled;
+    uint32_t recon0_scaled;
+    uint32_t tap0_scaled;
     uint32_t tap1_scaled;
     uint32_t tap2_scaled, tap3_scaled, tap4_scaled, tap5_scaled;
-    uint32_t sign_e4, sign_e0;
+    uint32_t sign_pole0, sign_pole1;
     uint32_t sign_t0, sign_t1, sign_t2, sign_t3, sign_t4, sign_t5;
-    uint32_t sign_dc, sign_d8, sign_d4, sign_d0, sign_cc, sign_c8;
-    uint32_t del_e0_new, del_e0_sum;
+    uint32_t sign_zero0, sign_zero1, sign_zero2, sign_zero3, sign_zero4, sign_zero5;
+    uint32_t new_pole1, pole1_sum;
     uint32_t new_tap0;
     uint32_t saved_delta;
     uint32_t acc, mag, coeff;
@@ -516,7 +517,7 @@ typedef struct MSVSymbolCtx {
 } MSVSymbolCtx;
 
 static void msv_state_commit(MSVADPCMState *st, const MSVSymCommit *c,
-                             uint32_t scl_c4_scaled)
+                             uint32_t new_recon0)
 {
     st->tap5 = st->tap4;
     st->tap4 = st->tap3;
@@ -524,18 +525,18 @@ static void msv_state_commit(MSVADPCMState *st, const MSVSymCommit *c,
     st->tap2 = st->tap1;
     st->tap1 = st->tap0;
     st->tap0 = c->tap0;
-    st->del_ec = st->del_e8;
-    st->del_e8 = c->del_e8_mag;
-    st->del_e4 = c->e4;
-    st->del_e0 = c->e0;
-    st->del_dc = c->dc;
-    st->del_d8 = c->d8;
-    st->del_d4 = c->d4;
-    st->del_d0 = c->d0;
-    st->scl_c4 = st->scl_c0;
-    st->del_cc = c->cc;
-    st->scl_c0 = scl_c4_scaled;
-    st->del_c8 = c->c8;
+    st->pr_sign1 = st->pr_sign0;
+    st->pr_sign0 = c->new_pr_sign0;
+    st->pole0 = c->new_pole0;
+    st->pole1 = c->new_pole1;
+    st->zero0 = c->new_zero0;
+    st->zero1 = c->new_zero1;
+    st->zero2 = c->new_zero2;
+    st->zero3 = c->new_zero3;
+    st->recon1 = st->recon0;
+    st->zero4 = c->new_zero4;
+    st->recon0 = new_recon0;
+    st->zero5 = c->new_zero5;
     st->adapt_ctrl = c->adapt_ctrl;
     st->bw_scale = c->bw_scale;
     st->filt_lo = c->filt_lo;
@@ -550,18 +551,18 @@ static uint16_t msv_decode_symbol_init(MSVADPCMState *st)
     st->tap3 = st->tap0;
     st->tap4 = st->tap0;
     st->tap5 = st->tap0;
-    st->del_c8 = msv_state_word(1, 0, 0);
-    st->scl_c0 = st->tap0;
-    st->scl_c4 = st->tap0;
-    st->del_cc = st->del_c8;
-    st->del_d0 = st->del_c8;
-    st->del_d4 = st->del_c8;
-    st->del_d8 = st->del_c8;
-    st->del_dc = st->del_c8;
-    st->del_e0 = st->del_c8;
-    st->del_e4 = st->del_c8;
-    st->del_e8 = st->del_c8;
-    st->del_ec = st->del_c8;
+    st->zero5 = msv_state_word(1, 0, 0);
+    st->recon0 = st->tap0;
+    st->recon1 = st->tap0;
+    st->zero4 = st->zero5;
+    st->zero3 = st->zero5;
+    st->zero2 = st->zero5;
+    st->zero1 = st->zero5;
+    st->zero0 = st->zero5;
+    st->pole1 = st->zero5;
+    st->pole0 = st->zero5;
+    st->pr_sign0 = st->zero5;
+    st->pr_sign1 = st->zero5;
     st->quant_base = msv_state_word(1, 0, 0x220);
     st->sym_acc = msv_state_word(1, 0, 0x8800);
     st->adapt_ctrl = 0;
@@ -573,39 +574,39 @@ static uint16_t msv_decode_symbol_init(MSVADPCMState *st)
 
 static void msv_decode_tap_sum(MSVSymbolCtx *c)
 {
-    c->sign_e4 = c->st->del_e4 >> 0xf;
-    c->mag = msv_norm_mag_13bit(c->st->del_e4, &c->exp_shift);
-    c->tap_c0_scaled = msv_scale_tap(c->st->scl_c0, c->mag, c->exp_shift, c->sign_e4);
-    c->sign_e0 = c->st->del_e0 >> 0xf;
-    c->mag = msv_norm_mag_13bit(c->st->del_e0, &c->exp_shift);
-    c->scl_c4_scaled = msv_scale_tap(c->st->scl_c4, c->mag, c->exp_shift, c->sign_e0);
-    c->sign_dc = c->st->del_dc >> 0xf;
+    c->sign_pole0 = c->st->pole0 >> 0xf;
+    c->mag = msv_norm_mag_13bit(c->st->pole0, &c->exp_shift);
+    c->recon0_scaled = msv_scale_tap(c->st->recon0, c->mag, c->exp_shift, c->sign_pole0);
+    c->sign_pole1 = c->st->pole1 >> 0xf;
+    c->mag = msv_norm_mag_13bit(c->st->pole1, &c->exp_shift);
+    c->recon1_scaled = msv_scale_tap(c->st->recon1, c->mag, c->exp_shift, c->sign_pole1);
+    c->sign_zero0 = c->st->zero0 >> 0xf;
     c->sign_t0 = c->st->tap0 >> 10;
-    c->mag = msv_norm_mag_13bit(c->st->del_dc, &c->exp_shift);
-    c->f0_tap_scaled = msv_scale_tap(c->st->tap0, c->mag, c->exp_shift, c->sign_dc);
-    c->sign_d8 = c->st->del_d8 >> 0xf;
+    c->mag = msv_norm_mag_13bit(c->st->zero0, &c->exp_shift);
+    c->tap0_scaled = msv_scale_tap(c->st->tap0, c->mag, c->exp_shift, c->sign_zero0);
+    c->sign_zero1 = c->st->zero1 >> 0xf;
     c->sign_t1 = c->st->tap1 >> 10;
-    c->mag = msv_norm_mag_13bit(c->st->del_d8, &c->exp_shift);
-    c->tap1_scaled = msv_scale_tap(c->st->tap1, c->mag, c->exp_shift, c->sign_d8);
-    c->sign_d4 = c->st->del_d4 >> 0xf;
+    c->mag = msv_norm_mag_13bit(c->st->zero1, &c->exp_shift);
+    c->tap1_scaled = msv_scale_tap(c->st->tap1, c->mag, c->exp_shift, c->sign_zero1);
+    c->sign_zero2 = c->st->zero2 >> 0xf;
     c->sign_t2 = c->st->tap2 >> 10;
-    c->mag = msv_norm_mag_13bit(c->st->del_d4, &c->exp_shift);
-    c->tap2_scaled = msv_scale_tap(c->st->tap2, c->mag, c->exp_shift, c->sign_d4);
-    c->sign_d0 = c->st->del_d0 >> 0xf;
+    c->mag = msv_norm_mag_13bit(c->st->zero2, &c->exp_shift);
+    c->tap2_scaled = msv_scale_tap(c->st->tap2, c->mag, c->exp_shift, c->sign_zero2);
+    c->sign_zero3 = c->st->zero3 >> 0xf;
     c->sign_t3 = c->st->tap3 >> 10;
-    c->mag = msv_norm_mag_13bit(c->st->del_d0, &c->exp_shift);
-    c->tap3_scaled = msv_scale_tap(c->st->tap3, c->mag, c->exp_shift, c->sign_d0);
-    c->sign_cc = c->st->del_cc >> 0xf;
+    c->mag = msv_norm_mag_13bit(c->st->zero3, &c->exp_shift);
+    c->tap3_scaled = msv_scale_tap(c->st->tap3, c->mag, c->exp_shift, c->sign_zero3);
+    c->sign_zero4 = c->st->zero4 >> 0xf;
     c->sign_t4 = c->st->tap4 >> 10;
-    c->mag = msv_norm_mag_13bit(c->st->del_cc, &c->exp_shift);
-    c->tap4_scaled = msv_scale_tap(c->st->tap4, c->mag, c->exp_shift, c->sign_cc);
-    c->sign_c8 = c->st->del_c8 >> 0xf;
+    c->mag = msv_norm_mag_13bit(c->st->zero4, &c->exp_shift);
+    c->tap4_scaled = msv_scale_tap(c->st->tap4, c->mag, c->exp_shift, c->sign_zero4);
+    c->sign_zero5 = c->st->zero5 >> 0xf;
     c->sign_t5 = c->st->tap5 >> 10;
-    c->mag = msv_norm_mag_13bit(c->st->del_c8, &c->exp_shift);
-    c->tap5_scaled = msv_scale_tap(c->st->tap5, c->mag, c->exp_shift, c->sign_c8);
+    c->mag = msv_norm_mag_13bit(c->st->zero5, &c->exp_shift);
+    c->tap5_scaled = msv_scale_tap(c->st->tap5, c->mag, c->exp_shift, c->sign_zero5);
     c->tmp_b = (c->tap5_scaled + c->tap4_scaled + c->tap3_scaled + c->tap2_scaled +
-                c->tap1_scaled + c->f0_tap_scaled) & 0xffff;
-    c->mag = (c->tmp_b + c->scl_c4_scaled + c->tap_c0_scaled) >> 1;
+                c->tap1_scaled + c->tap0_scaled) & 0xffff;
+    c->mag = (c->tmp_b + c->recon1_scaled + c->recon0_scaled) >> 1;
     c->tmp_b = c->tmp_b >> 1;
     c->coeff = c->mag & 0x7fff;
 }
@@ -653,8 +654,10 @@ static void msv_decode_synth(MSVSymbolCtx *c)
     c->acc = c->synth;
     if (c->synth >> 0xf != 0)
         c->acc = -c->synth & 0x7fff;
-    c->scl_c4_scaled = msv_exp_mant_15bit(c->acc, &c->exp_idx);
-    c->scl_c4_scaled = ((c->synth >> 0xf) * 0x10 + c->exp_idx) * 0x40 + c->scl_c4_scaled;
+    /* From here on recon1_scaled holds the new reconstructed sample,
+     * which msv_state_commit() stores as recon0. */
+    c->recon1_scaled = msv_exp_mant_15bit(c->acc, &c->exp_idx);
+    c->recon1_scaled = ((c->synth >> 0xf) * 0x10 + c->exp_idx) * 0x40 + c->recon1_scaled;
 }
 
 static void msv_decode_adapt(MSVSymbolCtx *c)
@@ -666,44 +669,46 @@ static void msv_decode_adapt(MSVSymbolCtx *c)
     c->acc = (c->tmp_c + c->tmp_b) & 0xffff;
     c->mag = c->acc >> 0xf;
     c->adapt_cmp = c->acc == 0;
-    c->acc = c->mag ^ c->st->del_e8;
-    c->tmp_b = msv_del_e4_step(c->sign_e4, c->st->del_e4);
+    c->acc = c->mag ^ c->st->pr_sign0;
+    c->tmp_b = msv_pole0_times4(c->sign_pole0, c->st->pole0);
     if (c->acc != 1)
         c->tmp_b = -c->tmp_b & 0x1ffff;
-    c->tmp_b = ((-(uint32_t)(c->mag != c->st->del_ec) & 0x18000) + 0x4000 + c->tmp_b) & 0x1ffff;
-    c->del_e0_new = msv_del_e0_inc(c->tmp_b, c->adapt_cmp);
-    if (c->sign_e0 == 0)
-        c->tmp_b = -(c->st->del_e0 >> 7);
+    c->tmp_b = ((-(uint32_t)(c->mag != c->st->pr_sign1) & 0x18000) + 0x4000 + c->tmp_b) & 0x1ffff;
+    /* new_pole1 holds the pole1 increment first; below it takes the new pole1. */
+    c->new_pole1 = msv_pole1_inc(c->tmp_b, c->adapt_cmp);
+    if (c->sign_pole1 == 0)
+        c->tmp_b = -(c->st->pole1 >> 7);
     else
-        c->tmp_b = 0x200 - (c->st->del_e0 >> 7);
-    c->del_e0_sum = msv_del_e0_saturate(((c->tmp_b & 0xffff) + c->del_e0_new + c->st->del_e0) & 0xffff);
-    c->adapt_sum = c->del_e0_sum;
-    c->del_e0_new = ~-(uint32_t)(c->pf_ovfl != 0) & c->del_e0_sum;
+        c->tmp_b = 0x200 - (c->st->pole1 >> 7);
+    c->pole1_sum = msv_pole1_clamp(((c->tmp_b & 0xffff) + c->new_pole1 + c->st->pole1) & 0xffff);
+    c->adapt_sum = c->pole1_sum;
+    c->new_pole1 = ~-(uint32_t)(c->pf_ovfl != 0) & c->pole1_sum;
     c->new_tap0 = msv_tap0_seed(c->acc, c->adapt_cmp);
-    c->sign_e0 = msv_del_e4_predict(c->sign_e4, c->st->del_e4, c->new_tap0, c->del_e0_sum);
-    c->sign_e0 = ~-(uint32_t)(c->pf_ovfl != 0) & c->sign_e0;
+    /* From here on sign_pole1 holds the new pole0. */
+    c->sign_pole1 = msv_pole0_update(c->sign_pole0, c->st->pole0, c->new_tap0, c->pole1_sum);
+    c->sign_pole1 = ~-(uint32_t)(c->pf_ovfl != 0) & c->sign_pole1;
     c->new_tap0 = msv_exp_mant_15bit(c->pcm_mag, &c->exp_idx);
     c->new_tap0 = (c->tap1_scaled * 0x10 + c->exp_idx) * 0x40 + c->new_tap0;
     {
         MSVDelayStep ds = { 0, 0 };
 
         ds = msv_delay_line_step(c->sign_t0, c->tap1_scaled, c->pcm_mag, &c->saved_delta,
-                                 ds.delta, 1, c->sign_dc, c->st->del_dc, c->pf_ovfl);
-        c->sign_dc = ds.delay;
+                                 ds.delta, 1, c->sign_zero0, c->st->zero0, c->pf_ovfl);
+        c->sign_zero0 = ds.delay;
         ds = msv_delay_line_step(c->sign_t1, c->tap1_scaled, c->pcm_mag, &c->saved_delta,
-                                 ds.delta, 0, c->sign_d8, c->st->del_d8, c->pf_ovfl);
-        c->sign_d8 = ds.delay;
+                                 ds.delta, 0, c->sign_zero1, c->st->zero1, c->pf_ovfl);
+        c->sign_zero1 = ds.delay;
         ds = msv_delay_line_step(c->sign_t2, c->tap1_scaled, c->pcm_mag, &c->saved_delta,
-                                 ds.delta, 0, c->sign_d4, c->st->del_d4, c->pf_ovfl);
-        c->sign_d4 = ds.delay;
+                                 ds.delta, 0, c->sign_zero2, c->st->zero2, c->pf_ovfl);
+        c->sign_zero2 = ds.delay;
         ds = msv_delay_line_step(c->sign_t3, c->tap1_scaled, c->pcm_mag, &c->saved_delta,
-                                 ds.delta, 0, c->sign_d0, c->st->del_d0, c->pf_ovfl);
-        c->sign_d0 = ds.delay;
+                                 ds.delta, 0, c->sign_zero3, c->st->zero3, c->pf_ovfl);
+        c->sign_zero3 = ds.delay;
         ds = msv_delay_line_step(c->sign_t4, c->tap1_scaled, c->pcm_mag, &c->saved_delta,
-                                 ds.delta, 0, c->sign_cc, c->st->del_cc, c->pf_ovfl);
-        c->sign_cc = ds.delay;
+                                 ds.delta, 0, c->sign_zero4, c->st->zero4, c->pf_ovfl);
+        c->sign_zero4 = ds.delay;
         ds = msv_delay_line_step(c->sign_t5, c->tap1_scaled, c->pcm_mag, &c->saved_delta,
-                                 ds.delta, 0, c->sign_c8, c->st->del_c8, c->pf_ovfl);
+                                 ds.delta, 0, c->sign_zero5, c->st->zero5, c->pf_ovfl);
         c->tmp_b = ds.delay;
     }
 }
@@ -723,21 +728,21 @@ static void msv_decode_filter_commit(MSVSymbolCtx *c)
     c->st->quant_base = msv_quant_base_update(c->sym_lo, c->mode, c->mag);
     c->mag = msv_sym_acc_mag(c->st->quant_base, c->st->sym_acc);
     c->sym_acc_out = (c->mag + c->st->sym_acc) & 0x7ffff;
-    commit.tap0       = c->new_tap0;
-    commit.del_e8_mag = c->exp_idx;
-    commit.e4         = c->sign_e0;
-    commit.e0         = c->del_e0_new;
-    commit.dc         = c->sign_dc;
-    commit.d8         = c->sign_d8;
-    commit.d4         = c->sign_d4;
-    commit.d0         = c->sign_d0;
-    commit.cc         = c->sign_cc;
-    commit.c8         = c->tmp_b;
-    commit.adapt_ctrl = c->acc;
-    commit.bw_scale   = c->coeff;
-    commit.filt_lo    = c->st->filt_lo;
-    commit.filt_hi    = c->st->filt_hi;
-    msv_state_commit(c->st, &commit, c->scl_c4_scaled);
+    commit.tap0         = c->new_tap0;
+    commit.new_pr_sign0 = c->exp_idx;
+    commit.new_pole0    = c->sign_pole1;
+    commit.new_pole1    = c->new_pole1;
+    commit.new_zero0    = c->sign_zero0;
+    commit.new_zero1    = c->sign_zero1;
+    commit.new_zero2    = c->sign_zero2;
+    commit.new_zero3    = c->sign_zero3;
+    commit.new_zero4    = c->sign_zero4;
+    commit.new_zero5    = c->tmp_b;
+    commit.adapt_ctrl   = c->acc;
+    commit.bw_scale     = c->coeff;
+    commit.filt_lo      = c->st->filt_lo;
+    commit.filt_hi      = c->st->filt_hi;
+    msv_state_commit(c->st, &commit, c->recon1_scaled);
     c->st->sym_acc = c->sym_acc_out;
 }
 

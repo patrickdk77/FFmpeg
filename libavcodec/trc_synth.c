@@ -173,7 +173,7 @@ static int16_t trc_tilt_coef_ir(const int16_t lpc[TRC_ORDER], const int16_t *win
     int16_t aw_num[TRC_ORDER], aw_den[TRC_ORDER];
     int16_t buf[40];
     int64_t r0, r1, a, c, d, div, num;
-    int ebx, step, rel, ki;
+    int byte_off, step, rel, ki;
     int widx, hidx;
 
     for (ki = 0; ki < TRC_ORDER; ki++) {
@@ -185,24 +185,24 @@ static int16_t trc_tilt_coef_ir(const int16_t lpc[TRC_ORDER], const int16_t *win
     buf[10] = 0x2000;
     memcpy(buf + 11, aw_num, TRC_ORDER * sizeof(int16_t));
 
-    ebx = 16;
+    byte_off = 16;
     for (step = 0; step < 30; step++) {
         int64_t acc;
         int32_t v;
 
-        widx = (ebx + 4) / 2;
+        widx = (byte_off + 4) / 2;
         v    = buf[widx];
         acc  = (int64_t)v << 14;
         for (ki = 0; ki < TRC_ORDER; ki++) {
             rel  = rels[ki];
-            hidx = (ebx + rel) / 2;
+            hidx = (byte_off + rel) / 2;
             if (hidx >= 0 && hidx < 40)
                 acc += (int64_t)aw_den[ki] * buf[hidx] * 2;
         }
         acc = trc_sat32(acc);
         acc = trc_sat32(acc << 2);
         buf[widx] = trc_round16((int32_t)acc);
-        ebx += 2;
+        byte_off += 2;
     }
 
     r0 = 0;
@@ -242,8 +242,8 @@ static void trc_postfilter_formant_ring(int16_t *ring, int ring_off,
     int16_t aw_num[TRC_ORDER], aw_den[TRC_ORDER];
     int16_t tilt_coef;
     int pcm_off = ring_off + TRC_PF_PCM_LEAD - TRC_ORDER;
-    int16_t *ps8;
-    const int16_t *ps7;
+    int16_t *ring_ptr;
+    const int16_t *syn_ptr;
     int n, k;
 
     if (len > 256)
@@ -253,25 +253,25 @@ static void trc_postfilter_formant_ring(int16_t *ring, int ring_off,
     trc_expand_lpc(aw_den, lpc, trc_lag_window);
     tilt_coef = trc_tilt_coef_ir(lpc, win, trc_lag_window);
 
-    ps8 = ring + pcm_off - 8;
-    ps7 = syn - 2;
+    ring_ptr = ring + pcm_off - 8;
+    syn_ptr = syn - 2;
 
     for (n = 0; n < len; n++) {
         int64_t acc = 0, r;
         int16_t formant, tilted;
 
         for (k = 0; k < TRC_ORDER; k++)
-            acc += (int64_t)aw_num[k] * ps7[1 - k] * 2;
-        acc += (int64_t)aw_den[0] * ps8[3] * 2;
-        acc += (int64_t)aw_den[1] * ps8[2] * 2;
-        acc += (int64_t)aw_den[2] * ps8[1] * 2;
-        acc += (int64_t)aw_den[3] * ps8[0] * 2;
-        acc += (int64_t)aw_den[4] * ps8[-1] * 2;
-        acc += (int64_t)aw_den[5] * ps8[-2] * 2;
-        acc += (int64_t)aw_den[6] * ps8[-3] * 2;
-        acc += (int64_t)aw_den[7] * ps8[-4] * 2;
-        acc += (int64_t)aw_den[8] * ps8[-5] * 2;
-        acc += (int64_t)aw_den[9] * ps8[-6] * 2;
+            acc += (int64_t)aw_num[k] * syn_ptr[1 - k] * 2;
+        acc += (int64_t)aw_den[0] * ring_ptr[3] * 2;
+        acc += (int64_t)aw_den[1] * ring_ptr[2] * 2;
+        acc += (int64_t)aw_den[2] * ring_ptr[1] * 2;
+        acc += (int64_t)aw_den[3] * ring_ptr[0] * 2;
+        acc += (int64_t)aw_den[4] * ring_ptr[-1] * 2;
+        acc += (int64_t)aw_den[5] * ring_ptr[-2] * 2;
+        acc += (int64_t)aw_den[6] * ring_ptr[-3] * 2;
+        acc += (int64_t)aw_den[7] * ring_ptr[-4] * 2;
+        acc += (int64_t)aw_den[8] * ring_ptr[-5] * 2;
+        acc += (int64_t)aw_den[9] * ring_ptr[-6] * 2;
         /*
          * The accumulator stays 64-bit through the <<2 and the direct-term
          * add; a single saturation happens at extraction.
@@ -281,16 +281,16 @@ static void trc_postfilter_formant_ring(int16_t *ring, int ring_off,
         formant = (int16_t)(r >> 16);
 
         if (tilt_coef) {
-            r = trc_sat32(acc - (int64_t)trc_l_mult(0, ps8[3], tilt_coef)
+            r = trc_sat32(acc - (int64_t)trc_l_mult(0, ring_ptr[3], tilt_coef)
                               + 0x8000);
             tilted = (int16_t)(r >> 16);
         } else
             tilted = formant;
 
-        ps8[4]  = formant;
-        ps8[-6] = tilted;
-        ps7++;
-        ps8++;
+        ring_ptr[4]  = formant;
+        ring_ptr[-6] = tilted;
+        syn_ptr++;
+        ring_ptr++;
     }
 }
 

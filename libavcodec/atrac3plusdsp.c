@@ -675,14 +675,14 @@ void ff_atrac3p_ipqf(Atrac3pIPQFChannelCtx *hist, const float *in, float *out)
 
     for (s = 0; s < ATRAC3P_SUBBAND_SAMPLES; s++, out += ATRAC3P_SUBBANDS) {
         const uint8_t *idx;
-        int c80, c8c, c98, ca4, cb0, cbc, cc8;
+        int cur_lo, cur_hi, old_hi, cur_lo_end, old_end, cur_end, prev_lo;
         float x[ATRAC3P_SUBBANDS], v[ATRAC3P_SUBBANDS], r[4];
         float a0, a1, a2, a3, b0, b1, b2, b3, g0, g1, g2, g3, h0, h1, h2, h3;
 
         ph  = (hist->pos + s) % 3;
         idx = ipqf_idx[ph];
-        c80 = idx[0]; c8c = idx[1]; c98 = idx[2]; ca4 = idx[3];
-        cb0 = idx[4]; cbc = idx[5]; cc8 = idx[6];
+        cur_lo = idx[0]; cur_hi = idx[1]; old_hi = idx[2]; cur_lo_end = idx[3];
+        old_end = idx[4]; cur_end = idx[5]; prev_lo = idx[6];
 
         for (i = 0; i < ATRAC3P_SUBBANDS; i++)
             x[i] = in[i * ATRAC3P_SUBBAND_SAMPLES + s] * ipqf_pre[i];
@@ -717,80 +717,80 @@ void ff_atrac3p_ipqf(Atrac3pIPQFChannelCtx *hist, const float *in, float *out)
             double db = ((double)b0 - b3) * k2, eb = ((double)b1 - b2) * k3;
             double dg = ((double)g0 - g3) * k0, eg = ((double)g1 - g2) * k1;
             double dh = ((double)h0 - h3) * k2, eh = ((double)h1 - h2) * k3;
-            float t120, tf8, t108, t118, t128, te0, te8, t104, tdc, te4;
+            float rot_a, half_b, mid_b, alt_b, rot_b, alt_g, rot_g, mid_g, mid_h, alt_h;
             double u;
 
-            v[0]  = sum_a * half;
-            t120  = k5 * da - k6 * ea;
-            tf8   = sum_b * half;
-            t108  = (eb + db) * half - tf8;
-            t118  = ((((double)b0 - b1) - b2) + b3) * k4 - t108;
-            t128  = (k5 * db - eb * k6) - t118;
-            v[1]  = sum_g * half - v[0];
-            v[2]  = (double)tf8 - v[1];
-            te0   = ((((double)g0 - g1) - g2) + g3) * k4;
-            te8   = dg * k5 - eg * k6;
-            v[3]  = (sum_h * half - sum_g * half) - v[2];
-            t104  = (eg + dg) * half - (sum_h * half - sum_g * half);
-            v[4]  = (ea + da) * half - v[3];
-            v[5]  = (double)t104 - v[4];
-            v[6]  = (double)t108 - v[5];
-            tdc   = ((((eh + dh) - h0) - h1) - h2 - h3) * half;
-            te4   = ((((double)h0 - h1) - h2) + h3) * k4 - tdc;
-            u     = (double)tdc - t104;
-            v[7]  = u - v[6];
-            v[8]  = ((((double)a0 - a1) - a2) + a3) * k4 - v[7];
-            u     = te0 - u;
-            v[9]  = u - v[8];
-            v[10] = (double)t118 - v[9];
-            u     = te4 - u;
-            v[11] = u - v[10];
-            v[12] = (double)t120 - v[11];
-            u     = te8 - u;
-            v[13] = u - v[12];
-            v[14] = (double)t128 - v[13];
-            v[15] = ((dh * k5 - eh * k6) - te4 - u) - v[14];
+            v[0]   = sum_a * half;
+            rot_a  = k5 * da - k6 * ea;
+            half_b = sum_b * half;
+            mid_b  = (eb + db) * half - half_b;
+            alt_b  = ((((double)b0 - b1) - b2) + b3) * k4 - mid_b;
+            rot_b  = (k5 * db - eb * k6) - alt_b;
+            v[1]   = sum_g * half - v[0];
+            v[2]   = (double)half_b - v[1];
+            alt_g  = ((((double)g0 - g1) - g2) + g3) * k4;
+            rot_g  = dg * k5 - eg * k6;
+            v[3]   = (sum_h * half - sum_g * half) - v[2];
+            mid_g  = (eg + dg) * half - (sum_h * half - sum_g * half);
+            v[4]   = (ea + da) * half - v[3];
+            v[5]   = (double)mid_g - v[4];
+            v[6]   = (double)mid_b - v[5];
+            mid_h  = ((((eh + dh) - h0) - h1) - h2 - h3) * half;
+            alt_h  = ((((double)h0 - h1) - h2) + h3) * k4 - mid_h;
+            u      = (double)mid_h - mid_g;
+            v[7]   = u - v[6];
+            v[8]   = ((((double)a0 - a1) - a2) + a3) * k4 - v[7];
+            u      = alt_g - u;
+            v[9]   = u - v[8];
+            v[10]  = (double)alt_b - v[9];
+            u      = alt_h - u;
+            v[11]  = u - v[10];
+            v[12]  = (double)rot_a - v[11];
+            u      = rot_g - u;
+            v[13]  = u - v[12];
+            v[14]  = (double)rot_b - v[13];
+            v[15]  = ((dh * k5 - eh * k6) - alt_h - u) - v[14];
         }
 
         for (i = 0; i < ATRAC3P_SUBBANDS; i++)
-            H[cbc - i] = v[i];
+            H[cur_end - i] = v[i];
 
         for (i = 0; i < 4; i++) {
-            H[c80 + 48 + i] = ipqf_q0[0][i]     * H[c8c + i]     + ipqf_q0[2][i]     * H[cc8 + 7 - i];
-            H[c8c + 48 + i] = ipqf_q0[3][3 - i] * H[cbc - i]     - ipqf_q0[1][3 - i] * H[cc8 + i];
+            H[cur_lo + 48 + i] = ipqf_q0[0][i]     * H[cur_hi + i]     + ipqf_q0[2][i]     * H[prev_lo + 7 - i];
+            H[cur_hi + 48 + i] = ipqf_q0[3][3 - i] * H[cur_end - i]    - ipqf_q0[1][3 - i] * H[prev_lo + i];
         }
         for (i = 0; i < 4; i++) {
-            H[c80 + 52 + i] = ipqf_q0[1][i]     * H[c8c + 4 + i] + ipqf_q0[3][i]     * H[cc8 + 3 - i];
-            H[c8c + 52 + i] = ipqf_q0[2][3 - i] * H[cbc - 4 - i] - ipqf_q0[0][3 - i] * H[cc8 + 4 + i];
+            H[cur_lo + 52 + i] = ipqf_q0[1][i]     * H[cur_hi + 4 + i]  + ipqf_q0[3][i]     * H[prev_lo + 3 - i];
+            H[cur_hi + 52 + i] = ipqf_q0[2][3 - i] * H[cur_end - 4 - i] - ipqf_q0[0][3 - i] * H[prev_lo + 4 + i];
         }
 
         for (it = 0; it < 10; it++) {
             const float *ql = ipqf_q1[it], *qh = ipqf_q1[it] + 4;
-            float *pd  = &H[c80 + 144 + 48 * it];
-            float *p18 = &H[c8c +  96 + 48 * it];
-            float *p1c = &H[cb0 +  41 + 48 * it];
-            float *p20 = &H[c98 +  48 + 48 * it];
-            float *p28 = &H[ca4 +  41 + 48 * it];
+            float *pd      = &H[cur_lo + 144 + 48 * it];
+            float *hi_out  = &H[cur_hi +  96 + 48 * it];
+            float *old_rev = &H[old_end +  41 + 48 * it];
+            float *old_fwd = &H[old_hi +  48 + 48 * it];
+            float *lo_rev  = &H[cur_lo_end +  41 + 48 * it];
 
             for (i = 0; i < 4; i++)
-                r[i] = pd[-96 + i] + ql[i] * p1c[7 - i];
+                r[i] = pd[-96 + i] + ql[i] * old_rev[7 - i];
             memcpy(&pd[-48], r, sizeof(r));
             for (i = 0; i < 4; i++)
-                r[i] = qh[3 - i] * p28[7 - i] - p20[i];
-            memcpy(&p18[0], r, sizeof(r));
+                r[i] = qh[3 - i] * lo_rev[7 - i] - old_fwd[i];
+            memcpy(&hi_out[0], r, sizeof(r));
             for (i = 0; i < 4; i++)
-                r[i] = pd[-92 + i] + qh[i] * p1c[3 - i];
+                r[i] = pd[-92 + i] + qh[i] * old_rev[3 - i];
             memcpy(&pd[-44], r, sizeof(r));
             for (i = 0; i < 4; i++)
-                r[i] = ql[3 - i] * p28[3 - i] - p20[4 + i];
-            memcpy(&p18[4], r, sizeof(r));
+                r[i] = ql[3 - i] * lo_rev[3 - i] - old_fwd[4 + i];
+            memcpy(&hi_out[4], r, sizeof(r));
         }
 
         for (i = 0; i < 4; i++) {
-            out[i]      = (H[c80 + 528 + i] + ipqf_q2[0][i] * H[cb0 + 528 - i]) * (1.0f / 32768);
-            out[4 + i]  = (H[c80 + 532 + i] + ipqf_q2[1][i] * H[cb0 + 524 - i]) * (1.0f / 32768);
-            out[8 + i]  = (ipqf_q2[1][3 - i] * H[ca4 + 528 - i] - H[c98 + 528 + i]) * (1.0f / 32768);
-            out[12 + i] = (ipqf_q2[0][3 - i] * H[ca4 + 524 - i] - H[c98 + 532 + i]) * (1.0f / 32768);
+            out[i]      = (H[cur_lo + 528 + i] + ipqf_q2[0][i] * H[old_end + 528 - i]) * (1.0f / 32768);
+            out[4 + i]  = (H[cur_lo + 532 + i] + ipqf_q2[1][i] * H[old_end + 524 - i]) * (1.0f / 32768);
+            out[8 + i]  = (ipqf_q2[1][3 - i] * H[cur_lo_end + 528 - i] - H[old_hi + 528 + i]) * (1.0f / 32768);
+            out[12 + i] = (ipqf_q2[0][3 - i] * H[cur_lo_end + 524 - i] - H[old_hi + 532 + i]) * (1.0f / 32768);
         }
     }
 

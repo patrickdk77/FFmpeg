@@ -21,8 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#ifndef AVCODEC_LPEC_AB80_H
-#define AVCODEC_LPEC_AB80_H
+#ifndef AVCODEC_LPEC_QMF_H
+#define AVCODEC_LPEC_QMF_H
 
 #define LPEC_QMF_MAX 2048
 #define LPEC_QMF_FFT_MAX ((LPEC_QMF_MAX) >> 1)
@@ -62,4 +62,4 @@ void ff_lpec_qmf_process_scratch(LPECQmfState *st, double *buf, int len,
 void ff_lpec_qmf_process_seg(LPECQmfState *st, double *buf, int seg_len,
                           const LPECQmfDesc *desc);
 
-#endif /* AVCODEC_LPEC_AB80_H */
+#endif /* AVCODEC_LPEC_QMF_H */

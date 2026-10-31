@@ -22,7 +22,7 @@
  * THE SOFTWARE.
  */
 #include "libavutil/mathematics.h"
-#include "lpec_ab80.h"
+#include "lpec_qmf.h"
 
 #include <math.h>
 #include <string.h>
@@ -77,7 +77,7 @@ static void lpec_qmf_build_desc(LPECQmfDesc *desc, double *sin_buf, int len,
 }
 
 /* bit-reversal permutation. */
-static void lpec_qmf_permute012c0(double *a, double *b, int n)
+static void lpec_qmf_bitrev(double *a, double *b, int n)
 {
     int i, m = 0;
     int half = n >> 1;
@@ -104,7 +104,7 @@ static void lpec_qmf_permute012c0(double *a, double *b, int n)
 /*
  * Pass1 modulation bin count (pairs fill lo/hi[0..mod_n)).
  */
-static int lpec_ab80_mod_n(int flen)
+static int lpec_qmf_mod_bins(int flen)
 {
     return flen >> 2;
 }
@@ -126,8 +126,8 @@ static double lpec_cos_at(const double *cos, int idx, int period)
 /* Radix-2 stages until 4-point blocks remain. The twiddles come from the
  * sine table: wr at the twiddle index, wi a quarter period on (512 in
  * cos2048, 384 in cos1536). */
-static void lpec_qmf_fft01430(double *a, double *b, int n, const double *cos,
-                              int tw_base)
+static void lpec_qmf_radix2_stages(double *a, double *b, int n, const double *cos,
+                                   int tw_base)
 {
     int tw_step;
     int size;
@@ -171,7 +171,7 @@ static void lpec_qmf_fft01430(double *a, double *b, int n, const double *cos,
     }
 }
 
-static void lpec_qmf_stage01340(double *a, double *b, int n, double invn)
+static void lpec_qmf_radix4_last(double *a, double *b, int n, double invn)
 {
     int q = n >> 2;
     int i;
@@ -196,7 +196,7 @@ static void lpec_qmf_stage01340(double *a, double *b, int n, double invn)
 
 /* Radix-3 output shuffle after three sub-FFTs.
  * Interleave block0[k], block1[k], block2[k] -> buf[3*k..3*k+2]. */
-static void lpec_qmf_shuffle01590(double *buf, int n)
+static void lpec_qmf_radix3_interleave(double *buf, int n)
 {
     int u = n / 3;
     int k;
@@ -217,7 +217,7 @@ static void lpec_qmf_shuffle01590(double *buf, int n)
  * Radix-3 first pass of the transform for n = 3 * 2^k, in double
  * arithmetic. Reordering the operations changes the output.
  */
-static void lpec_qmf_pre01590_ref(double *re, double *im, int n, const double *cos)
+static void lpec_qmf_radix3_pass(double *re, double *im, int n, const double *cos)
 {
     const double *wi = cos + LPEC_COS1536_WI_OFF;
     const double h = sqrt(3.0) * 0.5;
@@ -248,10 +248,10 @@ static void lpec_qmf_pre01590_ref(double *re, double *im, int n, const double *c
 }
 
 /*
- * desc768: radix-3 preprocess, then three n/3 blocks of 01430 + 01340 +
- * 012c0 on cos2048.
+ * desc768: radix-3 preprocess, then three n/3 blocks of radix-2 stages,
+ * the last radix-4 stage and bit reversal on cos2048.
  */
-static void lpec_qmf_fft01590(double *lo, double *hi, int n, const double *cos1536,
+static void lpec_qmf_fft_3x2k(double *lo, double *hi, int n, const double *cos1536,
                               const double *cos2048)
 {
     int sub = n / 3;
@@ -262,36 +262,36 @@ static void lpec_qmf_fft01590(double *lo, double *hi, int n, const double *cos15
         return;
 
     /* radix-3 preprocess */
-    lpec_qmf_pre01590_ref(lo, hi, n, cos1536);
+    lpec_qmf_radix3_pass(lo, hi, n, cos1536);
 
     for (i = 0; i < n; i += sub) {
-        lpec_qmf_fft01430(lo + i, hi + i, sub, cos2048, 2048);
-        lpec_qmf_stage01340(lo + i, hi + i, sub, sc);
-        lpec_qmf_permute012c0(lo + i, hi + i, sub);
+        lpec_qmf_radix2_stages(lo + i, hi + i, sub, cos2048, 2048);
+        lpec_qmf_radix4_last(lo + i, hi + i, sub, sc);
+        lpec_qmf_bitrev(lo + i, hi + i, sub);
     }
 
-    /* radix-3 reorder (opt-out LPEC_NO_SHUFFLE01590=1). */
-    lpec_qmf_shuffle01590(lo, n);
-    lpec_qmf_shuffle01590(hi, n);
+    /* radix-3 reorder. */
+    lpec_qmf_radix3_interleave(lo, n);
+    lpec_qmf_radix3_interleave(hi, n);
 
 }
 
 /* Length-n FFT: the 3 * 2^k transform for the cos1536 table; otherwise the
  * radix-2 stages, the last radix-4 stage and bit reversal. */
-static void lpec_qmf_stage1530(double *lo, double *hi, int n, const double *cos,
-                               int tw_base, const double *cos2048)
+static void lpec_qmf_fft(double *lo, double *hi, int n, const double *cos,
+                         int tw_base, const double *cos2048)
 {
     if (tw_base == 1536) {
-        lpec_qmf_fft01590(lo, hi, n, cos, cos2048);
+        lpec_qmf_fft_3x2k(lo, hi, n, cos, cos2048);
     } else {
-        lpec_qmf_fft01430(lo, hi, n, cos, tw_base);
-        lpec_qmf_stage01340(lo, hi, n, 1.0 / (double) n);
-        lpec_qmf_permute012c0(lo, hi, n);
+        lpec_qmf_radix2_stages(lo, hi, n, cos, tw_base);
+        lpec_qmf_radix4_last(lo, hi, n, 1.0 / (double) n);
+        lpec_qmf_bitrev(lo, hi, n);
     }
 }
 
-static void lpec_ab80_core(double *inout, int seg_len, const LPECQmfDesc *desc,
-                           const double *cos2048)
+static void lpec_qmf_transform(double *inout, int seg_len, const LPECQmfDesc *desc,
+                               const double *cos2048)
 {
     const int scale  = desc->scale;
     const int flen   = desc->len;
@@ -301,33 +301,33 @@ static void lpec_ab80_core(double *inout, int seg_len, const LPECQmfDesc *desc,
     double hi[LPEC_QMF_FFT_MAX + 16];
     int nband = flen >> 2;
     int half  = flen >> 1;
-    int mod_n = lpec_ab80_mod_n(flen);
+    int mod_n = lpec_qmf_mod_bins(flen);
     int fft_n = flen >> 1;             /* FFT + synthesis length */
     /* cos1536 table is 1536 entries. */
     int tw_base = flen % 3 ? 2048 : 1536;
-    int i9 = 0;
+    int bin = 0;
     const double *pd_in = inout;
     int cos_n = lpec_cos_period(flen);
     int hi_idx = scale * nband;
     int lo_idx = 0;
     int pass1_end = mod_n & ~1;
-    int i15 = half;
+    int unused_half = half;
 
     memset(lo, 0, fft_n * sizeof(double));
     memset(hi, 0, fft_n * sizeof(double));
 
-    for (; i9 < pass1_end; i9 += 2) {
-        lo[i9]     = pd_in[0] * lpec_cos_at(cos, hi_idx, cos_n);
-        hi[i9]     = pd_in[0] * lpec_cos_at(cos, lo_idx, cos_n);
-        lo[i9 + 1] = pd_in[2] * lpec_cos_at(cos, hi_idx - scale, cos_n);
-        hi[i9 + 1] = pd_in[2] * lpec_cos_at(cos, lo_idx + scale, cos_n);
+    for (; bin < pass1_end; bin += 2) {
+        lo[bin]     = pd_in[0] * lpec_cos_at(cos, hi_idx, cos_n);
+        hi[bin]     = pd_in[0] * lpec_cos_at(cos, lo_idx, cos_n);
+        lo[bin + 1] = pd_in[2] * lpec_cos_at(cos, hi_idx - scale, cos_n);
+        hi[bin + 1] = pd_in[2] * lpec_cos_at(cos, lo_idx + scale, cos_n);
         pd_in  += 4;
         hi_idx -= scale + scale;
         lo_idx += scale + scale;
     }
-    for (; i9 < mod_n; i9++) {
-        lo[i9] = pd_in[0] * lpec_cos_at(cos, hi_idx, cos_n);
-        hi[i9] = pd_in[0] * lpec_cos_at(cos, lo_idx, cos_n);
+    for (; bin < mod_n; bin++) {
+        lo[bin] = pd_in[0] * lpec_cos_at(cos, hi_idx, cos_n);
+        hi[bin] = pd_in[0] * lpec_cos_at(cos, lo_idx, cos_n);
         pd_in  += 2;
         hi_idx -= scale;
         lo_idx += scale;
@@ -341,25 +341,25 @@ static void lpec_ab80_core(double *inout, int seg_len, const LPECQmfDesc *desc,
         /* pass2: end index flen/2, input at buf + flen/2 - 1. */
         pd_in = inout + (flen >> 1) - 1;
 
-        for (; i9 < pass2_end && pd_in >= inout; i9 += 2) {
-            lo[i9]     = pd_in[0]  * lpec_cos_at(cos, lo_idx, cos_n);
-            hi[i9]     = pd_in[0]  * lpec_cos_at(cos, hi_idx, cos_n);
-            lo[i9 + 1] = pd_in[-2] * lpec_cos_at(cos, lo_idx + scale, cos_n);
-            hi[i9 + 1] = pd_in[-2] * lpec_cos_at(cos, hi_idx - scale, cos_n);
+        for (; bin < pass2_end && pd_in >= inout; bin += 2) {
+            lo[bin]     = pd_in[0]  * lpec_cos_at(cos, lo_idx, cos_n);
+            hi[bin]     = pd_in[0]  * lpec_cos_at(cos, hi_idx, cos_n);
+            lo[bin + 1] = pd_in[-2] * lpec_cos_at(cos, lo_idx + scale, cos_n);
+            hi[bin + 1] = pd_in[-2] * lpec_cos_at(cos, hi_idx - scale, cos_n);
             pd_in  -= 4;
             lo_idx += scale + scale;
             hi_idx -= scale + scale;
         }
-        for (; i9 < pass2_end && pd_in >= inout; i9++) {
-            lo[i9] = pd_in[0] * lpec_cos_at(cos, lo_idx, cos_n);
-            hi[i9] = pd_in[0] * lpec_cos_at(cos, hi_idx, cos_n);
+        for (; bin < pass2_end && pd_in >= inout; bin++) {
+            lo[bin] = pd_in[0] * lpec_cos_at(cos, lo_idx, cos_n);
+            hi[bin] = pd_in[0] * lpec_cos_at(cos, hi_idx, cos_n);
             pd_in  -= 2;
             lo_idx += scale;
             hi_idx -= scale;
         }
     }
 
-    lpec_qmf_stage1530(lo, hi, fft_n, cos, tw_base, cos2048);
+    lpec_qmf_fft(lo, hi, fft_n, cos, tw_base, cos2048);
     if (fft_n > LPEC_QMF_FFT_MAX)
         return;
 
@@ -421,7 +421,7 @@ static void lpec_ab80_core(double *inout, int seg_len, const LPECQmfDesc *desc,
         }
     }
 
-    (void) i15;
+    (void) unused_half;
 }
 
 void ff_lpec_qmf_init(LPECQmfState *st)
@@ -470,7 +470,7 @@ void ff_lpec_qmf_process_slot(LPECQmfState *st, double *buf, int len, int desc_i
     else
         desc = &st->desc512;
 
-    lpec_ab80_core(buf, len, desc, st->cos2048);
+    lpec_qmf_transform(buf, len, desc, st->cos2048);
 }
 
 void ff_lpec_qmf_process_seg(LPECQmfState *st, double *buf, int seg_len,
@@ -480,7 +480,7 @@ void ff_lpec_qmf_process_seg(LPECQmfState *st, double *buf, int seg_len,
         ff_lpec_qmf_init(st);
     if (!desc || seg_len <= 0)
         return;
-    lpec_ab80_core(buf, seg_len, desc, st->cos2048);
+    lpec_qmf_transform(buf, seg_len, desc, st->cos2048);
 }
 
 void ff_lpec_qmf_process_scratch(LPECQmfState *st, double *buf, int len,
@@ -502,7 +502,7 @@ void ff_lpec_qmf_process_scratch(LPECQmfState *st, double *buf, int len,
         memcpy(tmp + half, buf + half, half * sizeof(double));
     if (tail > 0)
         memcpy(tmp + len, buf + len, tail * sizeof(double));
-    lpec_ab80_core(tmp, len, desc, st->cos2048);
+    lpec_qmf_transform(tmp, len, desc, st->cos2048);
     memcpy(buf, tmp, len * sizeof(double));
     if (tail > 0)
         memcpy(buf + len, tmp + len, tail * sizeof(double));

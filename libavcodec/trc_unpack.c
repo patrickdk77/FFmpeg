@@ -72,24 +72,24 @@ static void trc_decode_lags(GetBitContext *gb, TRCFrameParams *fp, int rate)
     }
 
     {
-        int s8, temp;
+        int lag_base, temp;
 
-        s8 = raw + 0x11;
-        if (s8 < 0x12)
-            s8 = 0x12;
+        lag_base = raw + 0x11;
+        if (lag_base < 0x12)
+            lag_base = 0x12;
         if (raw + 0x14 > 0x8e)
-            s8 = 0x8c;
-        fp->sf[1].lag = get_bits(gb, 2) + s8;
+            lag_base = 0x8c;
+        fp->sf[1].lag = get_bits(gb, 2) + lag_base;
 
         temp = fp->base_lag - get_bits(gb, 4);
         fp->sf[2].lag = temp + 7;
 
-        s8 = temp + 6;
-        if (s8 < 0x12)
-            s8 = 0x12;
+        lag_base = temp + 6;
+        if (lag_base < 0x12)
+            lag_base = 0x12;
         if (temp + 9 > 0x8e)
-            s8 = 0x8c;
-        fp->sf[3].lag = get_bits(gb, 2) + s8;
+            lag_base = 0x8c;
+        fp->sf[3].lag = get_bits(gb, 2) + lag_base;
     }
 }
 

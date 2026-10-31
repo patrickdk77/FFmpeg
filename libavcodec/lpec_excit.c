@@ -32,7 +32,7 @@
 #define LPEC_EXCIT_HDR 19
 
 /* truncate positive doubles >= 1.0, else 0. */
-static int lpec_f8e0(double x)
+static int lpec_trunc_ge1(double x)
 {
     if (!(x >= 1.0))
         return 0;
@@ -43,8 +43,8 @@ static const int lpec_pitch_taps[3] = { 2, 4, 8 };
 
 static const double lpec_excit_uv_const = 0.6;
 static const double lpec_excit_v_const  = -0.6;
-static const double lpec_f4e0_mix_a      = 0.9;
-static const double lpec_f4e0_mix_b      = 0.9;
+static const double lpec_noise_mix_a      = 0.9;
+static const double lpec_noise_mix_b      = 0.9;
 
 int ff_lpec_excit_route_idx(int mode, int half)
 {
@@ -150,7 +150,7 @@ void ff_lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
         st->pitch_route_len[3] = qmf_lens[b + 2];
     }
 
-    pitch_mult = lpec_f8e0(128.0 / ((double) num_bands * (double) half_rate) * (double) br);
+    pitch_mult = lpec_trunc_ge1(128.0 / ((double) num_bands * (double) half_rate) * (double) br);
     if (pitch_mult < 1)
         pitch_mult = 1;
     st->pitch_mult  = pitch_mult;
@@ -205,26 +205,26 @@ void ff_lpec_excit_init(LPECExcitState *st, int sample_rate, int codec_rate_in,
     inv_half = 1.0 / (double) half_rate;
     for (i = 0; i < 4; i++) {
         int pv = refs[i];
-        int uvar5 = lpec_f8e0((double) route_scale * (double) pv * inv_half + 0.5);
-        int i6;
+        int excit_start = lpec_trunc_ge1((double) route_scale * (double) pv * inv_half + 0.5);
+        int band_step;
 
-        if (uvar5 < 1)
-            uvar5 = 1;
+        if (excit_start < 1)
+            excit_start = 1;
 
-        i6 = ((pv + ((unsigned) pv >> 6 >> 0x19)) >> 7) * pitch_mult;
+        band_step = ((pv + ((unsigned) pv >> 6 >> 0x19)) >> 7) * pitch_mult;
 
-        st->pitch_scale_route[i] = i6;
-        st->route_excit_start[i] = uvar5;
-        st->route_tail_start[i]  = i6 * num_bands + uvar5;
+        st->pitch_scale_route[i] = band_step;
+        st->route_excit_start[i] = excit_start;
+        st->route_tail_start[i]  = band_step * num_bands + excit_start;
 
-        /* 4194304 / (i6 * num_bands), rounded. */
-        st->pitch_mult_route[i] = lpec_f8e0(4194304.0 / ((double) i6 * (double) num_bands) + 0.5);
+        /* 4194304 / (band_step * num_bands), rounded. */
+        st->pitch_mult_route[i] = lpec_trunc_ge1(4194304.0 / ((double) band_step * (double) num_bands) + 0.5);
         if (st->pitch_mult_route[i] < 1)
             st->pitch_mult_route[i] = 1;
     }
 }
 
-static void lpec_pitch_weights_3d80(int pw[3], int pitch_val, int scale)
+static void lpec_pitch_weights(int pw[3], int pitch_val, int scale)
 {
     int a, b, c, i;
 
@@ -251,7 +251,7 @@ static void lpec_pitch_weights_3d80(int pw[3], int pitch_val, int scale)
 }
 
 /* sort route entries by val descending */
-static void lpec_route_sort_b110(LPECRouteEntry *ent, int n)
+static void lpec_route_sort(LPECRouteEntry *ent, int n)
 {
     LPECRouteEntry key, tmp;
     int i, j;
@@ -273,13 +273,13 @@ static void lpec_route_sort_b110(LPECRouteEntry *ent, int n)
     ent[j] = ent[0];
     ent[0] = tmp;
     if (j > 0)
-        lpec_route_sort_b110(ent, j - 1);
+        lpec_route_sort(ent, j - 1);
     if (n - j - 1 > 0)
-        lpec_route_sort_b110(ent + j + 1, n - j - 1);
+        lpec_route_sort(ent + j + 1, n - j - 1);
 }
 
 /* ascending quicksort. */
-static void lpec_route_sort_a610(LPECRouteEntry *ent, int n)
+static void lpec_xa_route_sort(LPECRouteEntry *ent, int n)
 {
     LPECRouteEntry key, tmp;
     int i, j;
@@ -301,13 +301,13 @@ static void lpec_route_sort_a610(LPECRouteEntry *ent, int n)
     ent[j] = ent[0];
     ent[0] = tmp;
     if (j > 0)
-        lpec_route_sort_a610(ent, j - 1);
+        lpec_xa_route_sort(ent, j - 1);
     if (n - j - 1 > 0)
-        lpec_route_sort_a610(ent + j + 1, n - j - 1);
+        lpec_xa_route_sort(ent + j + 1, n - j - 1);
 }
 
 /* advance noise index. */
-static int lpec_f4e0_next_pos(int pos)
+static int lpec_noise_next_pos(int pos)
 {
     int v = pos + 1;
     uint32_t t = (uint32_t) v >> 9;
@@ -317,9 +317,9 @@ static int lpec_f4e0_next_pos(int pos)
     return v - (int) t;
 }
 
-static void lpec_noise_fill_f4e0(double *exc, const LPECRouteEntry *route,
-                                 int start, int end, double mix, int *npos,
-                                 int subfr_len)
+static void lpec_noise_fill(double *exc, const LPECRouteEntry *route,
+                            int start, int end, double mix, int *npos,
+                            int subfr_len)
 {
     const double inv_mix = 1.0 - mix;
     int i = start;
@@ -329,16 +329,16 @@ static void lpec_noise_fill_f4e0(double *exc, const LPECRouteEntry *route,
         int d0 = route[i].dst;
         int d1 = route[i + 1].dst;
         int idx = pos & 1023;
-        double v0 = lpec_f4e0_noise_b[idx] * inv_mix * lpec_f4e0_mix_a +
-                    lpec_f4e0_noise_a[idx] * lpec_f4e0_mix_b * mix;
+        double v0 = lpec_noise_b[idx] * inv_mix * lpec_noise_mix_a +
+                    lpec_noise_a[idx] * lpec_noise_mix_b * mix;
 
         pos++;
         idx = pos & 1023;
         {
-            double v1 = lpec_f4e0_noise_a[idx] * lpec_f4e0_mix_b * mix +
-                        lpec_f4e0_noise_b[idx] * inv_mix * lpec_f4e0_mix_a;
+            double v1 = lpec_noise_a[idx] * lpec_noise_mix_b * mix +
+                        lpec_noise_b[idx] * inv_mix * lpec_noise_mix_a;
 
-            pos = lpec_f4e0_next_pos(pos);
+            pos = lpec_noise_next_pos(pos);
             if ((unsigned) d0 < (unsigned) subfr_len)
                 exc[d0] = v0;
             if ((unsigned) d1 < (unsigned) subfr_len)
@@ -349,10 +349,10 @@ static void lpec_noise_fill_f4e0(double *exc, const LPECRouteEntry *route,
     for (; i < end; i++) {
         int d0 = route[i].dst;
         int idx = pos & 1023;
-        double v0 = lpec_f4e0_noise_b[idx] * inv_mix * lpec_f4e0_mix_a +
-                    lpec_f4e0_noise_a[idx] * lpec_f4e0_mix_b * mix;
+        double v0 = lpec_noise_b[idx] * inv_mix * lpec_noise_mix_a +
+                    lpec_noise_a[idx] * lpec_noise_mix_b * mix;
 
-        pos = lpec_f4e0_next_pos(pos);
+        pos = lpec_noise_next_pos(pos);
         if ((unsigned) d0 < (unsigned) subfr_len)
             exc[d0] = v0;
     }
@@ -412,8 +412,8 @@ static const int lpec_route_voiced_tpl_28b[30] = {
      5, 12, 18, 21, 19, 16, 20, 19, 19, 19,
 };
 
-static int lpec_pitch_route_4450(LPECExcitState *st, int route[40], int half_slot,
-                                 int bit_budget, int pitch_route_arg, int counts[4])
+static int lpec_pitch_route_alloc(LPECExcitState *st, int route[40], int half_slot,
+                                  int bit_budget, int pitch_route_arg, int counts[4])
 {
     const int nb = st->num_bands;
     int hs = half_slot & 3;
@@ -434,7 +434,7 @@ static int lpec_pitch_route_4450(LPECExcitState *st, int route[40], int half_slo
             if (tbl_off < 0 || tbl_off >= 648)
                 tbl = 0;
             else
-                tbl = lpec_16k_pitch_gain[tbl_off];
+                tbl = lpec_16k_pitch_route_gain[tbl_off];
         } else {
             if (tbl_off < 0 || tbl_off >= 512)
                 tbl = 0;
@@ -445,7 +445,7 @@ static int lpec_pitch_route_4450(LPECExcitState *st, int route[40], int half_slo
         }
 
         half = (int16_t) (tbl + (int16_t) ((bit_budget - pitch_ref) * pitch_mult >> 9));
-        lpec_pitch_weights_3d80(pw, half, pitch_scale);
+        lpec_pitch_weights(pw, half, pitch_scale);
         route[b * 4 + 0] = pw[0];
         route[b * 4 + 1] = pw[1];
         route[b * 4 + 2] = pw[2];
@@ -690,7 +690,8 @@ void ff_lpec_xa_lsf_indices_to_i16(int order, int num_cb,
     lpec_xa_stabilize_lsf_i16(lsf_out, order);
 }
 
-/* route magnitudes via a110 + c680; builds sort table for 060e0. */
+/* route magnitudes from the LPC envelope; builds the sort table for
+ * lpec_excit_decode_bands(). */
 static void lpec_build_route_vals(LPECExcitState *st, LPECRouteEntry *rtbl,
                                   int subfr_len, int route_tbl_idx, int half_slot,
                                   int band_slot, int half_idx, int lpc_order,
@@ -698,7 +699,7 @@ static void lpec_build_route_vals(LPECExcitState *st, LPECRouteEntry *rtbl,
                                   const int16_t *lsf_i16_override,
                                   int pitch_win, double pitch_e, int voiced)
 {
-    int16_t lsf_i16[19], a110_out[19];
+    int16_t lsf_i16[19], lpc_i16[19];
     int32_t *route32 = st->route_pitch;
     int pitch_len = lpec_route_pitch_len(st, half_slot);
     int pitch_cap = pitch_len < LPEC_ROUTE_PITCH_MAX ? pitch_len : LPEC_ROUTE_PITCH_MAX;
@@ -714,11 +715,11 @@ static void lpec_build_route_vals(LPECExcitState *st, LPECRouteEntry *rtbl,
         ff_lpec_xa_lsf_indices_to_i16(lpc_order, num_lsf_cb, lsf_idx, lsf_i16);
     else
         ff_lpec_lsf_indices_to_i16(st->num_bands, lpc_order, num_lsf_cb, lsf_idx, lsf_i16);
-    ff_lpec_a110_route_shorts(lsf_i16, a110_out, lpc_order);
+    ff_lpec_lsf_to_lpc_i16(lsf_i16, lpc_i16, lpc_order);
 
     memset(route32, 0, pitch_cap * sizeof(route32[0]));
     /* pitch_win of this half; 0 means unvoiced */
-    ff_lpec_c680_route(a110_out, pitch_win, pitch_e, route32, pitch_cap, lpc_order);
+    ff_lpec_envelope_route(lpc_i16, pitch_win, pitch_e, route32, pitch_cap, lpc_order);
 
     pos = excit_start;
     for (b = 0; b < st->num_bands; b++) {
@@ -767,7 +768,7 @@ static void lpec_xa_build_band_stack(LPECExcitState *st, LPECRouteEntry *rtbl,
                                      const int16_t *lsf_i16_override,
                                      int pitch_win, double pitch_e)
 {
-    int16_t lsf_i16[19], a110_out[19];
+    int16_t lsf_i16[19], lpc_i16[19];
     int32_t *route32 = st->route_pitch;
     int pitch_len = lpec_route_pitch_len(st, half_slot);
     int pitch_cap = pitch_len < LPEC_ROUTE_PITCH_MAX ? pitch_len : LPEC_ROUTE_PITCH_MAX;
@@ -784,10 +785,10 @@ static void lpec_xa_build_band_stack(LPECExcitState *st, LPECRouteEntry *rtbl,
         ff_lpec_xa_lsf_indices_to_i16(lpc_order, num_lsf_cb, lsf_idx, lsf_i16);
     else
         ff_lpec_lsf_indices_to_i16(st->num_bands, lpc_order, num_lsf_cb, lsf_idx, lsf_i16);
-    ff_lpec_a110_route_shorts(lsf_i16, a110_out, lpc_order);
+    ff_lpec_lsf_to_lpc_i16(lsf_i16, lpc_i16, lpc_order);
 
     memset(route32, 0, pitch_cap * sizeof(route32[0]));
-    ff_lpec_c680_route(a110_out, pitch_win, pitch_e, route32, pitch_cap, lpc_order);
+    ff_lpec_envelope_route(lpc_i16, pitch_win, pitch_e, route32, pitch_cap, lpc_order);
 
     pos = excit_start;
     for (b = 0; b < st->num_bands; b++) {
@@ -832,11 +833,11 @@ static const double *lpec_excit_cb_entry(LPECExcitState *st, int group, int idx)
 }
 
 /* group loop. */
-static void lpec_excit_group_060e0(LPECExcitState *st, double *excit,
-                                   LPECRouteEntry *band_rt, int band_samples,
-                                   int subfr_len, int *sort_idx, int g, int need,
-                                   const uint8_t *cb_idx, int cb_base,
-                                   int total_cb, int *cb_slot, int *cb_tap)
+static void lpec_excit_fill_group(LPECExcitState *st, double *excit,
+                                  LPECRouteEntry *band_rt, int band_samples,
+                                  int subfr_len, int *sort_idx, int g, int need,
+                                  const uint8_t *cb_idx, int cb_base,
+                                  int total_cb, int *cb_slot, int *cb_tap)
 {
     const int taps = lpec_pitch_taps[g];
 
@@ -895,10 +896,10 @@ static void lpec_excit_group_060e0(LPECExcitState *st, double *excit,
  * The excitation path of quality 0x19.
  *
  * For quality 0x19 in mode 1, ff_lpec_generate_excitation() gets the route
- * counts from lpec_route_decode_03920(), which splits each band with
- * lpec_rc_split_03250(), in place of lpec_pitch_route_4450(). It builds
+ * counts from lpec_xa_route_alloc(), which splits each band with
+ * lpec_xa_route_split(), in place of lpec_pitch_route_alloc(). It builds
  * the route values with lpec_xa_build_band_stack() in place of
- * lpec_build_route_vals(). lpec_excit_decode_060e0() runs for every quality.
+ * lpec_build_route_vals(). lpec_excit_decode_bands() runs for every quality.
  */
 
 /* 32-bit truncating multiply (low 32 bits of the product). */
@@ -910,9 +911,9 @@ static inline int lpec_imul32(int a, int b)
 /* Range-coder probability split. Given interval params (p,q),
  * fills out[0..2] with the three sub-interval sizes. Pure integer arithmetic
  * with arithmetic right shifts. */
-static void lpec_rc_split_03250(int out[3], int p, int q)
+static void lpec_xa_route_split(int out[3], int p, int q)
 {
-    int a, b, esi, edi, bx, di;
+    int a, b, used, total, g2, room;
 
     a = -(p >> 1) + 0x5000;
     a = lpec_imul32(a, p) >> 14;
@@ -926,38 +927,38 @@ static void lpec_rc_split_03250(int out[3], int p, int q)
     b = lpec_imul32(b, q) >> 15;
     out[0] = b;
 
-    esi = 4 * b + 2 * a;
-    edi = lpec_imul32(p, q) >> 13;
-    bx  = edi - esi;
-    di  = q - b - a;
+    used  = 4 * b + 2 * a;
+    total = lpec_imul32(p, q) >> 13;
+    g2    = total - used;
+    room  = q - b - a;
 
-    if (bx > di) {
-        int ecx = (lpec_imul32(p - 0x4000, q) + 0x2000) >> 14;
+    if (g2 > room) {
+        int g0_alt = (lpec_imul32(p - 0x4000, q) + 0x2000) >> 14;
 
-        out[0] = ecx;
-        out[1] = q - ecx;
+        out[0] = g0_alt;
+        out[1] = q - g0_alt;
         out[2] = 0;
     } else {
-        out[2] = bx;
+        out[2] = g2;
     }
 }
 
 /* per-band arithmetic route-count decoder. */
-static void lpec_route_decode_03920(int route[40], int route_idx, int rem_bits,
-                                    int pitch_param, int f[4],
-                                    const int16_t *rtable, int num_bands,
-                                    int band_step, int ctx_e8, int ctx_f8)
+static void lpec_xa_route_alloc(int route[40], int route_idx, int rem_bits,
+                                int pitch_param, int f[4],
+                                const int16_t *rtable, int num_bands,
+                                int band_step, int pitch_ref, int pitch_mult)
 {
     int a0 = 0, a1 = 0, a2 = 0, uv_acc = 0, band;
 
-    int budget = (int16_t) (lpec_imul32(rem_bits - ctx_e8, ctx_f8) >> 9);
+    int budget = (int16_t) (lpec_imul32(rem_bits - pitch_ref, pitch_mult) >> 9);
 
     for (band = 0; band < num_bands; band++) {
         int idx = lpec_imul32(num_bands, pitch_param) + band;
         int p   = (int) rtable[idx] + budget;
         int out[3];
 
-        lpec_rc_split_03250(out, p, band_step);
+        lpec_xa_route_split(out, p, band_step);
         route[band * 4 + 0] = out[0];
         route[band * 4 + 1] = out[1];
         route[band * 4 + 2] = out[2];
@@ -1078,7 +1079,7 @@ static void lpec_route_decode_03920(int route[40], int route_idx, int rem_bits,
     f[3] = uv_acc;
 }
 
-static void lpec_excit_decode_060e0(LPECExcitState *st, GetBitContext *gb,
+static void lpec_excit_decode_bands(LPECExcitState *st, GetBitContext *gb,
                                     double *excit, const int route[40],
                                     LPECRouteEntry *rtbl, int band_step,
                                     int subfr_len, double pitch_mix,
@@ -1136,14 +1137,14 @@ static void lpec_excit_decode_060e0(LPECExcitState *st, GetBitContext *gb,
         if (sort_n < 0)
             sort_n = 0;
         if (st->is_xaudio_lp && mode == 1)
-            lpec_route_sort_a610(band_rt, sort_n);
+            lpec_xa_route_sort(band_rt, sort_n);
         else
-            lpec_route_sort_b110(band_rt, sort_n);
+            lpec_route_sort(band_rt, sort_n);
 
         for (g = 0; g < 3; g++)
-            lpec_excit_group_060e0(st, excit, band_rt, band_samples, subfr_len,
-                                   &sort_idx, g, rb[g], cb_idx, cb_base[g],
-                                   total_cb, cb_slot, cb_tap);
+            lpec_excit_fill_group(st, excit, band_rt, band_samples, subfr_len,
+                                  &sort_idx, g, rb[g], cb_idx, cb_base[g],
+                                  total_cb, cb_slot, cb_tap);
 
         for (n = 0; n < rb[3]; n++) {
             int v = (uv_flags[uv >> 5] >> (uv & 31)) & 1;
@@ -1159,9 +1160,9 @@ static void lpec_excit_decode_060e0(LPECExcitState *st, GetBitContext *gb,
         }
 
         if (sort_idx < band_samples)
-            lpec_noise_fill_f4e0(excit, band_rt, sort_idx, band_samples,
-                                 pitch_mix, &st->f4e0_noise_pos,
-                                 subfr_len);
+            lpec_noise_fill(excit, band_rt, sort_idx, band_samples,
+                            pitch_mix, &st->noise_pos,
+                            subfr_len);
 
         rt += band_samples;
     }
@@ -1201,11 +1202,11 @@ static void lpec_excit_zero_head_tail(LPECExcitState *st, double *excit,
     }
 }
 
-/* post-060e0: zero head/tail, per-band gain (clamp). */
-static void lpec_excit_finish_05d50(LPECExcitState *st, double *excit,
-                                    int subfr_len, int mode, int half_slot,
-                                    int band_slot, const double *band_cb,
-                                    double gain, int route_tbl_idx)
+/* after lpec_excit_decode_bands(): zero head/tail, per-band gain (clamp). */
+static void lpec_excit_band_gain(LPECExcitState *st, double *excit,
+                                 int subfr_len, int mode, int half_slot,
+                                 int band_slot, const double *band_cb,
+                                 double gain, int route_tbl_idx)
 {
     static const double band_cb_min = 1e-5;
     int hs = half_slot & 3;
@@ -1272,7 +1273,7 @@ int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
                                             ff_lpec_excit_route_idx(mode, half_idx1));
     excit_work = subfr_len;
     if (mode == 2 && half_idx1 == 2)
-        /* mode-2 h2: the ab80 segment is the whole frame (512 @ 8 kHz), not
+        /* mode-2 h2: the QMF segment is the whole frame (512 @ 8 kHz), not
          * pitch_route_len[2] >> 1 (384); a short fill corrupts excit_src[384:512). */
         excit_work = frame_size;
     else if (mode == 1 || mode == 3)
@@ -1298,8 +1299,8 @@ int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
             bit_budget = bits_limit - pos;
     }
 
-    /* No full-buffer memset before 060e0. lpec_excit_finish_05d50
-     * zeros head/tail only. Clearing excit_work bytes here destroys ab80 tail state
+    /* No full-buffer memset before lpec_excit_decode_bands(). lpec_excit_band_gain
+     * zeros head/tail only. Clearing excit_work bytes here destroys QMF tail state
      * in excit_src[seg:flen) (e.g. mode 1 excit_work=384 vs QMF desc768 flen=768). */
     if (st->num_bands == 10)
         gain_table = lpec_16k_gain_table;
@@ -1345,21 +1346,21 @@ int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
             int hs = half_slot & 3;
             int f[4];
             const int16_t *rtable = (st->codec_rate_in == 6000)
-                                    ? lpec_xa_rtable_03920_388a0
-                                    : lpec_xa_rtable_03920_38cb0;
+                                    ? lpec_xa_route_gain_6k
+                                    : lpec_xa_route_gain_other;
 
-            lpec_route_decode_03920(route, hs, rem_bits, pitch_route_arg, f,
-                                    rtable, st->num_bands,
-                                    st->pitch_scale_route[hs],
-                                    st->pitch_ref_route[hs],
-                                    st->pitch_mult_route[hs]);
+            lpec_xa_route_alloc(route, hs, rem_bits, pitch_route_arg, f,
+                                rtable, st->num_bands,
+                                st->pitch_scale_route[hs],
+                                st->pitch_ref_route[hs],
+                                st->pitch_mult_route[hs]);
             counts[0] = f[0];
             counts[1] = f[1];
             counts[2] = f[2];
             counts[3] = f[3];
         } else {
-            lpec_pitch_route_4450(st, route, half_slot, rem_bits, pitch_route_arg,
-                                  counts);
+            lpec_pitch_route_alloc(st, route, half_slot, rem_bits, pitch_route_arg,
+                                   counts);
         }
     }
 
@@ -1391,7 +1392,7 @@ int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
         if (mode == 2 && half_idx1 == 2)
             decode_len = excit_work;
 
-        lpec_excit_decode_060e0(st, gb, excitation, route, rtbl, band_step,
+        lpec_excit_decode_bands(st, gb, excitation, route, rtbl, band_step,
                                 decode_len, pitch_e, counts, bits_limit, mode);
 
         /* advance to end of rem_bits route window before next half hdr. */
@@ -1412,11 +1413,11 @@ int ff_lpec_generate_excitation(LPECExcitState *st, GetBitContext *gb,
         if (mode == 2 && half_idx1 == 2)
             finish_len = frame_size;
         if (st->is_xaudio_lp && mode == 1)
-            lpec_excit_finish_05d50(st, excitation, finish_len, mode, half_slot,
-                                    -1, band_cb, gain, route_tbl_idx);
+            lpec_excit_band_gain(st, excitation, finish_len, mode, half_slot,
+                                 -1, band_cb, gain, route_tbl_idx);
         else
-            lpec_excit_finish_05d50(st, excitation, finish_len, mode, half_slot,
-                                    xa_band_slot, band_cb, gain, route_tbl_idx);
+            lpec_excit_band_gain(st, excitation, finish_len, mode, half_slot,
+                                 xa_band_slot, band_cb, gain, route_tbl_idx);
     }
 
     for (i = 0; i < excit_work; i++) {

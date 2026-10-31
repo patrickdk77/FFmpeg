@@ -48,18 +48,18 @@ typedef struct MSVADPCMState {
     uint32_t filt_lo;     /* filter state (low) */
     uint32_t filt_hi;     /* filter state (high) */
     uint32_t quant_base;  /* quantizer predictor base */
-    uint32_t scl_c0;      /* scale / delay pair 0 */
-    uint32_t scl_c4;
-    uint32_t del_c8;
-    uint32_t del_cc;
-    uint32_t del_d0;
-    uint32_t del_d4;
-    uint32_t del_d8;
-    uint32_t del_dc;
-    uint32_t del_e0;
-    uint32_t del_e4;
-    uint32_t del_e8;
-    uint32_t del_ec;
+    uint32_t recon0;      /* reconstructed signal history */
+    uint32_t recon1;
+    uint32_t zero5;
+    uint32_t zero4;
+    uint32_t zero3;
+    uint32_t zero2;
+    uint32_t zero1;
+    uint32_t zero0;
+    uint32_t pole1;
+    uint32_t pole0;
+    uint32_t pr_sign0;
+    uint32_t pr_sign1;
     uint32_t tap0;
     uint32_t tap1;
     uint32_t tap2;
