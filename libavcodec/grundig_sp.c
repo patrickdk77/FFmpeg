@@ -21,7 +21,7 @@
 
 /*
  * Grundig DSS-SP ('\x06dss' / Digta SP) decoder, as found in Grundig DigtaSoft
- * .dss recordings and produced by the Grundig dss2wav reference codec.
+ * .dss recordings.
  *
  * It is a CELP coder operating at a native 12 kHz sampling rate: each 41-byte
  * (328-bit) frame yields 288 samples (4 subframes x 72 samples).  Each frame
@@ -38,8 +38,8 @@
  * intentionally left to libswresample -- this decoder emits the codec's native
  * 12 kHz rate.
  *
- * The decoder uses f64 arithmetic and floor(x + 0.5) rounding to remain
- * bit-exact against the reference codec.
+ * The decoder uses f64 arithmetic and floor(x + 0.5) rounding. The output
+ * must not change by a single bit, so keep both.
  */
 
 #include <math.h>
@@ -62,8 +62,6 @@
 
 /* de-emphasis pole (y[n] = x[n] - DEEMPH_POLE*y[n-1], DEEMPH_POLE = -0.1) */
 #define GRUNDIG_DEEMPH_POLE  (-0.1)
-
-/* The tables come from the .data section of Grundig's dss2wav.dll. */
 
 static const double grundig_lpc0[448] = {
     -0x1.fe33e3fffffffp-1, -0x1.fd2bce0000002p-1, -0x1.fc0b47fffffffp-1, -0x1.fad7340000001p-1,
@@ -270,13 +268,13 @@ static const uint8_t grundig_widths[GRUNDIG_ORDER] = {
     5, 5, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3,
 };
 
-/* From Olympus DssDecoder.dll 1.1.1.0 */
+/* Variable rate SP last reflection coefficient, 2-bit index */
 static const double grundig_vr_refl13[4] = {
     -0x1.fe5eb80000000p-3, -0x1.2e71f00000000p-4,
      0x1.f33c9e0000001p-5,  0x1.a30cf00000000p-3,
 };
 
-/* In 1/32768, from the same DLL */
+/* In 1/32768 */
 static const uint16_t grundig_vr_noise_gain[32] = {
       0,   5,  10,  15,  21,  28,  35,  42,  50,  59,  69,  79,  90, 102,
     115, 129, 144, 160, 178, 197, 218, 240, 264, 290, 318, 348, 381, 417,

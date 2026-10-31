@@ -52,7 +52,7 @@
 #define DS2_QP7_LAST_REFL_BITS 2
 #define DS2_QP7_NOISE_GAIN_BITS 5
 
-/* ---- Quantization tables (from DssDecoder.dll via hirparak/dss-codec) ---- */
+/* ---- Quantization tables (from hirparak/dss-codec) ---- */
 
 static const int ds2_qp_refl_bits[DS2_QP_NUM_REFL] = {7, 7, 6, 6, 5, 5, 5, 5,
                                                       5, 4, 4, 4, 4, 3, 3, 3};
@@ -364,7 +364,7 @@ static const double ds2_qp_refl_cb[DS2_QP_NUM_REFL][128] = {
     },
 };
 
-/* QP pitch gain: 64 entries (6-bit) at VA 0x1004BA10 */
+/* QP pitch gain: 64 entries (6-bit) */
 static const double ds2_qp_pitch_gain[64] = {
     0.004913, 0.056367, 0.102669, 0.145092, 0.184286, 0.220170, 0.252640, 0.281841,
     0.308202, 0.332237, 0.354531, 0.375491, 0.395460, 0.414675, 0.433337, 0.451622,
@@ -376,7 +376,7 @@ static const double ds2_qp_pitch_gain[64] = {
     1.487140, 1.548301, 1.613491, 1.682657, 1.755914, 1.833605, 1.914886, 1.999406,
 };
 
-/* QP excitation gain: 64 entries (6-bit) at VA 0x1004BC10 */
+/* QP excitation gain: 64 entries (6-bit) */
 static const double ds2_qp_exc_gain[64] = {
     3.928000, 7.069000, 10.993000, 16.465000, 23.856000, 32.753000, 42.893000, 54.076000,
     66.160000, 79.016000, 92.493000, 106.558000, 121.106000, 136.128000, 151.663000, 167.700000,
@@ -388,7 +388,7 @@ static const double ds2_qp_exc_gain[64] = {
     2545.084000, 2752.592000, 2991.921000, 3271.340000, 3603.855000, 4004.808000, 4476.587000, 4970.296000,
 };
 
-/* QP pulse amplitude: 8 entries (3-bit) at VA 0x1004BE10 */
+/* QP pulse amplitude: 8 entries (3-bit) */
 static const double ds2_qp_pulse_amp[8] = {
     -0.921705, -0.628998, -0.397315, -0.140886, 0.206959, 0.433678, 0.652927, 0.931249,
 };
@@ -772,7 +772,7 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
   ds2_qp_deemphasis_frame(p, p->frame_buf, DS2_QP_FRAME_SAMPLES);
 
-  /* Convert to int16 (truncate toward zero, matching ds2decode.py / DLL) */
+  /* Convert to int16 (truncate toward zero, matching ds2decode.py) */
   for (i = 0; i < DS2_QP_FRAME_SAMPLES; i++) {
     double sample = p->frame_buf[i];
     if (sample > 32767.0)
