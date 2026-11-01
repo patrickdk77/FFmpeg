@@ -49,6 +49,8 @@ typedef struct DS2DemuxContext {
   int counter;          /* bytes remaining in current block payload */
   int total_frames;     /* total frame count from block headers */
   int frames_read;      /* frames read so far */
+  int resync_drop;      /* QP: partial frame orphaned at a re-sync block */
+  int blk_frames;       /* frames still to start in the current block */
 } DS2DemuxContext;
 
 static int ds2_probe(const AVProbeData *p) {
@@ -109,12 +111,23 @@ static int ds2_read_metadata_string(AVFormatContext *s, unsigned int offset,
 }
 
 /*
+ * Frames that start in a block: byte 2 when it is not 0, otherwise byte 5
+ * unless that is 0xff. A recorder writes the second form where it pauses or
+ * stops, and those frames are audio like any other.
+ */
+static int ds2_block_frames(const uint8_t *hdr) {
+  if (hdr[2] || hdr[5] == 0xff)
+    return hdr[2];
+  return hdr[5];
+}
+
+/*
  * Frames that start in the part of a block a cut file still holds, from the
  * block's header and payload, size bytes of them. Only frames whose first
  * byte is there count; the reader returns the last one zero-filled.
  */
 static int ds2_partial_block_frames(const uint8_t *buf, int size) {
-  int frame_count = buf[2], n = 0;
+  int frame_count = ds2_block_frames(buf), n = 0;
   int off = DS2_AUDIO_BLOCK_HEADER_SIZE +
             av_clip(2 * buf[1] + 2 * (buf[0] >> 7) -
                     DS2_AUDIO_BLOCK_HEADER_SIZE, 0, DS2_BLOCK_PAYLOAD_SIZE);
@@ -129,16 +142,20 @@ static int ds2_partial_block_frames(const uint8_t *buf, int size) {
 static int ds2_count_total_frames(AVFormatContext *s) {
   AVIOContext *pb = s->pb;
   int64_t size = avio_size(pb);
-  uint8_t buf[DS2_BLOCK_SIZE];
+  uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE], buf[DS2_BLOCK_SIZE];
   int blocks, i, tail, total = 0;
 
+  if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
+    return 0;
   if (size < DS2_HEADER_SIZE)
     return AVERROR_INVALIDDATA;
 
   blocks = (size - DS2_HEADER_SIZE) / DS2_BLOCK_SIZE;
   for (i = 0; i < blocks; i++) {
-    avio_seek(pb, DS2_HEADER_SIZE + (int64_t)i * DS2_BLOCK_SIZE + 2, SEEK_SET);
-    total += avio_r8(pb);
+    avio_seek(pb, DS2_HEADER_SIZE + (int64_t)i * DS2_BLOCK_SIZE, SEEK_SET);
+    if (avio_read(pb, hdr, sizeof(hdr)) != sizeof(hdr))
+      break;
+    total += ds2_block_frames(hdr);
   }
 
   tail = (size - DS2_HEADER_SIZE) % DS2_BLOCK_SIZE;
@@ -150,11 +167,11 @@ static int ds2_count_total_frames(AVFormatContext *s) {
   return total;
 }
 
-static int ds2_load_block(AVFormatContext *s) {
+static int ds2_load_block(AVFormatContext *s, int in_frame_offset) {
   DS2DemuxContext *ctx = s->priv_data;
   AVIOContext *pb = s->pb;
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE];
-  int ret, frame_count, cont_size, blk_swap;
+  int ret, frame_count, cont_size, blk_swap, anchor, aligned;
 
   if (ctx->total_frames > 0 && ctx->frames_read >= ctx->total_frames)
     return AVERROR_EOF;
@@ -164,16 +181,56 @@ static int ds2_load_block(AVFormatContext *s) {
     return ret < 0 ? ret : AVERROR_EOF;
 
   blk_swap    = hdr[0] >> 7;
-  frame_count = hdr[2];
+  frame_count = ds2_block_frames(hdr);
   cont_size   = FFMAX(0, 2 * hdr[1] + 2 * blk_swap - DS2_AUDIO_BLOCK_HEADER_SIZE);
+
+  ctx->blk_frames  = frame_count;
 
   if (frame_count == 0) {
     ctx->counter = cont_size;
   } else {
+    /*
+     * QP frames re-anchor at payload offset 2*byte1 - 6 at every block
+     * (blk_swap == 0 in QP, so this equals cont_size). On gap-free audio the
+     * anchor coincides with the straddle carried from the previous block, so a
+     * flat concatenation is correct. At a segment boundary the recorder emits
+     * a re-sync block whose anchor jumps: the leading bytes are an orphaned
+     * straddle tail, the partial frame in flight is stale, and framing must
+     * restart at the anchor. frame_count over-counts on these blocks (observed
+     * 19), so there the block end is the limit.
+     */
+    anchor  = FFMIN(cont_size, DS2_BLOCK_PAYLOAD_SIZE);
+    aligned = (!in_frame_offset && !anchor) ||
+              (in_frame_offset && in_frame_offset + anchor == DS2_QP_FRAME_SIZE);
+    if (!aligned) {
+      ctx->resync_drop = 1;
+      if (anchor > 0 && avio_skip(pb, anchor) < 0)
+        return AVERROR_EOF;
+      ctx->counter = DS2_BLOCK_PAYLOAD_SIZE - anchor;
+      return 0;
+    }
+
     ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
   }
 
   return 0;
+}
+
+/*
+ * Skip the rest of the current block and load the next one. A pause block
+ * holds padding after its last frame. The file header is a whole number of
+ * blocks, so blocks are aligned to their size in the file.
+ */
+static int ds2_next_block(AVFormatContext *s, int in_frame_offset) {
+  DS2DemuxContext *ctx = s->priv_data;
+  int64_t in_block = avio_tell(s->pb) % DS2_BLOCK_SIZE;
+
+  ctx->counter = 0;
+  ctx->resync_drop = 0;
+  if (in_block > 0 && avio_skip(s->pb, DS2_BLOCK_SIZE - in_block) < 0)
+    return AVERROR_EOF;
+
+  return ds2_load_block(s, in_frame_offset);
 }
 
 static int ds2_read_header(AVFormatContext *s) {
@@ -181,7 +238,7 @@ static int ds2_read_header(AVFormatContext *s) {
   AVIOContext *pb = s->pb;
   AVStream *st;
   uint8_t block_header[DS2_AUDIO_BLOCK_HEADER_SIZE];
-  int ret, frame_count, cont_size, blk_swap, samples_per_frame;
+  int ret, samples_per_frame;
   int64_t ret64;
 
   st = avformat_new_stream(s, NULL);
@@ -251,17 +308,13 @@ static int ds2_read_header(AVFormatContext *s) {
     st->codecpar->bit_rate = (int)s->bit_rate;
   }
 
-  blk_swap    = block_header[0] >> 7;
-  frame_count = block_header[2];
-  cont_size   = FFMAX(0, 2 * block_header[1] + 2 * blk_swap -
-                           DS2_AUDIO_BLOCK_HEADER_SIZE);
-
+  /* Let the first read load the block: a file cut out of a longer recording
+   * can start with the tail of a frame, before the block's anchor. */
+  if ((ret64 = avio_seek(pb, DS2_HEADER_SIZE, SEEK_SET)) < 0)
+    return (int)ret64;
   ctx->frames_read = 0;
-
-  if (frame_count == 0)
-    ctx->counter = cont_size;
-  else
-    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+  ctx->counter     = 0;
+  ctx->blk_frames  = 0;
 
   return 0;
 }
@@ -273,8 +326,8 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
   if (ctx->total_frames > 0 && ctx->frames_read >= ctx->total_frames)
     return AVERROR_EOF;
 
-  if (ctx->counter == 0) {
-    ret = ds2_load_block(s);
+  while (ctx->blk_frames <= 0 || ctx->counter == 0) {
+    ret = ds2_next_block(s, 0);
     if (ret < 0)
       return ret;
   }
@@ -293,11 +346,13 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
   while (offset < DS2_QP_FRAME_SIZE) {
     int to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
     if (to_read <= 0) {
-      ret = ds2_load_block(s);
-      if (ret == AVERROR_EOF && offset > 0)
+      ret = ds2_next_block(s, offset);
+      if (ret == AVERROR_EOF && offset > 0 && !ctx->resync_drop)
         goto truncated;
       if (ret < 0)
         return ret;
+      if (ctx->resync_drop)
+        offset = 0;
       to_read = FFMIN(DS2_QP_FRAME_SIZE - offset, ctx->counter);
     }
 
@@ -314,6 +369,8 @@ static int ds2_qp_read_packet(AVFormatContext *s, AVPacket *pkt) {
       goto truncated;
     }
 
+    if (!offset)
+      ctx->blk_frames--;
     offset += to_read;
     ctx->counter -= to_read;
   }
@@ -334,8 +391,6 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
                          int64_t timestamp, int flags) {
   DS2DemuxContext *ctx = s->priv_data;
   int64_t ret, seekto;
-  uint8_t header[DS2_AUDIO_BLOCK_HEADER_SIZE];
-  int frame_count, cont_size, blk_swap;
 
   seekto = timestamp / DS2_QP_SAMPLES_PER_FRAME * DS2_QP_FRAME_SIZE /
            DS2_BLOCK_PAYLOAD_SIZE * DS2_BLOCK_SIZE;
@@ -349,21 +404,11 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   if (ret < 0)
     return ret;
 
-  ret = avio_read(s->pb, header, DS2_AUDIO_BLOCK_HEADER_SIZE);
-  if (ret < DS2_AUDIO_BLOCK_HEADER_SIZE)
-    return ret < 0 ? ret : AVERROR_EOF;
-
-  blk_swap    = header[0] >> 7;
-  frame_count = header[2];
-  cont_size   = FFMAX(0, 2 * header[1] + 2 * blk_swap -
-                           DS2_AUDIO_BLOCK_HEADER_SIZE);
-
+  /* The next read loads this block and starts at its anchor, skipping the
+   * tail of a frame that began in the previous block. */
   ctx->frames_read = timestamp / DS2_QP_SAMPLES_PER_FRAME;
-
-  if (frame_count == 0)
-    ctx->counter = cont_size;
-  else
-    ctx->counter = DS2_BLOCK_PAYLOAD_SIZE;
+  ctx->counter     = 0;
+  ctx->blk_frames  = 0;
 
   return 0;
 }
