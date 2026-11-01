@@ -23,6 +23,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
 #include "libavutil/error.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
 
@@ -41,6 +42,8 @@
 #define DS2_META_KEY_SIZE           30
 #define DS2_META_VAL_SIZE           30
 #define DS2_HEAD_EXT_META_END       0x31e
+#define DS2_HEAD_OFFSET_ANNOTATIONS 0x400
+#define DS2_HEAD_ANNOTATIONS_END    0x500
 
 void ff_dss_trim_string(char *s, int size)
 {
@@ -208,4 +211,69 @@ int ff_dss_read_ds2_metadata(AVFormatContext *s)
     }
 
     return ds2_read_extended_metadata(s, hdr, size);
+}
+
+/* The annotations are 8-byte entries of start and end time in ms, up to the
+ * first start time of 0xffffffff. */
+int ff_dss_read_ds2_annotations(AVFormatContext *s, int header_size,
+                                int frame_ms, DS2Annotations *ann)
+{
+    uint8_t hdr[DS2_HEAD_ANNOTATIONS_END - DS2_HEAD_OFFSET_ANNOTATIONS];
+    int64_t pos;
+    int off, ret;
+
+    ann->nb = 0;
+    if (header_size < DS2_HEAD_ANNOTATIONS_END)
+        return 0;
+
+    pos = avio_seek(s->pb, DS2_HEAD_OFFSET_ANNOTATIONS, SEEK_SET);
+    if (pos < 0)
+        return (int)pos;
+    ret = avio_read(s->pb, hdr, sizeof(hdr));
+    if (ret != sizeof(hdr))
+        return ret < 0 ? ret : AVERROR_EOF;
+
+    for (off = 0; off + 8 <= sizeof(hdr) && ann->nb < DS2_MAX_ANNOTATIONS;
+         off += 8) {
+        uint32_t start_ms = AV_RL32(hdr + off);
+        uint32_t end_ms   = AV_RL32(hdr + off + 4);
+
+        if (start_ms == 0xFFFFFFFFu)
+            break;
+        if (end_ms / frame_ms <= start_ms / frame_ms)
+            continue;
+
+        ann->range[ann->nb].first_frame = start_ms / frame_ms;
+        ann->range[ann->nb].last_frame  = end_ms / frame_ms;
+        ann->nb++;
+    }
+
+    return 0;
+}
+
+static int ds2_is_annotation(const DS2Annotations *ann, int64_t frame)
+{
+    int i;
+
+    for (i = 0; i < ann->nb; i++) {
+        if (frame >= ann->range[i].first_frame &&
+            frame < ann->range[i].last_frame)
+            return 1;
+    }
+    return 0;
+}
+
+int ff_dss_ds2_frame_included(const DS2Annotations *ann, int extract,
+                              int64_t frame)
+{
+    int is_ann = ds2_is_annotation(ann, frame);
+
+    switch (extract) {
+    case DS2_EXTRACT_MAIN:
+        return !is_ann;
+    case DS2_EXTRACT_ANNOTATIONS:
+        return is_ann;
+    default:
+        return 1;
+    }
 }
