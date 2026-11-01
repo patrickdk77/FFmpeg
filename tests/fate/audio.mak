@@ -80,6 +80,9 @@ fate-dss-sp-format-ff: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-format
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-format3-first
 fate-dss-sp-format3-first: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-format3-first.dss
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-hdr0
+fate-dss-sp-hdr0: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr0.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-hdr1
 fate-dss-sp-hdr1: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr1.dss
 
