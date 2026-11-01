@@ -579,7 +579,7 @@ library:
     @tab Multimedia format used by Delphine Software games.
 @item Digital Speech Standard (DSS) @tab   @tab X
 @item Digital Speech Standard Pro (DS2) @tab   @tab X
-    @tab Olympus dictation format; QP (16000 Hz) CELP mode.
+    @tab Olympus dictation format; SP (11000 Hz) and QP (16000 Hz) CELP modes.
 @item CD+G                      @tab   @tab X
     @tab Video format used by CD+G karaoke disks
 @item Phantom Cine              @tab   @tab X

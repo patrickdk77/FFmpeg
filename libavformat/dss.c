@@ -45,6 +45,7 @@
 #define DSS_BLOCK_SIZE                512
 #define DSS_AUDIO_BLOCK_HEADER_SIZE   6
 #define DSS_BLOCK_KEEP_BEFORE         2
+#define DSS_FORMAT_SCAN_BLOCKS        64
 #define DSS_FRAME_SIZE                42
 
 static const uint8_t frame_size[4] = { 24, 20, 4, 1 };
@@ -71,13 +72,46 @@ static int dss_block_frames(const uint8_t *header)
     return header[5];
 }
 
+/* Header size of a DS2 file from the first byte, in 512-byte blocks. Philips
+ * SpeechExec writes 1 in the DS2 files it splits out of a recording, over the
+ * usual 3 blocks; Olympus writes 1 over 1 block, followed by an audio block. */
+static int dss_ds2_header_size(const uint8_t *buf, int size)
+{
+    if (buf[0] == 1 && (size < DSS_BLOCK_SIZE + 4 ||
+                        buf[DSS_BLOCK_SIZE + 3] != 0xff))
+        return 3 * DSS_BLOCK_SIZE;
+    return buf[0] * DSS_BLOCK_SIZE;
+}
+
+static int dss_probe_format(const uint8_t *buf, int size, int pos)
+{
+    while (pos + DSS_AUDIO_BLOCK_HEADER_SIZE <= size) {
+        if (dss_block_frames(buf + pos))
+            return buf[pos + 4];
+        pos += DSS_BLOCK_SIZE;
+    }
+    return -1;
+}
+
 static int dss_probe(const AVProbeData *p)
 {
-    if (   AV_RL32(p->buf) != MKTAG(0x2, 'd', 's', 's')
-        && AV_RL32(p->buf) != MKTAG(0x3, 'd', 's', 's'))
-        return 0;
+    int format;
 
-    return AVPROBE_SCORE_MAX;
+    if (   AV_RL32(p->buf) == MKTAG(0x2, 'd', 's', 's')
+        || AV_RL32(p->buf) == MKTAG(0x3, 'd', 's', 's'))
+        return AVPROBE_SCORE_MAX;
+
+    /* DS2 files in SP or LP mode carry exactly the DSS payload; only the
+     * header is bigger. */
+    if (p->buf[0] &&
+        p->buf[1] == 'd' && p->buf[2] == 's' && p->buf[3] == '2') {
+        format = dss_probe_format(p->buf, p->buf_size,
+                                  dss_ds2_header_size(p->buf, p->buf_size));
+        if (format == DSS_ACODEC_DSS_SP || format == DSS_ACODEC_G723_1)
+            return AVPROBE_SCORE_MAX;
+    }
+
+    return 0;
 }
 
 static int dss_read_metadata_date(AVFormatContext *s, unsigned int offset,
@@ -125,37 +159,94 @@ static int dss_read_metadata_string(AVFormatContext *s, unsigned int offset,
     return av_dict_set(&s->metadata, key, value, AV_DICT_DONT_STRDUP_VAL);
 }
 
+static int dss_first_format(AVFormatContext *s)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = s->pb;
+    uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+    int64_t pos = ctx->dss_header_size, end = INT64_MAX;
+    int ret;
+
+    if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+        end = pos + FFMAX(FFMIN(s->probesize, INT_MAX / 2),
+                          DSS_FORMAT_SCAN_BLOCKS * DSS_BLOCK_SIZE);
+        if (avio_seek(pb, pos, SEEK_SET) < 0)
+            return DSS_ACODEC_DSS_SP;
+        if ((ret = ffio_ensure_seekback(pb, end - pos)) < 0)
+            return ret;
+    }
+
+    for (; pos < end; pos += DSS_BLOCK_SIZE) {
+        if (avio_seek(pb, pos, SEEK_SET) < 0)
+            break;
+        ret = avio_read(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+        if (ret < 0 && ret != AVERROR_EOF)
+            return ret;
+        if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE)
+            break;
+        if (dss_block_frames(header))
+            return header[4];
+    }
+    return DSS_ACODEC_DSS_SP;
+}
+
 static int dss_read_header(AVFormatContext *s)
 {
     DSSDemuxContext *ctx = s->priv_data;
     AVIOContext *pb = s->pb;
     AVStream *st;
+    uint8_t buf[DSS_BLOCK_SIZE + 4];
     int64_t ret64;
-    int ret, version;
+    int ret, version, is_ds2, format;
 
     st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
 
-    version = avio_r8(pb);
-    ctx->dss_header_size = version * DSS_BLOCK_SIZE;
+    ret = avio_read(pb, buf, sizeof(buf));
+    if (ret < 4)
+        return ret < 0 ? ret : AVERROR_INVALIDDATA;
+    version = buf[0];
+    is_ds2  = buf[3] == '2';
+    ctx->dss_header_size = is_ds2 ? dss_ds2_header_size(buf, ret)
+                                  : version * DSS_BLOCK_SIZE;
 
+    /* A DS2 header can leave the recording date zeroed, which does not
+     * parse. The audio does not depend on these fields, so in a DS2 file a
+     * field that does not parse only warns. */
     ret = dss_read_metadata_string(s, DSS_HEAD_OFFSET_AUTHOR,
                                    DSS_AUTHOR_SIZE, "author");
-    if (ret)
-        return ret;
+    if (ret) {
+        if (!is_ds2)
+            return ret;
+        av_log(s, AV_LOG_WARNING, "Failed to read author metadata\n");
+    }
 
     ret = dss_read_metadata_date(s, DSS_HEAD_OFFSET_END_TIME, "date");
-    if (ret)
-        return ret;
+    if (ret) {
+        if (!is_ds2)
+            return ret;
+        av_log(s, AV_LOG_WARNING, "Failed to read date metadata\n");
+    }
 
     ret = dss_read_metadata_string(s, DSS_HEAD_OFFSET_COMMENT,
                                    DSS_COMMENT_SIZE, "comment");
-    if (ret)
-        return ret;
+    if (ret) {
+        if (!is_ds2)
+            return ret;
+        av_log(s, AV_LOG_WARNING, "Failed to read comment metadata\n");
+    }
 
-    avio_seek(pb, DSS_HEAD_OFFSET_ACODEC, SEEK_SET);
-    ctx->audio_codec = avio_r8(pb);
+    /* DS2 leaves the DSS codec field unset; each block header states it. */
+    if (is_ds2) {
+        format = dss_first_format(s);
+        if (format < 0)
+            return format;
+        ctx->audio_codec = format;
+    } else {
+        avio_seek(pb, DSS_HEAD_OFFSET_ACODEC, SEEK_SET);
+        ctx->audio_codec = avio_r8(pb);
+    }
 
     if (ctx->audio_codec == DSS_ACODEC_DSS_SP) {
         st->codecpar->codec_id    = AV_CODEC_ID_DSS_SP;

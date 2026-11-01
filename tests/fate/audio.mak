@@ -44,6 +44,9 @@ FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP, PIPE_PROTOCOL) += fate-dss-sp-e
 fate-dss-sp-empty56-pipe: CMD = cat $(SAMPLES)/dss/olympus-sp-empty56.dss | framecrc -blocksize 7 -i pipe:0
 fate-dss-sp-empty56-pipe: REF = $(SRC_PATH)/tests/ref/fate/dss-sp-empty56
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-hdr1
+fate-dss-sp-hdr1: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-hdr1.dss
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp-pause-block
 fate-dss-sp-pause-block: CMD = framecrc -i $(TARGET_SAMPLES)/dss/olympus-sp-pause-block.dss
 
@@ -65,11 +68,33 @@ fate-ds2-qp-pause-block: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-paus
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-paused
 fate-ds2-qp-paused: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/paused-qp.ds2
 
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER) += fate-ds2-lp-empty64
+fate-ds2-lp-empty64: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-lp-empty64.ds2 -af aresample
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, G723_1, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-ds2-lp-empty64-pipe
+fate-ds2-lp-empty64-pipe: CMD = cat $(SAMPLES)/ds2/olympus-lp-empty64.ds2 | framecrc -i pipe:0 -af aresample
+fate-ds2-lp-empty64-pipe: REF = $(SRC_PATH)/tests/ref/fate/ds2-lp-empty64
+
 FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DS2_DEMUXER) += fate-ds2-qp-resync-pos
 fate-ds2-qp-resync-pos: CMD = probe -show_entries packet=pts,pos -of compact $(TARGET_SAMPLES)/ds2/olympus-qp-resync.ds2
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DS2, DS2) += fate-ds2-qp-tail-start
 fate-ds2-qp-tail-start: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-qp-tail-start.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp
+fate-ds2-sp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp-empty-lp
+fate-ds2-sp-empty-lp: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-empty-lp.ds2
+
+FATE_SAMPLES_AUDIO_FFPROBE-$(CONFIG_DSS_DEMUXER) += fate-ds2-sp-empty-lp-probe
+fate-ds2-sp-empty-lp-probe: CMD = probe -show_entries stream=codec_name,sample_rate $(TARGET_SAMPLES)/ds2/olympus-sp-empty-lp.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp-hdr1
+fate-ds2-sp-hdr1: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-hdr1.ds2
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-ds2-sp-hdr17
+fate-ds2-sp-hdr17: CMD = framecrc -i $(TARGET_SAMPLES)/ds2/olympus-sp-hdr17.ds2
 
 FATE_SAMPLES_AUDIO-$(call PCM, DSF, DST, ARESAMPLE_FILTER SWRESAMPLE) += fate-dsf-dst
 fate-dsf-dst: CMD = pcm -i $(TARGET_SAMPLES)/dst/dst-64fs44-2ch.dff

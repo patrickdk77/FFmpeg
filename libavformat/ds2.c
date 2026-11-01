@@ -9,7 +9,7 @@
  * DS2 is an evolution of the Digital Speech Standard (DSS) format used by
  * Olympus dictation recorders. This demuxer reads QP (Quality Play, 16000 Hz,
  * CELP with a C(64,11) codebook). SP and LP files carry exactly the DSS
- * payload behind a bigger header.
+ * payload behind a bigger header, so the DSS demuxer reads those.
  *
  * Block layout and demuxing follow hirparak/dss-codec CODEC_SPECIFICATION.md.
  */
@@ -27,8 +27,8 @@
 #define DS2_AUDIO_BLOCK_HEADER_SIZE 6
 #define DS2_BLOCK_PAYLOAD_SIZE (DS2_BLOCK_SIZE - DS2_AUDIO_BLOCK_HEADER_SIZE)
 
-#define DS2_FORMAT_SP 0 /* Standard Play */
-#define DS2_FORMAT_LP 2 /* Long Play (G.723.1) */
+#define DS2_FORMAT_SP 0 /* Standard Play, read by the DSS demuxer */
+#define DS2_FORMAT_LP 2 /* Long Play (G.723.1), read by the DSS demuxer */
 #define DS2_FORMAT_QP 6 /* Quality Play, 16000 Hz */
 
 #define DS2_QP_FRAME_SIZE 56         /* 448 bits = 56 bytes */
@@ -59,6 +59,7 @@ static int ds2_probe(const AVProbeData *p) {
   if (AV_RL32(p->buf) != MKTAG(0x3, 'd', 's', '2'))
     return 0;
 
+  /* SP and LP files belong to the DSS demuxer. */
   if (p->buf_size >= DS2_HEADER_SIZE + DS2_AUDIO_BLOCK_HEADER_SIZE) {
     format = p->buf[DS2_HEADER_SIZE + 4];
     if (format == DS2_FORMAT_SP || format == DS2_FORMAT_LP)
@@ -279,7 +280,7 @@ static int ds2_read_header(AVFormatContext *s) {
   st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
   if (ctx->format_type == DS2_FORMAT_SP || ctx->format_type == DS2_FORMAT_LP) {
-    av_log(s, AV_LOG_ERROR, "DS2 SP and LP files are not supported\n");
+    av_log(s, AV_LOG_ERROR, "DS2 SP and LP files are read by the dss demuxer\n");
     return AVERROR_INVALIDDATA;
   } else if (ctx->format_type == DS2_FORMAT_QP) {
     st->codecpar->sample_rate = DS2_QP_SAMPLE_RATE;

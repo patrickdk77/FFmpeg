@@ -10,6 +10,8 @@
  *   - QP mode: 16000 Hz, 16 reflection coefficients, 4x64-sample subframes,
  *              C(64,11) combinatorial codebook, 448-bit frames
  *
+ * The DSS demuxer reads DS2 SP and LP files, which dss_sp and g723_1 decode.
+ *
  * Based on technical documentation from FFmpeg trac ticket #6091.
  *
  */
