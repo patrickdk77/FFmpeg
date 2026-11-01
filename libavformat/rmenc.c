@@ -338,6 +338,8 @@ static int rm_write_header(AVFormatContext *s)
         case AVMEDIA_TYPE_AUDIO:
             rm->audio_stream = stream;
             frame_size = av_get_audio_frame_duration2(par, 0);
+            if (frame_size <= 0)
+                frame_size = par->frame_size;
             stream->frame_rate = (AVRational){par->sample_rate, frame_size};
             /* XXX: dummy values */
             stream->packet_max_size = 1024;

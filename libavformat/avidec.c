@@ -506,6 +506,53 @@ static int calculate_bitrate(AVFormatContext *s)
     return 1;
 }
 
+static void amv_load_index(AVFormatContext *s)
+{
+    AVIContext *avi = s->priv_data;
+    AVIOContext *pb = s->pb;
+    int64_t pos = avio_tell(pb);
+    int64_t frames[2] = { 0 }, bytes[2] = { 0 };
+
+    if (s->nb_streams != 2 ||
+        ffstream(s->streams[0])->nb_index_entries ||
+        ffstream(s->streams[1])->nb_index_entries ||
+        avio_seek(pb, avi->movi_list + 4, SEEK_SET) < 0)
+        return;
+
+    while (!avio_feof(pb)) {
+        int64_t chunk = avio_tell(pb);
+        uint32_t tag  = avio_rl32(pb);
+        uint32_t size = avio_rl32(pb);
+        int idx;
+
+        if (tag == MKTAG('0', '0', 'd', 'c'))
+            idx = 0;
+        else if (tag == MKTAG('0', '1', 'w', 'b'))
+            idx = 1;
+        else
+            break;
+        if (avio_feof(pb) || size > INT_MAX ||
+            av_add_index_entry(s->streams[idx], chunk, frames[idx], size,
+                               0, AVINDEX_KEYFRAME) < 0)
+            break;
+        frames[idx]++;
+        bytes[idx] += size;
+        avio_skip(pb, size);
+    }
+
+    for (int i = 0; i < 2; i++) {
+        AVStream *st = s->streams[i];
+
+        if (frames[i] > 0) {
+            st->nb_frames = frames[i];
+            st->duration  = frames[i];
+            st->codecpar->bit_rate = av_rescale(8 * bytes[i], st->time_base.den,
+                                                frames[i] * st->time_base.num);
+        }
+    }
+    avio_seek(pb, pos, SEEK_SET);
+}
+
 static int avi_read_header(AVFormatContext *s)
 {
     AVIContext *avi = s->priv_data;
@@ -750,7 +797,7 @@ static int avi_read_header(AVFormatContext *s)
                 ast->sample_size = 0;
             }
 
-            if (ast->sample_size == 0) {
+            if (ast->sample_size == 0 && st->nb_frames > 0) {
                 st->duration = st->nb_frames;
                 if (st->duration > 0 && avi->io_fsize > 0 && avi->riff_end > avi->io_fsize) {
                     av_log(s, AV_LOG_DEBUG, "File is truncated adjusting duration\n");
@@ -935,6 +982,7 @@ static int avi_read_header(AVFormatContext *s)
                     }
                     if (amv_file_format) {
                         st->codecpar->codec_id    = AV_CODEC_ID_ADPCM_IMA_AMV;
+                        st->codecpar->bit_rate    = 0;
                         ast->dshow_block_align = 0;
                     }
                     if ((st->codecpar->codec_id == AV_CODEC_ID_AAC  ||
@@ -1074,8 +1122,42 @@ end_of_header:
     if (stream_index != s->nb_streams - 1)
         return AVERROR_INVALIDDATA;
 
-    if (!avi->index_loaded && (pb->seekable & AVIO_SEEKABLE_NORMAL))
+    if (!avi->index_loaded && (pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         avi_load_index(s);
+        if (amv_file_format)
+            amv_load_index(s);
+    }
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        FFStream *const sti = ffstream(st);
+        AVIStream *ast = st->priv_data;
+        AVCodecParameters *par = st->codecpar;
+        int bps = av_get_exact_bits_per_sample(par->codec_id);
+        int64_t bytes = 0, samples = 0;
+
+        if (st->duration != AV_NOPTS_VALUE || !ast || ast->sample_size <= 0 ||
+            par->sample_rate <= 0 || par->ch_layout.nb_channels <= 0)
+            continue;
+        for (int j = 0; j < sti->nb_index_entries; j++) {
+            const AVIndexEntry *e = &sti->index_entries[j];
+
+            if (avi->io_fsize > 0 && e->pos + 8 + e->size > avi->io_fsize)
+                break;
+            bytes = e->timestamp + e->size;
+        }
+        if (bps > 0) {
+            samples = bytes * 8 / (bps * par->ch_layout.nb_channels);
+        } else if (par->block_align > 1 && ast->sample_size == par->block_align) {
+            int block_samples = av_get_audio_frame_duration2(par, par->block_align);
+
+            if (block_samples > 0)
+                samples = bytes / par->block_align * block_samples;
+        }
+        if (samples > 0)
+            st->duration = av_rescale(samples, st->time_base.den,
+                                      (int64_t)par->sample_rate *
+                                      st->time_base.num);
+    }
     calculate_bitrate(s);
     avi->index_loaded    |= 1;
 

@@ -111,7 +111,10 @@ static int get_aiff_header(AVFormatContext *s, int64_t size,
     channels = avio_rb16(pb);
     if (par->ch_layout.nb_channels && par->ch_layout.nb_channels != channels)
         return AVERROR_INVALIDDATA;
-    par->ch_layout.nb_channels = channels;
+    if (!par->ch_layout.nb_channels && (channels == 1 || channels == 2))
+        av_channel_layout_default(&par->ch_layout, channels);
+    else
+        par->ch_layout.nb_channels = channels;
     num_frames = avio_rb32(pb);
     par->bits_per_coded_sample = avio_rb16(pb);
 
@@ -418,6 +421,12 @@ got_sound:
     /* Now positioned, get the sound data start and end */
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
     st->start_time = 0;
+    if (st->codecpar->codec_id == AV_CODEC_ID_ADPCM_IMA_WS &&
+        aiff->data_end > offset &&
+        (aiff->data_end - offset) / st->codecpar->block_align >
+        st->nb_frames)
+        st->nb_frames = (aiff->data_end - offset) /
+                        st->codecpar->block_align;
     st->duration = st->nb_frames * aiff->block_duration;
 
     /* Position the stream at the first block */

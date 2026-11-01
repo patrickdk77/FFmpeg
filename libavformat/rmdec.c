@@ -598,7 +598,8 @@ static int rm_read_header(AVFormatContext *s)
             avio_rb32(pb); /* avg packet size */
             avio_rb32(pb); /* nb packets */
             duration = avio_rb32(pb); /* duration */
-            s->duration = av_rescale(duration, AV_TIME_BASE, 1000);
+            if (duration > 0)
+                s->duration = av_rescale(duration, AV_TIME_BASE, 1000);
             avio_rb32(pb); /* preroll */
             indx_off = (ver == 0) ? avio_rb32(pb) : avio_rb64(pb); /* index offset */
             data_off = avio_rb32(pb); /* data offset */
@@ -621,7 +622,8 @@ static int rm_read_header(AVFormatContext *s)
             avio_rb32(pb); /* preroll */
             duration = avio_rb32(pb); /* duration */
             st->start_time = start_time;
-            st->duration = duration;
+            if (duration > 0)
+                st->duration = duration;
             if(duration>0)
                 s->duration = AV_NOPTS_VALUE;
             get_str8(pb, buf, sizeof(buf)); /* desc */

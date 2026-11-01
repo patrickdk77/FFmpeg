@@ -385,7 +385,9 @@ static int gxf_header(AVFormatContext *s) {
             main_timebase.den = si->frames_per_second.num * 2;
         }
         st->start_time = si->first_field;
-        if (si->first_field != AV_NOPTS_VALUE && si->last_field != AV_NOPTS_VALUE)
+        if (si->first_field != AV_NOPTS_VALUE &&
+            si->last_field != AV_NOPTS_VALUE &&
+            si->last_field > si->first_field)
             st->duration = si->last_field - si->first_field;
     }
     if (len < 0)

@@ -33,6 +33,7 @@ static int rso_read_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     int id, rate, bps;
     unsigned int size;
+    int64_t data_size, file_size;
     enum AVCodecID codec;
     AVStream *st;
 
@@ -59,7 +60,12 @@ static int rso_read_header(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
 
-    st->duration            = (size * 8) / bps;
+    data_size = size;
+    file_size = avio_size(pb);
+    if (size == 0xffff && file_size - RSO_HEADER_SIZE > data_size)
+        data_size = file_size - RSO_HEADER_SIZE;
+    if (data_size)
+        st->duration        = (data_size * 8) / bps;
     st->codecpar->codec_type   = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_tag    = id;
     st->codecpar->codec_id     = codec;

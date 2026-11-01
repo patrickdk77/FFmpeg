@@ -100,6 +100,7 @@ static int pcm_read_header(AVFormatContext *s)
 
     par->block_align = par->bits_per_coded_sample * par->ch_layout.nb_channels / 8;
 
+    st->start_time = 0;
     avpriv_set_pts_info(st, 64, 1, par->sample_rate);
     return 0;
 }

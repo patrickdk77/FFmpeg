@@ -43,8 +43,7 @@ static int sbc_parse_header(AVCodecParserContext *s, AVCodecContext *avctx,
 
     if (data[0] == MSBC_SYNCWORD && data[1] == 0 && data[2] == 0) {
         av_channel_layout_uninit(&avctx->ch_layout);
-        avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
-        avctx->ch_layout.nb_channels = 1;
+        avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
         avctx->sample_rate = 16000;
         avctx->frame_size = 120;
         s->duration = avctx->frame_size;
@@ -68,8 +67,11 @@ static int sbc_parse_header(AVCodecParserContext *s, AVCodecContext *avctx,
                  + (joint * subbands)) + 7) / 8;
 
     av_channel_layout_uninit(&avctx->ch_layout);
-    avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
-    avctx->ch_layout.nb_channels = channels;
+    if (mode == SBC_MODE_DUAL_CHANNEL) {
+        avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+        avctx->ch_layout.nb_channels = channels;
+    } else
+        av_channel_layout_default(&avctx->ch_layout, channels);
     avctx->sample_rate = sample_rates[sr];
     avctx->frame_size = subbands * blocks;
     s->duration = avctx->frame_size;

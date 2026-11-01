@@ -43,6 +43,18 @@ typedef struct AIFFOutputContext {
     int id3v2_version;
 } AIFFOutputContext;
 
+static int aiff_frame_unit(const AVCodecParameters *par)
+{
+    switch (par->codec_id) {
+    case AV_CODEC_ID_ADPCM_IMA_WS:
+    case AV_CODEC_ID_ADPCM_G722:
+    case AV_CODEC_ID_ADPCM_G726LE:
+        return par->ch_layout.nb_channels;
+    default:
+        return par->block_align;
+    }
+}
+
 static int put_id3v2_tags(AVFormatContext *s, AIFFOutputContext *aiff)
 {
     int ret;
@@ -255,7 +267,8 @@ static int aiff_write_trailer(AVFormatContext *s)
 
         /* Number of sample frames */
         avio_seek(pb, aiff->frames, SEEK_SET);
-        avio_wb32(pb, (data_size - aiff->ssnd - 12) / par->block_align);
+        avio_wb32(pb, (data_size - aiff->ssnd - 12) /
+                      aiff_frame_unit(par));
 
         /* Sound Data chunk size */
         avio_seek(pb, aiff->ssnd, SEEK_SET);

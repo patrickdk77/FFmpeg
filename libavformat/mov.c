@@ -3318,6 +3318,13 @@ static int mov_finalize_stsd_codec(MOVContext *c, AVIOContext *pb,
     default:
         break;
     }
+
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+        st->codecpar->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC &&
+        (st->codecpar->ch_layout.nb_channels == 1 ||
+         st->codecpar->ch_layout.nb_channels == 2))
+        av_channel_layout_default(&st->codecpar->ch_layout,
+                                  st->codecpar->ch_layout.nb_channels);
     return 0;
 }
 
