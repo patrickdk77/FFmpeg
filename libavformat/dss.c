@@ -44,6 +44,8 @@
 #define DSS_ACODEC_DSS_SP_VR          0x1    /* SP mode, variable rate */
 #define DSS_ACODEC_G723_1             0x2    /* LP mode */
 #define DSS_ACODEC_G723_1_ALT         0x4    /* LP mode */
+#define DSS_ACODEC_QP                 0x6    /* QP mode */
+#define DSS_ACODEC_QP7                0x7    /* QP mode with noise frames */
 
 /* Native CELP codec at 12 kHz, 41-byte (328-bit) frames packed as a
  * continuous bitstream across 512-byte audio blocks. */
@@ -51,6 +53,17 @@
 #define DSS_GRUNDIG_FRAME_BITS        328
 #define DSS_GRUNDIG_SAMPLE_RATE       12000
 #define DSS_GRUNDIG_SAMPLES_PER_FRAME 288
+
+#define DSS_QP_FRAME_SIZE             56
+#define DSS_QP7_NOISE_FRAME_SIZE      12
+#define DSS_QP_SAMPLE_RATE            16000
+#define DSS_QP_SAMPLES_PER_FRAME      256
+
+/* SP, LP and QP frames all last a whole number of ticks */
+#define DSS_MIXED_TIME_BASE           48000
+
+/* The next block that holds frames is in another format */
+#define DSS_PART_END                  FFERRTAG('D', 'S', 'P', 'E')
 
 #define DSS_HEAD_OFFSET_COMMENT       0x31e
 #define DSS_COMMENT_SIZE              64
@@ -91,6 +104,17 @@ typedef struct DSSDemuxContext {
     int64_t total_frames;   /* frames of the recording, returned or not */
     int64_t frames_out;     /* frames returned so far */
     int skipped;            /* frames were left out since the last returned */
+
+    int     mixed;          /* packets lead with the format byte */
+    int64_t pts;
+    int64_t stated_pts;
+    int     first_format;
+    int     format_warned;
+
+    int qp_left;
+    int qp_frame_size;
+    int qp_block_format;
+    int qp_frame_format;
 } DSSDemuxContext;
 
 /* Frames that start in an audio block: byte 2 when it is not 0, otherwise
@@ -118,7 +142,67 @@ static int dss_frame_samples(const DSSDemuxContext *ctx)
 {
     if (ctx->grundig)
         return DSS_GRUNDIG_SAMPLES_PER_FRAME;
+    if (ctx->audio_codec == DSS_ACODEC_QP)
+        return DSS_QP_SAMPLES_PER_FRAME;
     return ctx->audio_codec == DSS_ACODEC_G723_1 ? 240 : 264;
+}
+
+static int dss_part_format(int format)
+{
+    switch (format) {
+    case DSS_ACODEC_DSS_SP:
+    case DSS_ACODEC_DSS_SP_VR:
+    case DSS_ACODEC_G723_1:
+    case DSS_ACODEC_QP:
+        return format;
+    case DSS_ACODEC_G723_1_ALT:
+        return DSS_ACODEC_G723_1;
+    case DSS_ACODEC_QP7:
+        return DSS_ACODEC_QP;
+    }
+    return -1;
+}
+
+static int dss_block_part(const uint8_t *header)
+{
+    return dss_format_known(header) ? dss_part_format(header[4]) : -1;
+}
+
+static int dss_part_rate(int format)
+{
+    if (format == DSS_ACODEC_G723_1)
+        return 8000;
+    if (format == DSS_ACODEC_QP)
+        return DSS_QP_SAMPLE_RATE;
+    return DSS_GRUNDIG_SAMPLE_RATE;
+}
+
+static int dss_part_ticks(int format)
+{
+    int samples = DSS_GRUNDIG_SAMPLES_PER_FRAME;
+
+    if (format == DSS_ACODEC_G723_1)
+        samples = 240;
+    else if (format == DSS_ACODEC_QP)
+        samples = DSS_QP_SAMPLES_PER_FRAME;
+    return samples * (DSS_MIXED_TIME_BASE / dss_part_rate(format));
+}
+
+static void dss_set_part(DSSDemuxContext *ctx, int format)
+{
+    ctx->audio_codec      = format;
+    ctx->grundig          = format == DSS_ACODEC_DSS_SP ||
+                            format == DSS_ACODEC_DSS_SP_VR;
+    ctx->frames_left      = 0;
+    ctx->swap             = 0;
+    ctx->dss_sp_swap_byte = -1;
+}
+
+static void dss_start_part(DSSDemuxContext *ctx, int format)
+{
+    dss_set_part(ctx, dss_part_format(format));
+    if (ctx->audio_codec == DSS_ACODEC_QP)
+        ctx->qp_block_format = format;
 }
 
 /* Header size of a DS2 file from the first byte, in 512-byte blocks. Philips
@@ -139,6 +223,30 @@ static int dss_header_copy_blocks(const uint8_t *header)
          (header[3] == 's' || header[3] == '2')) ||
         (header[1] == 'e' && header[2] == 'n' && header[3] == 'c'))
         return FFMAX(header[0], 1);
+    return 0;
+}
+
+static int dss_other_format(const DSSDemuxContext *ctx, const uint8_t *header)
+{
+    int format = dss_block_part(header);
+
+    return !dss_header_copy_blocks(header) && dss_block_frames(header) &&
+           format >= 0 && format != ctx->audio_codec;
+}
+
+static int dss_block_frames_read(AVFormatContext *s, const uint8_t *header)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+
+    if (!dss_other_format(ctx, header))
+        return dss_block_frames(header);
+    if (ctx->mixed)
+        return DSS_PART_END;
+    if (!ctx->format_warned) {
+        av_log(s, AV_LOG_WARNING, "Skipping blocks of format %d in a file "
+               "of format %d\n", header[4], ctx->audio_codec);
+        ctx->format_warned = 1;
+    }
     return 0;
 }
 
@@ -311,6 +419,31 @@ static int dss_first_format(AVFormatContext *s)
     return held ? AVERROR_INVALIDDATA : DSS_ACODEC_DSS_SP;
 }
 
+static int dss_formats_mixed(AVFormatContext *s, int first)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = ctx->pb;
+    uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+    int64_t pos;
+    int copy, format;
+
+    if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
+        return 1;
+
+    for (pos = ctx->dss_header_size; ; pos += DSS_BLOCK_SIZE) {
+        if (avio_seek(pb, pos, SEEK_SET) < 0 ||
+            avio_read(pb, header, sizeof(header)) != sizeof(header))
+            return 0;
+        if ((copy = dss_header_copy_blocks(header))) {
+            pos += (copy - 1) * DSS_BLOCK_SIZE;
+            continue;
+        }
+        format = dss_block_part(header);
+        if (dss_block_frames(header) && format >= 0 && format != first)
+            return 1;
+    }
+}
+
 static int dss_read_header(AVFormatContext *s)
 {
     DSSDemuxContext *ctx = s->priv_data;
@@ -372,10 +505,22 @@ static int dss_read_header(AVFormatContext *s)
     format = dss_first_format(s);
     if (format < 0)
         return format;
-    ctx->audio_codec = format;
 
-    if (ctx->audio_codec == DSS_ACODEC_DSS_SP ||
-        ctx->audio_codec == DSS_ACODEC_DSS_SP_VR) {
+    ctx->mixed = dss_formats_mixed(s, dss_part_format(format));
+
+    if (ctx->mixed && dss_part_format(format) >= 0) {
+        if (ctx->extract != DS2_EXTRACT_ALL &&
+            (ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+            avpriv_report_missing_feature(s, "extract in a file of more "
+                                          "than one format");
+            return AVERROR_PATCHWELCOME;
+        }
+        ctx->first_format = format;
+        dss_start_part(ctx, format);
+        st->codecpar->codec_id    = AV_CODEC_ID_DSS_MIXED;
+        st->codecpar->sample_rate = dss_part_rate(ctx->audio_codec);
+    } else if (format == DSS_ACODEC_DSS_SP || format == DSS_ACODEC_DSS_SP_VR) {
+        ctx->audio_codec = format;
         ctx->grundig = 1;
         st->codecpar->codec_id    = AV_CODEC_ID_GRUNDIG_SP;
         st->codecpar->sample_rate = DSS_GRUNDIG_SAMPLE_RATE;
@@ -389,15 +534,15 @@ static int dss_read_header(AVFormatContext *s)
         st->codecpar->codec_id    = AV_CODEC_ID_G723_1;
         st->codecpar->sample_rate = 8000;
     } else {
-        avpriv_request_sample(s, "Support for codec %x in DSS",
-                              ctx->audio_codec);
+        avpriv_request_sample(s, "Support for codec %x in DSS", format);
         return AVERROR_PATCHWELCOME;
     }
 
     st->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
     st->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
-    avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
+    avpriv_set_pts_info(st, 64, 1, ctx->mixed ? DSS_MIXED_TIME_BASE
+                                              : st->codecpar->sample_rate);
     st->start_time = 0;
 
     if (is_ds2) {
@@ -412,13 +557,20 @@ static int dss_read_header(AVFormatContext *s)
         av_log(s, AV_LOG_WARNING, "No annotations to extract\n");
 
     ctx->redo_frame = -1;
+    ctx->pts        = 0;
+    ctx->stated_pts = 0;
     frames = dss_count_frames(s);
     if (frames < 0)
         return (int)frames;
     if (frames > 0) {
         st->nb_frames = frames;
-        st->duration  = frames * dss_frame_samples(ctx);
+        st->duration  = ctx->mixed ? ctx->pts
+                                   : frames * dss_frame_samples(ctx);
     }
+    if (ctx->mixed)
+        dss_start_part(ctx, format);
+    ctx->pts        = 0;
+    ctx->stated_pts = 0;
 
     /* Jump over header */
 
@@ -467,6 +619,19 @@ static int dss_read_payload(AVFormatContext *s, uint8_t *buf, int size)
         int64_t off = (avio_tell(pb) - ctx->dss_header_size) % DSS_BLOCK_SIZE;
         int chunk;
 
+        if (!off) {
+            uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+
+            /* A frame does not go on into a block in another format. */
+            if (ffio_read_size(pb, header, sizeof(header)) < 0)
+                return AVERROR_EOF;
+            if (dss_other_format(ctx, header)) {
+                ctx->block_pos = avio_tell(pb) - sizeof(header) -
+                                 DSS_BLOCK_SIZE;
+                return DSS_PART_END;
+            }
+            continue;
+        }
         if (off < DSS_AUDIO_BLOCK_HEADER_SIZE) {
             if (avio_skip(pb, DSS_AUDIO_BLOCK_HEADER_SIZE - off) < 0)
                 return AVERROR_EOF;
@@ -497,7 +662,7 @@ static int dss_next_block(AVFormatContext *s)
     DSSDemuxContext *ctx = s->priv_data;
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
-    int64_t block_pos = ctx->block_pos;
+    int64_t block_pos = ctx->block_pos, stated_pts = ctx->stated_pts;
     int cont, copy, ret;
 
     for (;;) {
@@ -515,13 +680,18 @@ static int dss_next_block(AVFormatContext *s)
             ctx->block_pos += (copy - 1) * DSS_BLOCK_SIZE;
             continue;
         }
+        if ((ret = dss_block_frames_read(s, header)) < 0) {
+            ctx->block_pos -= DSS_BLOCK_SIZE;
+            return ret;
+        }
 
         ctx->swap = !!(header[0] & 0x80);
         cont      = 2 * header[1] + 2 * ctx->swap - DSS_AUDIO_BLOCK_HEADER_SIZE;
         if (cont < 0 || cont > DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE)
             cont = 0;
 
-        ctx->frames_left = dss_block_frames(header);
+        ctx->frames_left = ret;
+        ctx->stated_pts += (int64_t)ret * dss_part_ticks(ctx->audio_codec);
         if (!ctx->frames_left)
             continue;
 
@@ -550,8 +720,14 @@ static int dss_next_block(AVFormatContext *s)
 
 fail:
     ctx->block_pos   = block_pos;
+    ctx->stated_pts  = stated_pts;
     ctx->frames_left = 0;
     return ret;
+}
+
+static int dss_frame_cut(int ret)
+{
+    return ret == DSS_PART_END ? ret : AVERROR_EOF;
 }
 
 /* Offset of the next frame. A frame can start where a block does, after the
@@ -622,7 +798,7 @@ static int dss_sp_read_packet(AVFormatContext *s, AVPacket *pkt)
         } else {
             ret = dss_read_payload(s, pkt->data, 2);
             if (ret < 0)
-                return AVERROR_EOF; /* no whole frame left */
+                return dss_frame_cut(ret); /* no whole frame left */
             done = 2;
             if (!(pkt->data[1] & 0x80))
                 size = DSS_SP_SHORT_FRAME_SIZE;
@@ -637,7 +813,7 @@ static int dss_sp_read_packet(AVFormatContext *s, AVPacket *pkt)
     else
         ret = dss_read_payload(s, pkt->data + done, size + 1 - done);
     if (ret < 0)
-        return ret == AVERROR_EOF ? ret : AVERROR_EOF;
+        return dss_frame_cut(ret);
 
     ctx->frames_left--;
 
@@ -667,7 +843,7 @@ static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = dss_read_payload(s, &byte, 1);
     if (ret < 0)
-        return AVERROR_EOF; /* no whole frame left */
+        return dss_frame_cut(ret); /* no whole frame left */
     if (byte == 0xff)
         return AVERROR_INVALIDDATA;
 
@@ -686,7 +862,7 @@ static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     ret = dss_read_payload(s, pkt->data + 1, size - 1);
     if (ret < 0)
-        return AVERROR_EOF; /* no whole frame left */
+        return dss_frame_cut(ret); /* no whole frame left */
 
     ctx->frames_left--;
 
@@ -703,8 +879,8 @@ static int dss_grundig_next_block(AVFormatContext *s)
     DSSDemuxContext *ctx = s->priv_data;
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE], word[2];
-    int64_t at, block_pos = ctx->block_pos;
-    int64_t frames_read = ctx->frames_read;
+    int64_t at, block_pos = ctx->block_pos, stated_pts = ctx->stated_pts;
+    int64_t frames_read = ctx->frames_read, pts = ctx->pts;
     int start, copy, ret;
 
     for (;;) {
@@ -722,8 +898,13 @@ static int dss_grundig_next_block(AVFormatContext *s)
             ctx->block_pos += (copy - 1) * DSS_BLOCK_SIZE;
             continue;
         }
+        if ((ret = dss_block_frames_read(s, header)) < 0) {
+            ctx->block_pos -= DSS_BLOCK_SIZE;
+            return ret;
+        }
 
-        ctx->frames_left = dss_block_frames(header);
+        ctx->frames_left = ret;
+        ctx->stated_pts += (int64_t)ret * dss_part_ticks(ctx->audio_codec);
         if (!ctx->frames_left)
             continue;
 
@@ -745,6 +926,8 @@ static int dss_grundig_next_block(AVFormatContext *s)
                 start += DSS_GRUNDIG_FRAME_BITS;
                 ctx->frames_left--;
                 ctx->frames_read++;
+                if (ctx->mixed)
+                    ctx->pts += dss_part_ticks(ctx->audio_codec);
             }
             if (!ctx->frames_left)
                 continue;
@@ -764,7 +947,9 @@ static int dss_grundig_next_block(AVFormatContext *s)
 
 fail:
     ctx->block_pos   = block_pos;
+    ctx->stated_pts  = stated_pts;
     ctx->frames_read = frames_read;
+    ctx->pts         = pts;
     ctx->frames_left = 0;
     return ret;
 }
@@ -790,8 +975,8 @@ static int dss_grundig_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     for (i = 0; i < bits; i++) {
         if (!ctx->grundig_bits) {
-            if (dss_read_payload(s, word, 2) < 0)
-                return AVERROR_EOF; /* no whole frame left */
+            if ((ret = dss_read_payload(s, word, 2)) < 0)
+                return dss_frame_cut(ret); /* no whole frame left */
             ctx->grundig_word = AV_RL16(word);
             ctx->grundig_bits = 16;
         }
@@ -815,16 +1000,196 @@ static int dss_grundig_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
+static int dss_qp_anchor(const uint8_t *header)
+{
+    return av_clip(2 * header[1] + 2 * (header[0] >> 7) -
+                   DSS_AUDIO_BLOCK_HEADER_SIZE,
+                   0, DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE);
+}
+
+/* 1 for a re-sync block, whose anchor is not where the frame in flight ends */
+static int dss_qp_next_block(AVFormatContext *s, int in_frame)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    AVIOContext *pb = ctx->pb;
+    uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+    int64_t block_pos = ctx->block_pos;
+    int anchor, copy, ret;
+
+    for (;;) {
+        ctx->block_pos += DSS_BLOCK_SIZE;
+        if ((ret = dss_seek_block(s, ctx->block_pos)) < 0)
+            break;
+        ret = avio_read(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+        if (ret >= 0 && ret != DSS_AUDIO_BLOCK_HEADER_SIZE)
+            ret = AVERROR_EOF;
+        if (ret < 0)
+            break;
+        if (!(copy = dss_header_copy_blocks(header)))
+            break;
+        ctx->block_pos += (copy - 1) * DSS_BLOCK_SIZE;
+    }
+    if (ret < 0) {
+        ctx->block_pos   = block_pos;
+        ctx->frames_left = 0;
+        ctx->qp_left     = 0;
+        return ret;
+    }
+    if ((ret = dss_block_frames_read(s, header)) < 0) {
+        ctx->block_pos -= DSS_BLOCK_SIZE;
+        return ret;
+    }
+
+    ctx->frames_left = ret;
+    if (ret && dss_block_part(header) == DSS_ACODEC_QP)
+        ctx->qp_block_format = header[4];
+    anchor = dss_qp_anchor(header);
+
+    if (!ctx->frames_left) {
+        ctx->qp_left = anchor;
+        return 0;
+    }
+    if (in_frame ? in_frame + anchor != ctx->qp_frame_size : anchor) {
+        ctx->qp_left = DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE - anchor;
+        if (avio_skip(pb, anchor) < 0)
+            ctx->qp_left = 0;
+        return 1;
+    }
+    ctx->qp_left = DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE;
+    return 0;
+}
+
+static int dss_qp_read_packet(AVFormatContext *s, AVPacket *pkt)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    int64_t pos;
+    int ret, size, offset = 0;
+
+    while (ctx->frames_left <= 0 || !ctx->qp_left)
+        if ((ret = dss_qp_next_block(s, 0)) < 0)
+            return ret;
+    pos = avio_tell(ctx->pb);
+
+    if ((ret = av_new_packet(pkt, DSS_QP_FRAME_SIZE)) < 0)
+        return ret;
+
+    ctx->qp_frame_size = DSS_QP_FRAME_SIZE;
+    while (offset < ctx->qp_frame_size) {
+        size = FFMIN(ctx->qp_frame_size - offset, ctx->qp_left);
+        if (size <= 0) {
+            ret = dss_qp_next_block(s, offset);
+            if (ret == AVERROR_EOF)
+                goto truncated;
+            if (ret == DSS_PART_END)
+                ctx->stated_pts += dss_part_ticks(ctx->audio_codec);
+            if (ret < 0)
+                return ret;
+            if (ret) {
+                offset = 0;
+                ctx->qp_frame_size = DSS_QP_FRAME_SIZE;
+                pos = avio_tell(ctx->pb);
+            }
+            continue;
+        }
+
+        if (!offset) {
+            ctx->qp_frame_format = ctx->qp_block_format;
+            /* QP7: the type bit in the first 16-bit word gives the size */
+            if (ctx->qp_frame_format == DSS_ACODEC_QP7)
+                size = FFMIN(size, 2);
+        }
+        ret = avio_read(ctx->pb, pkt->data + offset, size);
+        if (ret < size) {
+            if (ret < 0 && ret != AVERROR_EOF)
+                return ret;
+            if (ret > 0)
+                offset += ret;
+            goto truncated;
+        }
+        if (!offset) {
+            ctx->frames_left--;
+            if (ctx->qp_frame_format == DSS_ACODEC_QP7 &&
+                !(pkt->data[1] & 0x80))
+                ctx->qp_frame_size = DSS_QP7_NOISE_FRAME_SIZE;
+        }
+        offset += size;
+        ctx->qp_left -= size;
+    }
+    goto done;
+
+truncated:
+    /* zero-filled, as in the ds2 demuxer */
+    if (!offset)
+        return AVERROR_EOF;
+    memset(pkt->data + offset, 0, ctx->qp_frame_size - offset);
+    ctx->qp_left = 0;
+done:
+    if (ctx->qp_frame_size != DSS_QP_FRAME_SIZE)
+        av_shrink_packet(pkt, ctx->qp_frame_size);
+    ctx->stated_pts += dss_part_ticks(ctx->audio_codec);
+
+    pkt->stream_index = 0;
+    pkt->pts          = ctx->frames_read++ * DSS_QP_SAMPLES_PER_FRAME;
+    pkt->duration     = DSS_QP_SAMPLES_PER_FRAME;
+    pkt->pos          = pos;
+    pkt->flags       |= AV_PKT_FLAG_KEY;
+
+    return 0;
+}
+
 static int dss_read_frame(AVFormatContext *s, AVPacket *pkt)
 {
     DSSDemuxContext *ctx = s->priv_data;
+    uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+    int64_t frames_read;
+    int ret, format;
 
-    if (ctx->grundig)
-        return dss_grundig_read_packet(s, pkt);
-    else if (ctx->audio_codec != DSS_ACODEC_G723_1)
-        return dss_sp_read_packet(s, pkt);
-    else
-        return dss_723_1_read_packet(s, pkt);
+    for (;;) {
+        frames_read = ctx->frames_read;
+        if (ctx->audio_codec == DSS_ACODEC_QP)
+            ret = dss_qp_read_packet(s, pkt);
+        else if (ctx->grundig)
+            ret = dss_grundig_read_packet(s, pkt);
+        else if (ctx->audio_codec != DSS_ACODEC_G723_1)
+            ret = dss_sp_read_packet(s, pkt);
+        else
+            ret = dss_723_1_read_packet(s, pkt);
+        if (ret != DSS_PART_END)
+            break;
+
+        av_packet_unref(pkt);
+        ctx->frames_read = frames_read;
+        format = ctx->audio_codec;
+        if (ctx->mixed) {
+            if (ctx->extract != DS2_EXTRACT_ALL) {
+                avpriv_report_missing_feature(s, "extract in a file of more "
+                                              "than one format");
+                return AVERROR_PATCHWELCOME;
+            }
+            if (avio_seek(ctx->pb, ctx->block_pos + DSS_BLOCK_SIZE,
+                          SEEK_SET) < 0 ||
+                ffio_read_size(ctx->pb, header, sizeof(header)) < 0)
+                return AVERROR_EOF;
+            if (dss_block_part(header) < 0)
+                return AVERROR_BUG;
+            format = header[4];
+        }
+        dss_start_part(ctx, format);
+        if (ctx->mixed)
+            ctx->pts = ctx->stated_pts;
+    }
+    if (ret < 0 || !ctx->mixed)
+        return ret;
+
+    pkt->duration = dss_part_ticks(ctx->audio_codec);
+    pkt->pts      = ctx->pts;
+    ctx->pts     += pkt->duration;
+    if ((ret = av_grow_packet(pkt, 1)) < 0)
+        return ret;
+    memmove(pkt->data + 1, pkt->data, pkt->size - 1);
+    pkt->data[0] = ctx->audio_codec == DSS_ACODEC_QP ? ctx->qp_frame_format
+                                                     : ctx->audio_codec;
+    return 0;
 }
 
 /* Return the next frame that the extract option keeps. The first one after
@@ -846,12 +1211,122 @@ static int dss_read_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     if (ctx->extract != DS2_EXTRACT_ALL)
-        pkt->pts = ctx->frames_out++ * dss_frame_samples(ctx);
+        pkt->pts = ctx->frames_out++ * (ctx->mixed ?
+                                        dss_part_ticks(ctx->audio_codec) :
+                                        dss_frame_samples(ctx));
     if (ctx->skipped) {
         ctx->skipped = 0;
         if (!av_packet_new_side_data(pkt, AV_PKT_DATA_DECODER_RESET, 0))
             return AVERROR(ENOMEM);
     }
+    return 0;
+}
+
+static int dss_qp_block_frames(AVFormatContext *s, int64_t pos,
+                               const uint8_t *header, int qp7, int count)
+{
+    AVIOContext *pb = ((DSSDemuxContext *)s->priv_data)->pb;
+    uint8_t buf[DSS_BLOCK_SIZE];
+    int64_t size = FFMIN(avio_size(pb) - pos, DSS_BLOCK_SIZE);
+    int off = DSS_AUDIO_BLOCK_HEADER_SIZE + dss_qp_anchor(header);
+    int n = 0, need, copy, ret;
+
+    memcpy(buf, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
+    if (qp7 && size > DSS_AUDIO_BLOCK_HEADER_SIZE &&
+        (ret = ffio_read_size(pb, buf + DSS_AUDIO_BLOCK_HEADER_SIZE,
+                              size - DSS_AUDIO_BLOCK_HEADER_SIZE)) < 0)
+        return ret;
+    while (n < count && off < size) {
+        n++;
+        if (qp7 && off + 1 < size && !(buf[off + 1] & 0x80))
+            off += DSS_QP7_NOISE_FRAME_SIZE;
+        else
+            off += DSS_QP_FRAME_SIZE;
+    }
+    need = size == DSS_BLOCK_SIZE ? off - DSS_BLOCK_SIZE : 0;
+    while (need > 0) {
+        pos += DSS_BLOCK_SIZE;
+        if (avio_seek(pb, pos, SEEK_SET) < 0 ||
+            avio_read(pb, buf, DSS_AUDIO_BLOCK_HEADER_SIZE) !=
+                DSS_AUDIO_BLOCK_HEADER_SIZE)
+            break;
+        if ((copy = dss_header_copy_blocks(buf))) {
+            pos += (copy - 1) * DSS_BLOCK_SIZE;
+            continue;
+        }
+        if (dss_block_frames(buf)) {
+            if ((dss_block_part(buf) < 0 ||
+                 dss_block_part(buf) == DSS_ACODEC_QP) &&
+                dss_qp_anchor(buf) != need)
+                n--;
+            break;
+        }
+        need -= dss_qp_anchor(buf);
+    }
+    return n;
+}
+
+static int dss_mixed_seek(AVFormatContext *s, int64_t timestamp)
+{
+    DSSDemuxContext *ctx = s->priv_data;
+    uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
+    int64_t pos, pts = 0, frames = 0, length;
+    int64_t last = -1, last_pts = 0, last_frames = 0;
+    int copy, count, format = dss_part_format(ctx->first_format);
+    int last_format = format;
+    int qp_format = ctx->first_format, last_qp_format = qp_format;
+
+    for (pos = ctx->dss_header_size; ; pos += DSS_BLOCK_SIZE) {
+        if (avio_seek(ctx->pb, pos, SEEK_SET) < 0 ||
+            ffio_read_size(ctx->pb, header, sizeof(header)) < 0) {
+            if (last < 0)
+                return AVERROR_EOF;
+            pos    = last;
+            pts    = last_pts;
+            frames = last_frames;
+            format = last_format;
+            qp_format = last_qp_format;
+            break;
+        }
+        if ((copy = dss_header_copy_blocks(header))) {
+            pos += (copy - 1) * DSS_BLOCK_SIZE;
+            continue;
+        }
+        if (!(count = dss_block_frames(header)))
+            continue;
+        /* an unread format byte leaves the block to the format before it */
+        if (dss_block_part(header) >= 0)
+            format = dss_block_part(header);
+        if (dss_block_part(header) == DSS_ACODEC_QP)
+            qp_format = header[4];
+        if (format == DSS_ACODEC_QP) {
+            count = dss_qp_block_frames(s, pos, header,
+                                        qp_format == DSS_ACODEC_QP7, count);
+            if (count < 0)
+                return count;
+            if (!count)
+                continue;
+        }
+        length = (int64_t)count * dss_part_ticks(format);
+        if (pts + length > timestamp)
+            break;
+        last        = pos;
+        last_pts    = pts;
+        last_frames = frames;
+        last_format = format;
+        last_qp_format = qp_format;
+        pts        += length;
+        frames     += count;
+    }
+
+    dss_set_part(ctx, format);
+    ctx->qp_block_format = qp_format;
+    ctx->pts         = pts;
+    ctx->stated_pts  = pts;
+    ctx->frames_read = frames;
+    ctx->frames_out  = frames;
+    ctx->skipped     = 0;
+    ctx->block_pos   = pos - DSS_BLOCK_SIZE;
     return 0;
 }
 
@@ -863,6 +1338,9 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
     int64_t ret, seekto, target = timestamp / samples, frames = 0;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int copy, count;
+
+    if (ctx->mixed)
+        return dss_mixed_seek(s, timestamp);
 
     /* With extract, timestamps count the frames returned: find the frame of
      * the file that the target is, or past the end the last one returned. */
