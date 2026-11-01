@@ -80,6 +80,7 @@ int ff_side_data_set_prft(AVPacket *pkt, int64_t timestamp);
     HANDLE(RTCP_SR,                     "rtcp_sr")                           \
     HANDLE(EXIF,                        "exif")                              \
     HANDLE(HEVC_CONF,                   "hevc_conf")                         \
-    HANDLE(GAIN_MAP_PARAMS,             "gain_map_params")
+    HANDLE(GAIN_MAP_PARAMS,             "gain_map_params")                   \
+    HANDLE(DECODER_RESET,               "decoder_reset")
 
 #endif // AVCODEC_PACKET_INTERNAL_H

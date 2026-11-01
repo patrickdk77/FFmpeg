@@ -313,6 +313,7 @@ const char *av_packet_side_data_name(enum AVPacketSideDataType type)
     case AV_PKT_DATA_EXIF:                       return "EXIF metadata";
     case AV_PKT_DATA_HEVC_CONF:                  return "HEVC enhancement-layer decoder configuration";
     case AV_PKT_DATA_GAIN_MAP_PARAMS:            return "Gain Map Parameters";
+    case AV_PKT_DATA_DECODER_RESET:              return "Decoder Reset";
     }
     return NULL;
 }
