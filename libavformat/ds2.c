@@ -23,7 +23,6 @@
 #include "demux.h"
 #include "internal.h"
 
-#define DS2_HEADER_SIZE 0x600 /* 1536 bytes */
 #define DS2_BLOCK_SIZE 512
 #define DS2_AUDIO_BLOCK_HEADER_SIZE 6
 #define DS2_BLOCK_PAYLOAD_SIZE (DS2_BLOCK_SIZE - DS2_AUDIO_BLOCK_HEADER_SIZE)
@@ -47,6 +46,7 @@
 #define DS2_COMMENT_SIZE 64
 
 typedef struct DS2DemuxContext {
+  int header_size;      /* in bytes, from ds2_header_size() */
   int format_type;      /* block format byte, DS2_FORMAT_QP */
   int counter;          /* bytes remaining in current block payload */
   int total_frames;     /* total frame count from block headers */
@@ -55,19 +55,57 @@ typedef struct DS2DemuxContext {
   int blk_frames;       /* frames still to start in the current block */
 } DS2DemuxContext;
 
+/*
+ * The first byte is the header size in 512-byte blocks (Olympus 2/3,
+ * Grundig/Philips 6/7, newer Olympus firmware 8). Philips SpeechExec
+ * writes 1 in the files it splits out of a recording, over the usual
+ * 3-block header; Olympus writes 1 over 1 block, followed by an audio block.
+ */
+static int ds2_header_size(const uint8_t *buf, int size) {
+  if (buf[0] == 1 && (size < DS2_BLOCK_SIZE + 4 ||
+                      buf[DS2_BLOCK_SIZE + 3] != 0xff))
+    return 3 * DS2_BLOCK_SIZE;
+  return buf[0] * DS2_BLOCK_SIZE;
+}
+
+/*
+ * Frames that start in a block: byte 2 when it is not 0, otherwise byte 5
+ * unless that is 0xff. A recorder writes the second form where it pauses or
+ * stops, and those frames are audio like any other.
+ */
+static int ds2_block_frames(const uint8_t *hdr) {
+  if (hdr[2] || hdr[5] == 0xff)
+    return hdr[2];
+  return hdr[5];
+}
+
+static int ds2_probe_format(const uint8_t *buf, int size, int pos) {
+  while (pos + DS2_AUDIO_BLOCK_HEADER_SIZE <= size) {
+    if (ds2_block_frames(buf + pos))
+      return buf[pos + 4];
+    pos += DS2_BLOCK_SIZE;
+  }
+  return -1;
+}
+
 static int ds2_probe(const AVProbeData *p) {
   int format;
 
-  if (AV_RL32(p->buf) != MKTAG(0x3, 'd', 's', '2'))
+  /* bytes 1..3 are the "ds2" tag */
+  if (p->buf_size < 4 || p->buf[1] != 'd' || p->buf[2] != 's' || p->buf[3] != '2')
+    return 0;
+  if (!p->buf[0])
     return 0;
 
-  /* SP, variable rate SP and LP files belong to the DSS demuxer. */
-  if (p->buf_size >= DS2_HEADER_SIZE + DS2_AUDIO_BLOCK_HEADER_SIZE) {
-    format = p->buf[DS2_HEADER_SIZE + 4];
-    if (format == DS2_FORMAT_SP || format == DS2_FORMAT_SP_VR ||
-        format == DS2_FORMAT_LP)
-      return 0;
-  }
+  /* SP, variable rate SP and LP files belong to the DSS demuxer. A long
+   * header can put the first block past the probe buffer; ask for more. */
+  format = ds2_probe_format(p->buf, p->buf_size,
+                            ds2_header_size(p->buf, p->buf_size));
+  if (format < 0)
+    return AVPROBE_SCORE_RETRY;
+  if (format == DS2_FORMAT_SP || format == DS2_FORMAT_SP_VR ||
+      format == DS2_FORMAT_LP)
+    return 0;
 
   return AVPROBE_SCORE_MAX;
 }
@@ -115,17 +153,6 @@ static int ds2_read_metadata_string(AVFormatContext *s, unsigned int offset,
 }
 
 /*
- * Frames that start in a block: byte 2 when it is not 0, otherwise byte 5
- * unless that is 0xff. A recorder writes the second form where it pauses or
- * stops, and those frames are audio like any other.
- */
-static int ds2_block_frames(const uint8_t *hdr) {
-  if (hdr[2] || hdr[5] == 0xff)
-    return hdr[2];
-  return hdr[5];
-}
-
-/*
  * Frames that start in the part of a block a cut file still holds, from the
  * block's header and payload, size bytes of them. Only frames whose first
  * byte is there count; the reader returns the last one zero-filled.
@@ -145,26 +172,27 @@ static int ds2_partial_block_frames(const uint8_t *buf, int size) {
 
 static int ds2_count_total_frames(AVFormatContext *s) {
   AVIOContext *pb = s->pb;
+  int header_size = ((DS2DemuxContext *)s->priv_data)->header_size;
   int64_t size = avio_size(pb);
   uint8_t hdr[DS2_AUDIO_BLOCK_HEADER_SIZE], buf[DS2_BLOCK_SIZE];
   int blocks, i, tail, total = 0;
 
   if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
     return 0;
-  if (size < DS2_HEADER_SIZE)
+  if (size < header_size)
     return AVERROR_INVALIDDATA;
 
-  blocks = (size - DS2_HEADER_SIZE) / DS2_BLOCK_SIZE;
+  blocks = (size - header_size) / DS2_BLOCK_SIZE;
   for (i = 0; i < blocks; i++) {
-    avio_seek(pb, DS2_HEADER_SIZE + (int64_t)i * DS2_BLOCK_SIZE, SEEK_SET);
+    avio_seek(pb, header_size + (int64_t)i * DS2_BLOCK_SIZE, SEEK_SET);
     if (avio_read(pb, hdr, sizeof(hdr)) != sizeof(hdr))
       break;
     total += ds2_block_frames(hdr);
   }
 
-  tail = (size - DS2_HEADER_SIZE) % DS2_BLOCK_SIZE;
+  tail = (size - header_size) % DS2_BLOCK_SIZE;
   if (i == blocks && tail >= DS2_AUDIO_BLOCK_HEADER_SIZE &&
-      avio_seek(pb, DS2_HEADER_SIZE + (int64_t)blocks * DS2_BLOCK_SIZE, SEEK_SET) >= 0 &&
+      avio_seek(pb, header_size + (int64_t)blocks * DS2_BLOCK_SIZE, SEEK_SET) >= 0 &&
       avio_read(pb, buf, tail) == tail)
     total += ds2_partial_block_frames(buf, tail);
 
@@ -242,8 +270,18 @@ static int ds2_read_header(AVFormatContext *s) {
   AVIOContext *pb = s->pb;
   AVStream *st;
   uint8_t block_header[DS2_AUDIO_BLOCK_HEADER_SIZE];
+  uint8_t file_magic[DS2_BLOCK_SIZE + 4];
   int ret, samples_per_frame;
   int64_t ret64;
+
+  if ((ret64 = avio_seek(pb, 0, SEEK_SET)) < 0)
+    return (int)ret64;
+  ret = avio_read(pb, file_magic, sizeof(file_magic));
+  if (ret < 4)
+    return ret < 0 ? ret : AVERROR_EOF;
+  if (!file_magic[0] || memcmp(file_magic + 1, "ds2", 3))
+    return AVERROR_INVALIDDATA;
+  ctx->header_size = ds2_header_size(file_magic, ret);
 
   st = avformat_new_stream(s, NULL);
   if (!st)
@@ -268,7 +306,7 @@ static int ds2_read_header(AVFormatContext *s) {
     return ret;
   ctx->total_frames = ret;
 
-  if ((ret64 = avio_seek(pb, DS2_HEADER_SIZE, SEEK_SET)) < 0)
+  if ((ret64 = avio_seek(pb, ctx->header_size, SEEK_SET)) < 0)
     return (int)ret64;
 
   ret = avio_read(pb, block_header, DS2_AUDIO_BLOCK_HEADER_SIZE);
@@ -306,8 +344,8 @@ static int ds2_read_header(AVFormatContext *s) {
     s->duration  = av_rescale_q(nb_samples, (AVRational){1, st->codecpar->sample_rate},
                                 AV_TIME_BASE_Q);
 
-    if (file_size > DS2_HEADER_SIZE && s->duration > 0)
-      s->bit_rate = (file_size - DS2_HEADER_SIZE) * 8LL * AV_TIME_BASE / s->duration;
+    if (file_size > ctx->header_size && s->duration > 0)
+      s->bit_rate = (file_size - ctx->header_size) * 8LL * AV_TIME_BASE / s->duration;
     else
       s->bit_rate = 8LL * frame_bytes * st->codecpar->sample_rate / samples_per_frame;
 
@@ -316,7 +354,7 @@ static int ds2_read_header(AVFormatContext *s) {
 
   /* Let the first read load the block: a file cut out of a longer recording
    * can start with the tail of a frame, before the block's anchor. */
-  if ((ret64 = avio_seek(pb, DS2_HEADER_SIZE, SEEK_SET)) < 0)
+  if ((ret64 = avio_seek(pb, ctx->header_size, SEEK_SET)) < 0)
     return (int)ret64;
   ctx->frames_read = 0;
   ctx->counter     = 0;
@@ -404,7 +442,7 @@ static int ds2_read_seek(AVFormatContext *s, int stream_index,
   if (seekto < 0)
     seekto = 0;
 
-  seekto += DS2_HEADER_SIZE;
+  seekto += ctx->header_size;
 
   ret = avio_seek(s->pb, seekto, SEEK_SET);
   if (ret < 0)
