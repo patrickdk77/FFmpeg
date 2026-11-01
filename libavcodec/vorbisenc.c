@@ -1089,7 +1089,8 @@ static int vorbis_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
             return AVERROR(ENOMEM);
         ff_bufqueue_add(avctx, &venc->bufqueue, clone);
     } else
-        if (!venc->afq.remaining_samples)
+        if (!venc->afq.remaining_samples ||
+            (!venc->afq.frame_alloc && !venc->afq.frame_count))
             return 0;
 
     move_audio(venc);
