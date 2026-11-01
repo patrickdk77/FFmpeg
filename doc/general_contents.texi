@@ -1338,7 +1338,7 @@ following image formats are supported:
 @item DFPWM                  @tab  X  @tab  X
 @item Digital Speech Standard - Standard Play mode (DSS SP) @tab     @tab  X
 @item Digital Speech Standard Pro (DS2) @tab     @tab  X
-    @tab SP (12000 Hz) and QP (16000 Hz) modes.
+    @tab QP and QP7 (16000 Hz) modes.
 @item Discworld II BMV Audio @tab     @tab  X
 @item COOK                   @tab     @tab  X
     @tab All versions except 5.1 are supported.

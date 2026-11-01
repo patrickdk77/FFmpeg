@@ -12,7 +12,8 @@
  *   - QP7 mode: QP with a type bit per frame; a 96-bit noise frame or a
  *              448-bit QP frame, the last reflection coefficient in 2 bits
  *
- * The DSS demuxer reads DS2 SP and LP files, which dss_sp and g723_1 decode.
+ * The DSS demuxer reads DS2 SP and LP files, which grundig_sp and
+ * g723_1 decode.
  *
  * Based on technical documentation from FFmpeg trac ticket #6091.
  *
