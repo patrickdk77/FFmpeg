@@ -719,6 +719,9 @@ static int ds2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
   int16_t *out;
   int ret, j, i;
 
+  if (av_packet_get_side_data(avpkt, AV_PKT_DATA_DECODER_RESET, NULL))
+    ds2_reset_state(p);
+
   /* The type bit is the top bit of the first byte in 16-bit word order */
   if (p->variable && buf_size >= 2 && !(buf[1] & 0x80))
     frame_size = DS2_QP7_NOISE_FRAME_SIZE;
