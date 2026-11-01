@@ -189,6 +189,7 @@ FATE_SEEK_EXTRA-$(call ALLYES, MOV_DEMUXER) += fate-seek-empty-edit-mp4
 FATE_SEEK_EXTRA-$(call ALLYES, MOV_DEMUXER) += fate-seek-test-iibbibb-mp4
 FATE_SEEK_EXTRA-$(call ALLYES, MOV_DEMUXER) += fate-seek-test-iibbibb-neg-ctts-mp4
 FATE_SEEK_EXTRA-$(CONFIG_WAV_DEMUXER)       += fate-seek-bad-avg-byterate
+FATE_SEEK_EXTRA-$(CONFIG_DSS_DEMUXER)       += fate-seek-dss-sp
 FATE_SEEK_EXTRA-$(CONFIG_DS2_DEMUXER)       += fate-seek-ds2-qp
 
 fate-seek-extra-mp3:  CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/gapless/gapless.mp3 -fastseek 1
@@ -199,6 +200,7 @@ fate-seek-test-iibbibb-mp4:  CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_
 fate-seek-test-iibbibb-neg-ctts-mp4:  CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/mov/test_iibbibb_neg_ctts.mp4 -duration 13 -frames 4
 fate-seek-cache-pipe: CMD = cat $(SAMPLES)/gapless/gapless.mp3 | run libavformat/tests/seek$(EXESUF) cache:pipe:0 -read_ahead_limit -1
 fate-seek-mkv-codec-delay:   CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/mkv/codec_delay_opus.mkv
+fate-seek-dss-sp:     CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/dss/sp.dss -duration 10
 fate-seek-ds2-qp:     CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/ds2/sample-qp.ds2 -duration 45
 
 # A master playlist with separate audio and video media playlists with different DTS.
