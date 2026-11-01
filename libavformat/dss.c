@@ -117,14 +117,27 @@ typedef struct DSSDemuxContext {
     int qp_frame_format;
 } DSSDemuxContext;
 
-/* Frames that start in an audio block: byte 2 when it is not 0, otherwise
- * byte 5 unless that is 0xff. A recorder writes the second form where it
- * pauses or stops, and those frames are audio like any other. */
+/* Frames that start in an audio block: byte 2, or byte 5 when byte 2 is 0 or
+ * 0xff, and none when that is 0xff. A recorder writes the second form where
+ * it pauses or stops, and those frames are audio like any other. */
 static int dss_block_frames(const uint8_t *header)
 {
-    if (header[2] || header[5] == 0xff)
-        return header[2];
-    return header[5];
+    int n = header[2] && header[2] != 0xff ? header[2] : header[5];
+
+    return n == 0xff ? 0 : n;
+}
+
+/* Where the first frame that starts in an audio block starts, in bits from
+ * the block start: byte 1 and the top half of byte 0, or where both are 0, as
+ * in Philips's pause blocks, the bottom half of byte 0 and byte 3. The first
+ * frame starts on a whole byte, so this drops the low 3 bits of either. */
+static int dss_block_start_bits(const uint8_t *header)
+{
+    int bits = header[1] << 4 | header[0] >> 4;
+
+    if (!bits)
+        bits = (header[0] & 0x0f) << 8 | header[3];
+    return bits & ~7;
 }
 
 static int dss_format_known(const uint8_t *header)
@@ -384,18 +397,19 @@ static int dss_first_format(AVFormatContext *s)
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int64_t pos = ctx->dss_header_size, end = INT64_MAX;
-    int copy, ret, first = -1, held = 0;
+    int copy, ret, first = -1;
 
     if (!(pb->seekable & AVIO_SEEKABLE_NORMAL)) {
         end = pos + FFMAX(FFMIN(s->probesize, INT_MAX / 2),
                           DSS_FORMAT_SCAN_BLOCKS * DSS_BLOCK_SIZE);
         if (avio_seek(pb, 0, SEEK_SET) < 0)
             return DSS_ACODEC_DSS_SP;
-        if ((ret = ffio_ensure_seekback(pb, end)) < 0)
+        if ((ret = ffio_ensure_seekback(pb, end + 255 * DSS_BLOCK_SIZE +
+                                        DSS_AUDIO_BLOCK_HEADER_SIZE)) < 0)
             return ret;
     }
 
-    for (; pos < end; pos += DSS_BLOCK_SIZE) {
+    for (;; pos += DSS_BLOCK_SIZE) {
         if (avio_seek(pb, pos, SEEK_SET) < 0)
             break;
         ret = avio_read(pb, header, DSS_AUDIO_BLOCK_HEADER_SIZE);
@@ -403,20 +417,24 @@ static int dss_first_format(AVFormatContext *s)
             return ret;
         if (ret != DSS_AUDIO_BLOCK_HEADER_SIZE)
             break;
+        /* From a pipe the scan stops at a window. Where the input goes on
+         * past it, a block whose format counts may follow, so do not fall
+         * back to the first block with frames or to the default format. */
+        if (pos >= end)
+            return AVERROR_INVALIDDATA;
         copy = dss_header_copy_blocks(header);
         if (copy)
             pos += (copy - 1) * DSS_BLOCK_SIZE;
         else if (dss_block_frames(header)) {
             if (dss_format_known(header))
                 return header[4];
-            if (first < 0 && header[3] == 0xff)
+            if (first < 0)
                 first = header[4];
-            held = 1;
         }
     }
-    if (first >= 0)
-        return first;
-    return held ? AVERROR_INVALIDDATA : DSS_ACODEC_DSS_SP;
+    if (pb->error < 0)
+        return pb->error;
+    return first >= 0 ? first : DSS_ACODEC_DSS_SP;
 }
 
 static int dss_formats_mixed(AVFormatContext *s, int first)
@@ -663,7 +681,7 @@ static int dss_next_block(AVFormatContext *s)
     AVIOContext *pb = ctx->pb;
     uint8_t header[DSS_AUDIO_BLOCK_HEADER_SIZE];
     int64_t block_pos = ctx->block_pos, stated_pts = ctx->stated_pts;
-    int cont, copy, ret;
+    int cont, copy, ret, start;
 
     for (;;) {
         ctx->block_pos += DSS_BLOCK_SIZE;
@@ -685,8 +703,9 @@ static int dss_next_block(AVFormatContext *s)
             return ret;
         }
 
-        ctx->swap = !!(header[0] & 0x80);
-        cont      = 2 * header[1] + 2 * ctx->swap - DSS_AUDIO_BLOCK_HEADER_SIZE;
+        start     = dss_block_start_bits(header) >> 3;
+        ctx->swap = ctx->audio_codec != DSS_ACODEC_G723_1 && start & 1;
+        cont      = start + ctx->swap - DSS_AUDIO_BLOCK_HEADER_SIZE;
         if (cont < 0 || cont > DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE)
             cont = 0;
 
@@ -870,10 +889,12 @@ static int dss_723_1_read_packet(AVFormatContext *s, AVPacket *pkt)
 }
 
 /* Move to the next audio block that has frames, and set the bit reader to the
- * first of them. Byte 1 of the block header is its offset from the start of
- * the block in 16-bit words, and the top 4 bits of byte 0 the bit in that
- * word. An offset into the block header is taken as 0, as dss_next_block()
- * takes it. */
+ * first of them, at the bit dss_block_start_bits() gives. Byte 1 of an
+ * Olympus block header is its offset from the start of the block in 16-bit
+ * words, and bit 7 of byte 0 adds half a word. An offset into the block
+ * header with bit 3 set, as for a swapped frame, reaches back from the
+ * payload into the end of the block before. Any other offset into the header
+ * is taken as 0. */
 static int dss_grundig_next_block(AVFormatContext *s)
 {
     DSSDemuxContext *ctx = s->priv_data;
@@ -908,9 +929,8 @@ static int dss_grundig_next_block(AVFormatContext *s)
         if (!ctx->frames_left)
             continue;
 
-        start = (header[1] - DSS_AUDIO_BLOCK_HEADER_SIZE / 2) * 16 +
-                (header[0] >> 4);
-        if (start < 0 && header[0] & 0x80) {
+        start = dss_block_start_bits(header) - DSS_AUDIO_BLOCK_HEADER_SIZE * 8;
+        if (start < 0 && dss_block_start_bits(header) & 8) {
             at = ctx->block_pos - (15 - start) / 16 * 2;
             if (at >= ctx->dss_header_size + DSS_AUDIO_BLOCK_HEADER_SIZE) {
                 if (avio_seek(pb, at, SEEK_SET) < 0 ||
@@ -1002,7 +1022,7 @@ static int dss_grundig_read_packet(AVFormatContext *s, AVPacket *pkt)
 
 static int dss_qp_anchor(const uint8_t *header)
 {
-    return av_clip(2 * header[1] + 2 * (header[0] >> 7) -
+    return av_clip((dss_block_start_bits(header) >> 3) -
                    DSS_AUDIO_BLOCK_HEADER_SIZE,
                    0, DSS_BLOCK_SIZE - DSS_AUDIO_BLOCK_HEADER_SIZE);
 }
@@ -1390,7 +1410,7 @@ static int dss_read_seek(AVFormatContext *s, int stream_index,
                            ff_dss_ds2_frame_included(&ctx->annotations,
                                                      ctx->extract, frames);
     ctx->skipped     = 0;
-    ctx->swap        = !!(header[0] & 0x80);
+    ctx->swap        = (dss_block_start_bits(header) >> 3) & 1;
     ctx->frames_left = 0;
     ctx->block_pos   = seekto - DSS_BLOCK_SIZE;
     ctx->dss_sp_swap_byte = -1;
