@@ -412,6 +412,12 @@ static int atrac3p_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         out_ch_index += channels_to_process;
     }
 
+    if (ch_block < ctx->num_channel_blocks) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Frame data doesn't match channel configuration!\n");
+        return AVERROR_INVALIDDATA;
+    }
+
     *got_frame_ptr = 1;
 
     return avctx->codec_id == AV_CODEC_ID_ATRAC3P ? FFMIN(avctx->block_align, avpkt->size) : avpkt->size;
