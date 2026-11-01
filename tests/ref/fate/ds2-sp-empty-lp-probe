@@ -1,4 +1,4 @@
 [STREAM]
-codec_name=dss_sp
-sample_rate=11000
+codec_name=grundig_sp
+sample_rate=12000
 [/STREAM]
