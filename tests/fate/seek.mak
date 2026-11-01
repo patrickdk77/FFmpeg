@@ -193,6 +193,12 @@ FATE_SEEK_EXTRA-$(CONFIG_DSS_DEMUXER)       += fate-seek-dss-sp
 FATE_SEEK_EXTRA-$(CONFIG_DS2_DEMUXER)       += fate-seek-ds2-qp
 FATE_SEEK_EXTRA-$(CONFIG_DSS_DEMUXER)       += fate-seek-ds2-sp-qp-resync
 FATE_SEEK_EXTRA-$(CONFIG_DSS_DEMUXER)       += fate-seek-ds2-sp-qp-format3-first
+FATE_SEEK_EXTRA-$(CONFIG_MSV_DEMUXER)       += fate-seek-msv-adpcm-lp
+FATE_SEEK_EXTRA-$(CONFIG_MSV_DEMUXER)       += fate-seek-msv-lcst-sthq
+FATE_SEEK_EXTRA-$(CONFIG_MSV_DEMUXER)       += fate-seek-msv-lpec-sp
+FATE_SEEK_EXTRA-$(CONFIG_MSV_DEMUXER)       += fate-seek-msv-lpec-sp-nochunks
+FATE_SEEK_EXTRA-$(CONFIG_MSV_DEMUXER)       += fate-seek-msv-trc-hq
+FATE_SEEK_EXTRA-$(CONFIG_MSV_DEMUXER)       += fate-seek-msv-trc-page-hq
 
 fate-seek-extra-mp3:  CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/gapless/gapless.mp3 -fastseek 1
 fate-seek-bad-avg-byterate: CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/wav/wrong-avg-byterate.wav -seekback 500 -stream_id 0
@@ -206,6 +212,12 @@ fate-seek-dss-sp:     CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES
 fate-seek-ds2-qp:     CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/ds2/sample-qp.ds2 -duration 45
 fate-seek-ds2-sp-qp-resync: CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/ds2/olympus-sp-qp-resync.ds2 -duration 7
 fate-seek-ds2-sp-qp-format3-first: CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/ds2/olympus-sp-qp-format3-first.ds2 -duration 7
+fate-seek-msv-adpcm-lp:         CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/msv/adpcm-lp.msv
+fate-seek-msv-lcst-sthq:        CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/msv/lcst-sthq.msv
+fate-seek-msv-lpec-sp:          CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/msv/lpec-sp.msv
+fate-seek-msv-lpec-sp-nochunks: CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/msv/lpec-sp-nochunks.msv
+fate-seek-msv-trc-hq:           CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/msv/trc-hq.msv
+fate-seek-msv-trc-page-hq:      CMD = run libavformat/tests/seek$(EXESUF) $(TARGET_SAMPLES)/msv/trc-page-hq.msv
 
 # A master playlist with separate audio and video media playlists with different DTS.
 tests/data/hls-seek.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data

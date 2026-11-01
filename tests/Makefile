@@ -241,6 +241,7 @@ include $(SRC_PATH)/tests/fate/mpc.mak
 include $(SRC_PATH)/tests/fate/mpeg4.mak
 include $(SRC_PATH)/tests/fate/mpegps.mak
 include $(SRC_PATH)/tests/fate/mpegts.mak
+include $(SRC_PATH)/tests/fate/msv.mak
 include $(SRC_PATH)/tests/fate/mxf.mak
 include $(SRC_PATH)/tests/fate/ogg-vorbis.mak
 include $(SRC_PATH)/tests/fate/ogg-flac.mak
