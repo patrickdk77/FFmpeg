@@ -32,7 +32,6 @@
 
 #include "libavutil/float_dsp.h"
 #include "libavutil/mem_internal.h"
-#include "libavutil/tx.h"
 
 #include "atrac.h"
 #include "avcodec.h"
@@ -43,7 +42,6 @@
 #define ATRAC3P_SUBBAND_SAMPLES 128 ///< number of samples per subband
 #define ATRAC3P_FRAME_SAMPLES   (ATRAC3P_SUBBAND_SAMPLES * ATRAC3P_SUBBANDS)
 
-#define ATRAC3P_PQF_FIR_LEN     12  ///< length of the prototype FIR of the PQF
 
 /** Global constants */
 #define ATRAC3P_POWER_COMP_OFF  15  ///< disable power compensation
@@ -58,9 +56,8 @@ enum Atrac3pChannelUnitTypes {
 
 /** Per-channel IPQF history */
 typedef struct Atrac3pIPQFChannelCtx {
-    DECLARE_ALIGNED(32, float, buf1)[ATRAC3P_PQF_FIR_LEN * 2][8];
-    DECLARE_ALIGNED(32, float, buf2)[ATRAC3P_PQF_FIR_LEN * 2][8];
-    int pos;
+    float buf[576]; ///< filter history, three phases
+    int   pos;      ///< current phase
 } Atrac3pIPQFChannelCtx;
 
 /** Amplitude envelope of a group of sine waves */
@@ -173,7 +170,7 @@ int ff_atrac3p_decode_channel_unit(GetBitContext *gb, Atrac3pChanUnitCtx *ctx,
                                    int num_channels, AVCodecContext *avctx);
 
 /**
- * Initialize sine waves synthesizer and ff_sine_* tables.
+ * Initialize sine waves synthesizer and IMDCT tables.
  */
 void ff_atrac3p_init_dsp_static(void);
 
@@ -188,6 +185,15 @@ void ff_atrac3p_init_dsp_static(void);
  */
 void ff_atrac3p_generate_tones(Atrac3pChanUnitCtx *ch_unit, AVFloatDSPContext *fdsp,
                                int ch_num, int sb, float *out);
+
+/**
+ * Add the global time-domain noise of a channel unit to all subbands.
+ *
+ * @param[in]      ctx   ptr to the channel unit context
+ * @param[in]      ch    channel index within the unit
+ * @param[in,out]  out   16 subbands of 128 samples
+ */
+void ff_atrac3p_add_noise(const Atrac3pChanUnitCtx *ctx, int ch, float *out);
 
 /**
  * Perform power compensation aka noise dithering.
@@ -206,28 +212,35 @@ void ff_atrac3p_power_compensation(Atrac3pChanUnitCtx *ctx, AVFloatDSPContext *f
  * Regular IMDCT and windowing without overlapping,
  * with spectrum reversal in the odd subbands.
  *
- * @param[in]   fdsp       pointer to float DSP context
- * @param[in]   mdct_ctx   pointer to MDCT transform context
- * @param[in]   pIn        float input
- * @param[out]  pOut       float output
+ * @param[in]   in         128 spectral coefficients
+ * @param[out]  out        256 windowed samples
  * @param[in]   wind_id    which MDCT window to apply
  * @param[in]   sb         subband number
  */
-void ff_atrac3p_imdct(AVFloatDSPContext *fdsp, AVTXContext *mdct_ctx,
-                      av_tx_fn mdct_fn, float *pIn, float *pOut,
-                      int wind_id, int sb);
+void ff_atrac3p_imdct(const float *in, float *out, int wind_id, int sb);
+
+/**
+ * Gain compensation and overlapping of one subband.
+ *
+ * @param[in,out]  in       256 samples from ff_atrac3p_imdct()
+ * @param[in,out]  prev     128 overlapping samples of the previous frame
+ * @param[in]      gc_prev  gain control info of the previous frame
+ * @param[in]      gc_cur   gain control info of the current frame
+ * @param[out]     out      128 output samples
+ */
+void ff_atrac3p_gain_compensation(float *in, float *prev,
+                                  const AtracGainInfo *gc_prev,
+                                  const AtracGainInfo *gc_cur, float *out);
 
 /**
  * Subband synthesis filter based on the polyphase quadrature (pseudo-QMF)
  * filter bank.
  *
- * @param[in]      dct_ctx   ptr to the pre-initialized IDCT context
  * @param[in,out]  hist      ptr to the filter history
  * @param[in]      in        input data to process
  * @param[out]     out       receives processed data
  */
-void ff_atrac3p_ipqf(AVTXContext *dct_ctx, av_tx_fn dct_fn,
-                     Atrac3pIPQFChannelCtx *hist, const float *in, float *out);
+void ff_atrac3p_ipqf(Atrac3pIPQFChannelCtx *hist, const float *in, float *out);
 
 extern const uint16_t ff_atrac3p_qu_to_spec_pos[33];
 extern const float ff_atrac3p_sf_tab[64];

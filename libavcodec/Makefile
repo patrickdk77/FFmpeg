@@ -268,9 +268,9 @@ OBJS-$(CONFIG_ATRAC1_DECODER)          += atrac1.o atrac.o
 OBJS-$(CONFIG_ATRAC3_DECODER)          += atrac3.o atrac.o
 OBJS-$(CONFIG_ATRAC3AL_DECODER)        += atrac3.o atrac.o
 OBJS-$(CONFIG_ATRAC3P_DECODER)         += atrac3plusdec.o atrac3plus.o \
-                                          atrac3plusdsp.o atrac.o
+                                          atrac3plus_hfc.o atrac3plusdsp.o atrac.o
 OBJS-$(CONFIG_ATRAC3PAL_DECODER)       += atrac3plusdec.o atrac3plus.o \
-                                          atrac3plusdsp.o atrac.o
+                                          atrac3plus_hfc.o atrac3plusdsp.o atrac.o
 OBJS-$(CONFIG_ATRAC9_DECODER)          += atrac9dec.o
 OBJS-$(CONFIG_AURA_DECODER)            += cyuv.o
 OBJS-$(CONFIG_AURA2_DECODER)           += aura.o
